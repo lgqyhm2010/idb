@@ -30,4 +30,23 @@ final class HidRequestTranslationTests: XCTestCase {
       }
     }
   }
+
+  func testDisplaySelectionNamesADisplayOrTheActiveOne() {
+    XCTAssertEqual(HidMethodHandler.displayUniqueID(from: .with { $0.uniqueID = "inner" }), "inner")
+    XCTAssertNil(HidMethodHandler.displayUniqueID(from: .init()))
+  }
+
+  func testDisplaySelectionIsNotItselfAnEvent() {
+    let request = Idb_HIDEvent.with { $0.display.uniqueID = "inner" }
+    XCTAssertThrowsError(try HidMethodHandler.fbSimulatorHIDEvent(from: request)) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  func testUnknownDisplayIsTheCallersMistakeAndTheRestAreDeviceState() {
+    XCTAssertEqual(HidMethodHandler.rpcCode(for: .unknownDisplay("x", known: [])), .invalidArgument)
+    XCTAssertEqual(HidMethodHandler.rpcCode(for: .inactiveDisplay("x")), .failedPrecondition)
+    XCTAssertEqual(HidMethodHandler.rpcCode(for: .noTouchscreen("x")), .failedPrecondition)
+    XCTAssertEqual(HidMethodHandler.rpcCode(for: .noActiveIntegratedDisplay), .failedPrecondition)
+  }
 }

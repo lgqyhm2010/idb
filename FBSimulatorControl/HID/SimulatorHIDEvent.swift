@@ -48,8 +48,9 @@ public indirect enum SimulatorHIDEvent: Equatable, Hashable, Sendable {
 public extension SimulatorHIDEvent {
 
   /// Sends without draining afterwards. Prefer `SimulatorHID.send(event:logger:)`, which drains once per gesture.
-  func send(on hid: SimulatorHID) async throws {
-    _ = try await hid.deliver(self)
+  /// `target` routes the touches to one display's touchscreen; nil sends them to the main screen.
+  func send(on hid: SimulatorHID, target: SimulatorTouchTarget? = nil) async throws {
+    _ = try await hid.deliver(self, target: target)
   }
 }
 

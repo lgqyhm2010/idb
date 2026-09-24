@@ -9,10 +9,12 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 from typing import Dict, List, Optional, Tuple
 
 from idb.common.types import (
+    ACTIVE_DISPLAY,
     HIDButton,
     HIDButtonType,
     HIDDelay,
     HIDDirection,
+    HIDDisplay,
     HIDEvent,
     HIDKey,
     HIDOrientation,
@@ -25,6 +27,16 @@ from idb.common.types import (
     HIDTouch,
     Point,
 )
+
+
+def on_display(display: str | None, events: list[HIDEvent]) -> list[HIDEvent]:
+    """Routes the touches in `events` to one display's touchscreen: a display
+    unique id, or ACTIVE_DISPLAY for whichever integrated display is lit. None
+    leaves them on the main screen."""
+    if display is None:
+        return events
+    unique_id = "" if display == ACTIVE_DISPLAY else display
+    return [HIDDisplay(unique_id=unique_id), *events]
 
 
 def rotate_to_events(orientation: HIDOrientationType) -> list[HIDEvent]:

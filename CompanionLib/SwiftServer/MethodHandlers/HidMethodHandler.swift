@@ -15,11 +15,39 @@ struct HidMethodHandler {
   let commandExecutor: IDBCommandExecutor
 
   func handle(requestStream: RequestStreamReader<Idb_HIDEvent>, context: ServerContext) async throws -> Idb_HIDResponse {
+    // A display selection routes the touches after it in this stream, and only in this stream: the HID
+    // connection is shared by every caller, so the selection cannot live on it.
+    var touchTarget: SimulatorTouchTarget?
     for try await request in requestStream {
+      if case let .display(display) = request.event {
+        touchTarget = try await resolveTouchTarget(display)
+        continue
+      }
       let event = try Self.fbSimulatorHIDEvent(from: request)
-      try await commandExecutor.hid(event)
+      try await commandExecutor.hid(event, touchTarget: touchTarget)
     }
     return .init()
+  }
+
+  private func resolveTouchTarget(_ display: Idb_HIDEvent.HIDDisplay) async throws -> SimulatorTouchTarget {
+    do {
+      return try await commandExecutor.touch_target(displayUniqueID: Self.displayUniqueID(from: display))
+    } catch let error as SimulatorDisplayError {
+      throw RPCError(code: Self.rpcCode(for: error), message: error.localizedDescription)
+    }
+  }
+
+  /// An empty identity selects the active integrated display.
+  static func displayUniqueID(from display: Idb_HIDEvent.HIDDisplay) -> String? {
+    display.uniqueID.isEmpty ? nil : display.uniqueID
+  }
+
+  /// Naming a display that does not exist is the caller's mistake; the rest describe the device's state.
+  static func rpcCode(for error: SimulatorDisplayError) -> RPCError.Code {
+    switch error {
+    case .unknownDisplay: .invalidArgument
+    default: .failedPrecondition
+    }
   }
 
   static func fbSimulatorHIDEvent(from request: Idb_HIDEvent) throws -> SimulatorHIDEvent {
@@ -98,6 +126,9 @@ struct HidMethodHandler {
       } catch {
         throw RPCError(code: .invalidArgument, message: error.localizedDescription)
       }
+
+    case .display:
+      throw RPCError(code: .invalidArgument, message: "A display selection routes the events after it and is not an event itself")
 
     case .none:
       throw RPCError(code: .invalidArgument, message: "Unrecognized request.event")

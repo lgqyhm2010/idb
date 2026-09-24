@@ -33,6 +33,7 @@ from idb.common.hid import (
     iterator_to_async_iterator,
     key_press_to_events,
     multi_tap_to_events,
+    on_display,
     pinch_to_events,
     rotate_to_events,
     shake_to_events,
@@ -68,6 +69,7 @@ from idb.common.types import (
     DEFAULT_SCREENSHOT_OPTIONS,
     DeliveredNotification,
     DeviceOrientation,
+    DisplayInfo,
     DomainSocketAddress,
     FileContainer,
     FileContainerType,
@@ -126,6 +128,7 @@ from idb.grpc.idb_pb2 import (
     InstrumentsRunRequest,
     LaunchRequest,
     ListAppsRequest,
+    ListDisplaysRequest,
     ListSettingRequest,
     LOCALE as LocaleSetting,
     Location,
@@ -1114,8 +1117,14 @@ class Client(ClientBase):
         await self.hid(iterator_to_async_iterator(events))
 
     @log_and_handle_exceptions("hid")
-    async def tap(self, x: float, y: float, duration: float | None = None) -> None:
-        await self.send_events(tap_to_events(x, y, duration))
+    async def tap(
+        self,
+        x: float,
+        y: float,
+        duration: float | None = None,
+        display: str | None = None,
+    ) -> None:
+        await self.send_events(on_display(display, tap_to_events(x, y, duration)))
 
     @log_and_handle_exceptions("hid")
     async def multi_tap(
@@ -1125,8 +1134,11 @@ class Client(ClientBase):
         count: int = 2,
         duration: float | None = None,
         pause: float = 0.1,
+        display: str | None = None,
     ) -> None:
-        await self.send_events(multi_tap_to_events(x, y, count, duration, pause))
+        await self.send_events(
+            on_display(display, multi_tap_to_events(x, y, count, duration, pause))
+        )
 
     @log_and_handle_exceptions("hid")
     async def button(
@@ -1165,6 +1177,25 @@ class Client(ClientBase):
     async def set_hinge_angle(self, angle: float) -> None:
         await self.send_events([HIDHinge(angle=angle)])
 
+    @log_and_handle_exceptions("list_displays")
+    async def list_displays(self) -> list[DisplayInfo]:
+        response = await self.stub.list_displays(ListDisplaysRequest())
+        return [
+            DisplayInfo(
+                unique_id=display.unique_id,
+                name=display.name,
+                active=display.active,
+                primary=display.primary,
+                integrated=display.integrated,
+                width=display.width,
+                height=display.height,
+                scale=display.scale,
+                rotation=display.rotation,
+                touchscreen=display.touchscreen,
+            )
+            for display in response.displays
+        ]
+
     @log_and_handle_exceptions("hid")
     async def shake(self) -> None:
         await self.send_events(shake_to_events())
@@ -1184,8 +1215,11 @@ class Client(ClientBase):
         p_end: tuple[int, int],
         duration: float | None = None,
         delta: int | None = None,
+        display: str | None = None,
     ) -> None:
-        await self.send_events(swipe_to_events(p_start, p_end, duration, delta))
+        await self.send_events(
+            on_display(display, swipe_to_events(p_start, p_end, duration, delta))
+        )
 
     @log_and_handle_exceptions("hid")
     async def key_sequence(self, key_sequence: list[int]) -> None:
@@ -1215,14 +1249,18 @@ class Client(ClientBase):
         scale: float,
         duration: float = 0.5,
         radius: float = 100.0,
+        display: str | None = None,
     ) -> None:
         await self.send_events(
-            pinch_to_events(
-                center_x=center_x,
-                center_y=center_y,
-                scale=scale,
-                duration=duration,
-                radius=radius,
+            on_display(
+                display,
+                pinch_to_events(
+                    center_x=center_x,
+                    center_y=center_y,
+                    scale=scale,
+                    duration=duration,
+                    radius=radius,
+                ),
             )
         )
 

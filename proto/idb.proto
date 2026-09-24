@@ -32,6 +32,7 @@ service CompanionService {
   rpc get_orientation(GetOrientationRequest) returns (GetOrientationResponse) {}
   rpc set_orientation(SetOrientationRequest) returns (SetOrientationResponse) {}
   rpc hinge_angle(HingeAngleRequest) returns (HingeAngleResponse) {}
+  rpc list_displays(ListDisplaysRequest) returns (ListDisplaysResponse) {}
   rpc hid(stream HIDEvent) returns (HIDResponse) {}
   rpc open_url(OpenUrlRequest) returns (OpenUrlRequest) {}
   rpc set_location(SetLocationRequest) returns (SetLocationResponse) {}
@@ -114,6 +115,28 @@ message HingeAngleRequest {}
 message HingeAngleResponse {
   // A fresh measured hinge angle in degrees, from 0 (closed) to 180 (flat).
   double angle = 1;
+}
+
+message ListDisplaysRequest {}
+
+message ListDisplaysResponse {
+  message Display {
+    // Stable display identity; the value `HIDEvent.HIDDisplay.unique_id` takes.
+    string unique_id = 1;
+    string name = 2;
+    bool active = 3;
+    bool primary = 4;
+    bool integrated = 5;
+    // Size in the display's unrotated pixel space.
+    double width = 6;
+    double height = 7;
+    double scale = 8;
+    // The current interface rotation: "rot0", "rot90", "rot180" or "rot270".
+    string rotation = 9;
+    // Whether a touchscreen covers the display, so touches can be routed to it.
+    bool touchscreen = 10;
+  }
+  repeated Display displays = 1;
 }
 
 message Payload {
@@ -684,6 +707,17 @@ message HIDEvent {
     double angle = 1;
   }
 
+  // Routes the touch events that follow it in the same `hid` stream to one
+  // display's touchscreen, until the stream ends or another HIDDisplay arrives.
+  // Buttons and keys are unaffected. Selecting a display that is unknown,
+  // inactive or has no touchscreen fails the stream rather than falling back
+  // to the main screen.
+  message HIDDisplay {
+    // A `ListDisplaysResponse.Display.unique_id`. Empty selects the active
+    // integrated display.
+    string unique_id = 1;
+  }
+
   // Experimental display-selection clients used field 7.
   reserved 7;
 
@@ -695,6 +729,11 @@ message HIDEvent {
     HIDOrientation orientation = 5;
     HIDShake shake = 6;
     HIDHinge hinge = 8;
+    // Deliberately far from the sequential numbers above, so a companion that
+    // predates display routing rejects the selection as an unrecognized event
+    // instead of reading it as some later event, and touches never silently
+    // land on the main screen.
+    HIDDisplay display = 100;
   }
 }
 
