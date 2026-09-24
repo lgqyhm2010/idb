@@ -89,25 +89,59 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
 }
 
 /// Which touchscreen covers which display. Universal HID takes about a second to list it, which a
-/// touch cannot afford to pay each time, and it changes only with the displays themselves, so it is
-/// listed again only when the display identities differ from those it was listed against. Activity,
-/// rotation and geometry, which do change between touches, are read afresh on every resolution.
+/// touch cannot afford to pay each time, so a listing is kept and read again only when the displays
+/// differ from those it was read against: their identities, and which of them are lit, since a
+/// foldable can attach a display's touchscreen only while that display is lit and number it afresh
+/// when it does. Rotation and geometry, which do change between touches, are read afresh on every
+/// resolution and never decide whether the listing is kept.
+///
+/// A kept listing can still be stale in ways the displays do not show, so a display that a kept
+/// listing finds no touchscreen for is looked up once more in a fresh one before that is reported.
 ///
 /// The listing in flight is what is kept, so streams resolving at the same time share one read
 /// rather than each paying for it; a read that fails is forgotten.
 actor SimulatorTouchscreenTopology {
-  private var listing: (displayIDs: Set<String>, task: Task<[SimulatorTouchscreen], Error>)?
+  /// The displays a listing was read against.
+  private struct Key: Equatable {
+    let displayIDs: Set<String>
+    let activeDisplayIDs: Set<String>
 
-  func touchscreens(
-    forDisplays displayIDs: Set<String>, read: @escaping @Sendable () async throws -> [SimulatorTouchscreen]
-  ) async throws -> [SimulatorTouchscreen] {
-    if let listing, listing.displayIDs == displayIDs {
-      return try await listing.task.value
+    init(_ displays: [SimulatorDisplay]) {
+      displayIDs = Set(displays.map(\.uniqueID))
+      activeDisplayIDs = Set(displays.filter(\.isActive).map(\.uniqueID))
+    }
+  }
+
+  private var listing: (key: Key, task: Task<[SimulatorTouchscreen], Error>)?
+
+  /// Resolves the touchscreen of a display in `displays`, a snapshot read just before; nil selects the
+  /// active integrated display. `read` lists the touchscreens afresh.
+  func touchTarget(
+    displayUniqueID: String?, displays: [SimulatorDisplay],
+    read: @escaping @Sendable () async throws -> [SimulatorTouchscreen]
+  ) async throws -> SimulatorTouchTarget {
+    let key = Key(displays)
+    let (listed, kept) = try await touchscreens(for: key, refresh: false, read: read)
+    do {
+      return try SimulatorTouchTarget.resolve(displayUniqueID: displayUniqueID, displays: displays, touchscreens: listed)
+    } catch SimulatorDisplayError.noTouchscreen(_) where kept {
+      let (fresh, _) = try await touchscreens(for: key, refresh: true, read: read)
+      return try SimulatorTouchTarget.resolve(displayUniqueID: displayUniqueID, displays: displays, touchscreens: fresh)
+    }
+  }
+
+  /// The listing for `key`, and whether it was one already kept rather than read for this call.
+  /// `refresh` reads afresh even when a listing for `key` is kept.
+  private func touchscreens(
+    for key: Key, refresh: Bool, read: @escaping @Sendable () async throws -> [SimulatorTouchscreen]
+  ) async throws -> (touchscreens: [SimulatorTouchscreen], kept: Bool) {
+    if !refresh, let listing, listing.key == key {
+      return (try await listing.task.value, true)
     }
     let task = Task { try await read() }
-    listing = (displayIDs, task)
+    listing = (key, task)
     do {
-      return try await task.value
+      return (try await task.value, false)
     } catch {
       // The actor may have been re-entered during the await, so only forget the listing that failed.
       if listing?.task == task {
