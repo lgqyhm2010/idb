@@ -40,6 +40,8 @@ public enum SimulatorHIDError: Error, LocalizedError {
   case dtuhidUnresponsive(attempts: Int, underlying: Error?)
   /// A touchscreen touch was attempted on a tvOS target, which has no touchscreen.
   case touchUnsupportedOnAppleTV
+  /// A touch was aimed at a display other than the main one, which only the DTUHID transport can address.
+  case touchTargetUnsupportedOnIndigoTransport(displayUniqueID: String)
 
   public var errorDescription: String? {
     switch self {
@@ -80,6 +82,9 @@ public enum SimulatorHIDError: Error, LocalizedError {
         "dtuhidd did not answer a liveness probe in \(attempts) attempts\(detail) — the daemon is not running and launchd is not keeping it up, so every HID event sent to it would be discarded without error"
     case .touchUnsupportedOnAppleTV:
       return "Touch input is not supported on tvOS targets (no touchscreen)"
+    case let .touchTargetUnsupportedOnIndigoTransport(displayUniqueID):
+      return
+        "Cannot route a touch to display \(displayUniqueID): the legacy Indigo HID transport only addresses the main screen"
     }
   }
 

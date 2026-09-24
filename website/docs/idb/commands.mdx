@@ -40,6 +40,25 @@ idb hinge 180
 
 Device Hub's Closed, Book and Open presets correspond to 0, 130 and 180 degrees. Reads also observe changes made in Device Hub; during an animation they can report an intermediate angle. `get --json` prints an object such as `{"angle": 130.0}`. A read fails if the simulator cannot provide a fresh valid sample within five seconds.
 
+## Simulator displays
+
+A foldable simulator has more than one integrated display, and only one of them is lit at a time: on iPhone Duo the cover display when closed, the inner display when open. `idb list-displays` lists each display with its identity, size, rotation, whether it is active and whether touches can be routed to it.
+
+```
+idb list-displays
+idb list-displays --json
+```
+
+Coordinate touches go to the main display unless `--display` names another. `idb ui tap`, `swipe`, `multi-tap` and `pinch` accept `--display ID`, with an identity from `list-displays`, or `--display active` for whichever integrated display is lit. The coordinates are in that display's current interface orientation, the same space a screenshot of it is in. A display that is unknown, not lit, or has no touchscreen fails the command rather than delivering the touch to the main display, and so does a companion that predates display routing.
+
+```
+idb hinge 180
+idb ui tap --display active 334 896
+idb ui swipe --display active 80 500 600 500
+```
+
+Buttons and keys are not display-specific: `idb ui button`, `text` and `key` reach whichever app is in front.
+
 ## iOS Target Manipulation
 
 All `idb` cli commands run against a specific iOS Target (Simulator or Device). Since a single host will almost certainly have more than one target attached, there needs to be a way of specifying which iOS Target to run the command against.

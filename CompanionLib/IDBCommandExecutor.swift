@@ -543,9 +543,22 @@ public final class IDBCommandExecutor {
     return try await device.diagnosticInformation.fetch() as NSDictionary
   }
 
-  public func hid(_ event: SimulatorHIDEvent) async throws {
+  /// `touchTarget` routes the event's touches to one display's touchscreen; nil sends them to the main screen.
+  public func hid(_ event: SimulatorHIDEvent, touchTarget: SimulatorTouchTarget? = nil) async throws {
     let hid = try await connectToHID()
-    try await event.send(on: hid)
+    try await event.send(on: hid, target: touchTarget)
+  }
+
+  /// The touchscreen of a display; nil selects the active integrated display.
+  public func touch_target(displayUniqueID: String?) async throws -> SimulatorTouchTarget {
+    try await simulatorTarget().displays.touchTarget(displayUniqueID: displayUniqueID)
+  }
+
+  /// The displays, and the identities of those a touchscreen covers.
+  public func list_displays() async throws -> (displays: [SimulatorDisplay], touchscreenDisplayIDs: Set<String>) {
+    let commands = try simulatorTarget().displays
+    let displays = try await commands.list()
+    return (displays, Set(try await commands.touchscreensIfSupported().map(\.displayUniqueID)))
   }
 
   public func set_hardware_keyboard_enabled(_ enabled: Bool) async throws {

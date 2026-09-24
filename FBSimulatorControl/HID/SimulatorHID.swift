@@ -227,8 +227,9 @@ public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
   // MARK: - Dispatch
 
   /// Sends a (possibly composite) event, logging each sub-event, then drains once if any sub-event reached
-  /// the HID transport — so a tap or typed string settles once, not per primitive.
-  public func send(event: SimulatorHIDEvent, logger: ControlCoreLogger) async throws {
+  /// the HID transport — so a tap or typed string settles once, not per primitive. `target` routes its
+  /// touches to one display's touchscreen; nil sends them to the main screen.
+  public func send(event: SimulatorHIDEvent, target: SimulatorTouchTarget? = nil, logger: ControlCoreLogger) async throws {
     var wroteToTransport = false
     for subEvent in event.subEvents ?? [event] {
       switch subEvent {
@@ -238,7 +239,7 @@ public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
         .deviceOrientation, .hinge, .lockDevice, .shake, .toggleInCallStatusBar, .composite:
         logger.log("Sending \(subEvent)")
       }
-      if try await deliver(subEvent) {
+      if try await deliver(subEvent, target: target) {
         wroteToTransport = true
       }
     }
@@ -248,10 +249,11 @@ public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
   }
 
   /// Routes one event to its transport; returns whether it went to the HID transport (which decides the drain).
-  func deliver(_ event: SimulatorHIDEvent) async throws -> Bool {
+  /// `target` applies to touches only: buttons and keys have no display.
+  func deliver(_ event: SimulatorHIDEvent, target: SimulatorTouchTarget? = nil) async throws -> Bool {
     switch event {
     case let .touch(direction, x, y, edge):
-      try await transport.sendTouch(direction: direction, x: x, y: y, edge: edge)
+      try await transport.sendTouch(direction: direction, x: x, y: y, edge: edge, target: target)
       return true
     case let .button(direction, button):
       try await transport.sendButton(direction: direction, button: button)
@@ -263,7 +265,7 @@ public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
       try await transport.sendKeyboard(direction: direction, keyCode: keyCode)
       return true
     case let .twoFingerTouch(direction, finger1, finger2):
-      try await transport.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2)
+      try await transport.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2, target: target)
       return true
     case let .trackpad(phase, point):
       try await sendTrackpad(point: point, phase: phase)
@@ -292,7 +294,7 @@ public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
       return false
     case let .composite(events):
       var wrote = false
-      for event in events where try await deliver(event) {
+      for event in events where try await deliver(event, target: target) {
         wrote = true
       }
       return wrote

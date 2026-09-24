@@ -71,22 +71,39 @@ enum SimulatorHIDTransport: Sendable {
 
   /// Sends a single-finger touch at the given point (in points). `edge` tags the contact as
   /// originating at a screen edge, which is how the guest recognises a system edge gesture.
+  ///
+  /// `target` routes the touch to one display's touchscreen. Only DTUHID can address one; Indigo
+  /// refuses rather than delivering it to the main screen.
   func sendTouch(
-    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge
+    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge,
+    target: SimulatorTouchTarget? = nil
   ) async throws {
     switch self {
-    case let .indigo(indigo): try await indigo.sendTouch(direction: direction, x: x, y: y, edge: edge)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _): try await dtuhid.sendTouch(direction: direction, x: x, y: y, edge: edge)
+    case let .indigo(indigo):
+      try Self.requireMainScreen(target)
+      try await indigo.sendTouch(direction: direction, x: x, y: y, edge: edge)
+    case let .dtuhid(dtuhid), let .mixed(dtuhid, _):
+      try await dtuhid.sendTouch(direction: direction, x: x, y: y, edge: edge, target: target)
     }
   }
 
   /// Sends a two-finger touch (for multi-touch gestures) at the given points (in points).
-  func sendTwoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint) async throws {
+  func sendTwoFingerTouch(
+    direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint, target: SimulatorTouchTarget? = nil
+  ) async throws {
     switch self {
     case let .indigo(indigo):
+      try Self.requireMainScreen(target)
       try await indigo.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2)
     case let .dtuhid(dtuhid), let .mixed(dtuhid, _):
-      try await dtuhid.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2)
+      try await dtuhid.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2, target: target)
+    }
+  }
+
+  /// Indigo's digitizer target is fixed to the main screen, so a touch aimed elsewhere cannot be sent on it.
+  static func requireMainScreen(_ target: SimulatorTouchTarget?) throws {
+    if let target {
+      throw SimulatorHIDError.touchTargetUnsupportedOnIndigoTransport(displayUniqueID: target.displayUniqueID)
     }
   }
 

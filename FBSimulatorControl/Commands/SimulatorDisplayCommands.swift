@@ -41,6 +41,9 @@ public enum SimulatorDisplayError: Error, LocalizedError {
   case ambiguousActiveDisplays([String])
   case changed
   case screensNotReported(within: TimeInterval)
+  case unknownDisplay(String, known: [String])
+  case inactiveDisplay(String)
+  case noTouchscreen(String)
 
   public var errorDescription: String? {
     switch self {
@@ -48,6 +51,9 @@ public enum SimulatorDisplayError: Error, LocalizedError {
     case .noActiveIntegratedDisplay: "Simulator has no active integrated display"
     case let .ambiguousActiveDisplays(ids): "Simulator has multiple active integrated displays: \(ids.joined(separator: ", "))"
     case .changed: "Simulator display changed during capture"
+    case let .unknownDisplay(id, known): "Simulator has no display \(id); it has: \(known.joined(separator: ", "))"
+    case let .inactiveDisplay(id): "Display \(id) is not active, so touches sent to it would reach nothing"
+    case let .noTouchscreen(id): "Display \(id) has no touchscreen to route touches to"
     }
   }
 }
@@ -71,6 +77,27 @@ public struct SimulatorDisplayCommands {
     return try await simulator.coreDevice.send(
       service: SimulatorTouchscreenProtocol.service, message: SimulatorTouchscreenProtocol.request(),
       decode: SimulatorTouchscreenProtocol.touchscreens)
+  }
+
+  /// Lists connected touchscreens, or none when the provider cannot say which display each one covers.
+  public func touchscreensIfSupported() async throws -> [SimulatorTouchscreen] {
+    do {
+      return try await touchscreens()
+    } catch SimulatorCoreDeviceError.unsupported(_) {
+      return []
+    }
+  }
+
+  /// The touchscreen to route touches to for a display; nil selects the active integrated display.
+  public func touchTarget(displayUniqueID: String?) async throws -> SimulatorTouchTarget {
+    guard simulator.productFamily.hasTouchscreen else { throw SimulatorHIDError.touchUnsupportedOnAppleTV }
+    let displays = try await list()
+    let simulator = self.simulator
+    let topology = simulator.commandCache.resolve { SimulatorTouchscreenTopology() }
+    let screens = try await topology.touchscreens(forDisplays: Set(displays.map(\.uniqueID))) {
+      try await SimulatorDisplayCommands.commands(with: simulator).touchscreens()
+    }
+    return try SimulatorTouchTarget.resolve(displayUniqueID: displayUniqueID, displays: displays, touchscreens: screens)
   }
 
   /// Returns nil only when the provider lacks the capability needed to select a display.

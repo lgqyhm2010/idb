@@ -8,6 +8,7 @@
 from argparse import ArgumentParser, Namespace
 
 from idb.cli import ClientCommand
+from idb.cli.commands.displays import add_display_argument, display_kwargs
 from idb.common.hid import (
     iterator_to_async_iterator,
     key_press_with_modifiers_to_events,
@@ -40,6 +41,7 @@ class MultiTapCommand(ClientCommand):
             type=float,
             default=0.1,
         )
+        add_display_argument(parser)
         super().add_parser_arguments(parser)
 
     async def run_with_client(self, args: Namespace, client: Client) -> None:
@@ -49,6 +51,7 @@ class MultiTapCommand(ClientCommand):
             count=args.count,
             duration=args.duration,
             pause=args.pause,
+            **display_kwargs(args),
         )
 
 
@@ -271,6 +274,7 @@ class SwipeCommand(ClientCommand):
             type=int,
             required=False,
         )
+        add_display_argument(parser)
         super().add_parser_arguments(parser)
 
     async def run_with_client(self, args: Namespace, client: Client) -> None:
@@ -279,6 +283,7 @@ class SwipeCommand(ClientCommand):
             p_end=(args.x_end, args.y_end),
             duration=args.duration,
             delta=args.delta,
+            **display_kwargs(args),
         )
 
 
@@ -306,6 +311,7 @@ class PinchCommand(ClientCommand):
             type=float,
             default=100.0,
         )
+        add_display_argument(parser)
         super().add_parser_arguments(parser)
 
     async def run_with_client(self, args: Namespace, client: Client) -> None:
@@ -315,4 +321,5 @@ class PinchCommand(ClientCommand):
             scale=args.scale,
             duration=args.duration,
             radius=args.radius,
+            **display_kwargs(args),
         )

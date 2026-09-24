@@ -152,6 +152,52 @@ final class SimulatorDTUHIDTransportTests: XCTestCase {
     XCTAssertEqual(xpc_dictionary_get_double(pointTwo!, "y"), 0.5, accuracy: 1e-9)
   }
 
+  // MARK: - Display targets
+
+  func testMainScreenTouchKeepsTargetZeroAndTheMainGeometry() throws {
+    let transport = makeTransport(DrainRecorder())
+    let payload = try digitizerPayload(transport.digitizerEvent(CGPoint(x: 25, y: 50), eventType: .start, target: nil))
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "target"), 0)
+    let point = xpc_dictionary_get_dictionary(payload, "pointOne")!
+    XCTAssertEqual(xpc_dictionary_get_double(point, "x"), 0.5, accuracy: 1e-9)
+    XCTAssertEqual(xpc_dictionary_get_double(point, "y"), 0.5, accuracy: 1e-9)
+  }
+
+  // A touch aimed at a display other than the main one must name that display's digitizer target and
+  // be normalized against that display: target zero or the main geometry lands it on the main screen.
+  // The inner display here is upright, so the ratio is the plain one.
+  func testTouchAimedAtADisplayCarriesItsTargetAndNormalizesAgainstIt() throws {
+    let transport = makeTransport(DrainRecorder())
+    let payload = try digitizerPayload(
+      transport.digitizerEvent(CGPoint(x: 334.5, y: 951), eventType: .start, edge: .bottom, target: innerTarget))
+    XCTAssertEqual(xpc_get_type(xpc_dictionary_get_value(payload, "target")!), XPC_TYPE_UINT64, "target must be uint64")
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "target"), 2)
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "edge"), UInt64(SimulatorHIDEdge.bottom.rawValue))
+    let point = xpc_dictionary_get_dictionary(payload, "pointOne")!
+    XCTAssertEqual(xpc_dictionary_get_double(point, "x"), 0.5, accuracy: 1e-9)
+    XCTAssertEqual(xpc_dictionary_get_double(point, "y"), 1.0, accuracy: 1e-9)
+  }
+
+  func testTwoFingerTouchAimedAtADisplayCarriesItsTarget() throws {
+    let transport = makeTransport(DrainRecorder())
+    let payload = try digitizerPayload(
+      transport.digitizerEvent(CGPoint(x: 0, y: 0), CGPoint(x: 669, y: 951), eventType: .position, target: innerTarget))
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "target"), 2)
+    let pointTwo = xpc_dictionary_get_dictionary(payload, "pointTwo")!
+    XCTAssertEqual(xpc_dictionary_get_double(pointTwo, "x"), 1.0, accuracy: 1e-9)
+    XCTAssertEqual(xpc_dictionary_get_double(pointTwo, "y"), 1.0, accuracy: 1e-9)
+  }
+
+  func testIndigoRefusesATouchAimedAtAnotherDisplay() {
+    XCTAssertNoThrow(try SimulatorHIDTransport.requireMainScreen(nil))
+    XCTAssertThrowsError(try SimulatorHIDTransport.requireMainScreen(innerTarget)) { error in
+      guard case let .touchTargetUnsupportedOnIndigoTransport(displayUniqueID)? = error as? SimulatorHIDError else {
+        return XCTFail("Expected touchTargetUnsupportedOnIndigoTransport, got \(error)")
+      }
+      XCTAssertEqual(displayUniqueID, "inner")
+    }
+  }
+
   // MARK: - Button encoding
 
   func testButtonUsageMapping() {
@@ -661,6 +707,14 @@ final class SimulatorDTUHIDTransportTests: XCTestCase {
           throw DTUHIDLivenessFailure.timedOut
         }
       })
+  }
+
+  /// The iPhone Duo's inner display: 669x951 points at @3x, addressed as digitizer target 2.
+  private let innerTarget = SimulatorTouchTarget(
+    displayUniqueID: "inner", digitizerTarget: 2, pixelSize: CGSize(width: 2007, height: 2853), scale: 3)
+
+  private func digitizerPayload(_ event: IndigoDigitizerEvent) throws -> xpc_object_t {
+    try XCTUnwrap(xpc_dictionary_get_dictionary(try encodeDigitizer(event), "payload"))
   }
 
   private func encodeDigitizer(_ event: IndigoDigitizerEvent) throws -> xpc_object_t {

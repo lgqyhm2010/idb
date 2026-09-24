@@ -681,9 +681,44 @@ class HIDHinge:
             raise ValueError("Hinge angle must be finite and between 0 and 180 degrees")
 
 
+# Selects the active integrated display, in place of a display's unique id.
+ACTIVE_DISPLAY = "active"
+
+
+@dataclass(frozen=True)
+class HIDDisplay:
+    """Routes the touches after it in the same HID stream to one display's
+    touchscreen. An empty unique_id selects the active integrated display."""
+
+    unique_id: str
+
+
 HIDEvent = Union[
-    HIDPress, HIDSwipe, HIDDelay, HIDPinch, HIDOrientation, HIDShake, HIDHinge
+    HIDPress,
+    HIDSwipe,
+    HIDDelay,
+    HIDPinch,
+    HIDOrientation,
+    HIDShake,
+    HIDHinge,
+    HIDDisplay,
 ]
+
+
+@dataclass(frozen=True)
+class DisplayInfo:
+    unique_id: str
+    name: str
+    active: bool
+    primary: bool
+    integrated: bool
+    # Size in the display's unrotated pixel space.
+    width: float
+    height: float
+    scale: float
+    rotation: str
+    # Whether touches can be routed to it.
+    touchscreen: bool
 
 
 @dataclass(frozen=True)
@@ -1005,7 +1040,13 @@ class Client(ABC):
         pass
 
     @abstractmethod
-    async def tap(self, x: float, y: float, duration: float | None = None) -> None:
+    async def tap(
+        self,
+        x: float,
+        y: float,
+        duration: float | None = None,
+        display: str | None = None,
+    ) -> None:
         pass
 
     @abstractmethod
@@ -1016,6 +1057,7 @@ class Client(ABC):
         count: int = 2,
         duration: float | None = None,
         pause: float = 0.1,
+        display: str | None = None,
     ) -> None:
         pass
 
@@ -1046,6 +1088,10 @@ class Client(ABC):
         pass
 
     @abstractmethod
+    async def list_displays(self) -> list[DisplayInfo]:
+        pass
+
+    @abstractmethod
     async def shake(self) -> None:
         pass
 
@@ -1064,6 +1110,7 @@ class Client(ABC):
         p_end: tuple[int, int],
         duration: float | None = None,
         delta: int | None = None,
+        display: str | None = None,
     ) -> None:
         pass
 
@@ -1256,6 +1303,7 @@ class Client(ABC):
         scale: float,
         duration: float = 0.5,
         radius: float = 100.0,
+        display: str | None = None,
     ) -> None: ...
 
     @abstractmethod
