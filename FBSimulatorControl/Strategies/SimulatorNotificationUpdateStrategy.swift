@@ -47,8 +47,10 @@ final class SimulatorNotificationUpdateStrategy: @unchecked Sendable {
     guard let simulator = set.simulator(withUDID: device.udid.uuidString) else {
       return
     }
-    // The notification must not wait on the teardown.
+    // The notification must not wait on the teardown. A reboot numbers the touchscreens afresh behind
+    // the same displays, so the listing kept for routing touches goes with the HID connection.
     Task {
+      await simulator.touchscreenTopology.forget()
       await simulator.hid.disconnect()
     }
     if let simulatorSet = simulator.set {

@@ -17,12 +17,18 @@ struct HidMethodHandler {
   func handle(requestStream: RequestStreamReader<Idb_HIDEvent>, context: ServerContext) async throws -> Idb_HIDResponse {
     // A display selection routes the touches after it in this stream, and only in this stream: the HID
     // connection is shared by every caller, so the selection cannot live on it.
-    var touchTarget: SimulatorTouchTarget?
+    var routing = TouchRouting()
     // An edge selection is scoped to the stream for the same reason.
     var edge = SimulatorHIDEdge.none
     for try await request in requestStream {
       if case let .display(display) = request.event {
-        touchTarget = try await resolveTouchTarget(display)
+        guard !routing.touchIsDown else {
+          throw RPCError(
+            code: .invalidArgument,
+            message: "A display cannot be selected while a touch is down: lift it first, so it ends where it started")
+        }
+        let target = try await resolveTouchTarget(display)
+        routing.select(display, target: target)
         continue
       }
       if case let .edge(selection) = request.event {
@@ -30,7 +36,12 @@ struct HidMethodHandler {
         continue
       }
       let event = try Self.fbSimulatorHIDEvent(from: request, edge: edge)
-      try await commandExecutor.hid(event, touchTarget: touchTarget)
+      if let selection = routing.selectionToResolve(before: event) {
+        let target = try await resolveTouchTarget(selection)
+        routing.resolved(target)
+      }
+      try await commandExecutor.hid(event, touchTarget: routing.target)
+      routing.sent(event)
     }
     return .init()
   }
@@ -53,6 +64,63 @@ struct HidMethodHandler {
       return try await commandExecutor.touch_target(displayUniqueID: Self.displayUniqueID(from: display))
     } catch let error as SimulatorDisplayError {
       throw RPCError(code: Self.rpcCode(for: error), message: error.localizedDescription)
+    } catch let error as SimulatorHIDError {
+      throw RPCError(code: Self.rpcCode(forHIDError: error), message: error.localizedDescription)
+    }
+  }
+
+  /// Where one stream's touches go after a display selection. The target is resolved when the display
+  /// is selected, and again before the next touch once a rotation or a hinge change has moved the
+  /// display's geometry or which display is lit, but never while a contact is down: a contact goes to
+  /// one touchscreen from its start to its end.
+  struct TouchRouting {
+    private(set) var selection: Idb_HIDEvent.HIDDisplay?
+    private(set) var target: SimulatorTouchTarget?
+    private(set) var touchIsDown = false
+    private var targetIsStale = false
+
+    mutating func select(_ display: Idb_HIDEvent.HIDDisplay, target: SimulatorTouchTarget) {
+      selection = display
+      resolved(target)
+    }
+
+    /// The selection to resolve again before sending `event`, if its target has gone stale.
+    func selectionToResolve(before event: SimulatorHIDEvent) -> Idb_HIDEvent.HIDDisplay? {
+      guard targetIsStale, !touchIsDown, Self.carriesTouches(event) else {
+        return nil
+      }
+      return selection
+    }
+
+    mutating func resolved(_ target: SimulatorTouchTarget) {
+      self.target = target
+      targetIsStale = false
+    }
+
+    mutating func sent(_ event: SimulatorHIDEvent) {
+      // Only a bare touch leaves a contact down: a tap, swipe or pinch lifts every contact it starts.
+      if case let .touch(direction, _, _, _) = event {
+        touchIsDown = direction == .down
+      }
+      if Self.movesDisplays(event) {
+        targetIsStale = true
+      }
+    }
+
+    static func carriesTouches(_ event: SimulatorHIDEvent) -> Bool {
+      switch event {
+      case .touch, .twoFingerTouch: true
+      case let .composite(events): events.contains(where: carriesTouches)
+      default: false
+      }
+    }
+
+    static func movesDisplays(_ event: SimulatorHIDEvent) -> Bool {
+      switch event {
+      case .deviceOrientation, .hinge: true
+      case let .composite(events): events.contains(where: movesDisplays)
+      default: false
+      }
     }
   }
 
@@ -61,11 +129,21 @@ struct HidMethodHandler {
     display.uniqueID.isEmpty ? nil : display.uniqueID
   }
 
-  /// Naming a display that does not exist is the caller's mistake; the rest describe the device's state.
+  /// Naming a display that does not exist is the caller's mistake, and a runtime that cannot route by
+  /// display never will; the rest describe the device's state.
   static func rpcCode(for error: SimulatorDisplayError) -> RPCError.Code {
     switch error {
     case .unknownDisplay: .invalidArgument
+    case .touchRoutingUnsupported: .unimplemented
     default: .failedPrecondition
+    }
+  }
+
+  /// A target without a touchscreen has no display to route touches to.
+  static func rpcCode(forHIDError error: SimulatorHIDError) -> RPCError.Code {
+    switch error {
+    case .touchUnsupportedOnAppleTV: .unimplemented
+    default: .internalError
     }
   }
 

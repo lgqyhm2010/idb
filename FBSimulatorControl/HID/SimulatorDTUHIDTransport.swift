@@ -177,6 +177,16 @@ struct DigitizerContactTracker {
   }
 }
 
+/// One contact tracker per digitizer target, so contacts on different displays keep their own phases:
+/// a shared tracker would turn one display's `start` into a `position` while another's contact is down.
+struct DigitizerContacts {
+  private var trackers: [UInt64: DigitizerContactTracker] = [:]
+
+  mutating func eventType(for direction: SimulatorHIDDirection, target: UInt64) -> DigitizerEventType {
+    trackers[target, default: DigitizerContactTracker()].eventType(for: direction)
+  }
+}
+
 /**
  The DTUHID transport (Xcode 27 / macOS 26 / iOS 26+).
 
@@ -203,8 +213,8 @@ actor SimulatorDTUHIDTransport {
   private let mainScreenScale: Float
   private let productFamily: ProductFamily
   private let clock: DTUHIDDrainClock
-  private var contact = DigitizerContactTracker()
-  private var twoFingerContact = DigitizerContactTracker()
+  private var contacts = DigitizerContacts()
+  private var twoFingerContacts = DigitizerContacts()
   private var coldDrainState = ColdDrainState.pending
   // A drain claims a snapshot of the send count; later sends remain outstanding.
   private var sendGeneration = 0
@@ -327,7 +337,8 @@ actor SimulatorDTUHIDTransport {
       throw SimulatorHIDError.touchUnsupportedOnAppleTV
     }
     let event = digitizerEvent(
-      CGPoint(x: x, y: y), eventType: contact.eventType(for: direction), edge: edge, target: target)
+      CGPoint(x: x, y: y), eventType: contacts.eventType(for: direction, target: Self.digitizerTarget(target)),
+      edge: edge, target: target)
     try await send(messageType: "IndigoDigitizerEvent", payload: event)
   }
 
@@ -338,12 +349,20 @@ actor SimulatorDTUHIDTransport {
       throw SimulatorHIDError.touchUnsupportedOnAppleTV
     }
     let event = digitizerEvent(
-      finger1, finger2, eventType: twoFingerContact.eventType(for: direction), target: target)
+      finger1, finger2, eventType: twoFingerContacts.eventType(for: direction, target: Self.digitizerTarget(target)),
+      target: target)
     try await send(messageType: "IndigoDigitizerEvent", payload: event)
   }
 
+  /// The digitizer target a touch is addressed to: `target`'s touchscreen, or zero, the main-screen alias.
+  static func digitizerTarget(_ target: SimulatorTouchTarget?) -> UInt64 {
+    // Widening: the touchscreen listing carries the low byte of a 0x100-namespace service ID.
+    target.map { UInt64($0.digitizerTarget) } ?? 0
+  }
+
   /// The digitizer event for one or two contacts given in points, addressed to `target`'s touchscreen
-  /// and normalized against its display, or to the main screen when `target` is nil.
+  /// and normalized against its display, or to the main screen when `target` is nil. The edge is
+  /// given in the same interface orientation as the points and carried through the same rotation.
   nonisolated func digitizerEvent(
     _ first: CGPoint, _ second: CGPoint? = nil, eventType: DigitizerEventType, edge: SimulatorHIDEdge = .none,
     target: SimulatorTouchTarget?
@@ -358,11 +377,8 @@ actor SimulatorDTUHIDTransport {
       pointOne: normalized(first),
       pointTwo: second.map(normalized),
       eventType: eventType,
-      // The edge travels with the point: both are given in the interface orientation and read off the
-      // unrotated panel.
-      edge: UInt64((target?.panelEdge(for: edge) ?? edge).rawValue),
-      // Widening: the touchscreen listing carries the low byte of a 0x100-namespace service ID.
-      target: target.map { UInt64($0.digitizerTarget) } ?? 0)
+      edge: UInt64((target?.digitizerEdge(for: edge) ?? edge).rawValue),
+      target: Self.digitizerTarget(target))
   }
 
   func sendButton(direction: SimulatorHIDDirection, button: SimulatorHIDButton) async throws {

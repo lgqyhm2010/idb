@@ -47,6 +47,8 @@ public enum SimulatorDisplayError: Error, LocalizedError {
   case unknownDisplay(String, known: [String])
   case inactiveDisplay(String)
   case noTouchscreen(String)
+  /// The runtime cannot say which touchscreen covers which display, so touches cannot be routed by display.
+  case touchRoutingUnsupported(String)
 
   public var errorDescription: String? {
     switch self {
@@ -57,6 +59,7 @@ public enum SimulatorDisplayError: Error, LocalizedError {
     case let .unknownDisplay(id, known): "Simulator has no display \(id); it has: \(known.joined(separator: ", "))"
     case let .inactiveDisplay(id): "Display \(id) is not active, so touches sent to it would reach nothing"
     case let .noTouchscreen(id): "Display \(id) has no touchscreen to route touches to"
+    case let .touchRoutingUnsupported(detail): "Simulator cannot route touches to a display: \(detail)"
     }
   }
 }
@@ -93,14 +96,17 @@ public struct SimulatorDisplayCommands {
 
   /// The touchscreen to route touches to for a display; nil selects the active integrated display.
   public func touchTarget(displayUniqueID: String?) async throws -> SimulatorTouchTarget {
-    guard simulator.productFamily.hasTouchscreen else { throw SimulatorHIDError.touchUnsupportedOnAppleTV }
-    let displays = try await list()
     let simulator = self.simulator
-    let topology = simulator.commandCache.resolve { SimulatorTouchscreenTopology() }
-    let screens = try await topology.touchscreens(forDisplays: Set(displays.map(\.uniqueID))) {
-      try await SimulatorDisplayCommands.commands(with: simulator).touchscreens()
+    guard simulator.productFamily.hasTouchscreen else { throw SimulatorHIDError.touchUnsupportedOnAppleTV }
+    do {
+      return try await simulator.touchscreenTopology.touchTarget(
+        displayUniqueID: displayUniqueID,
+        readDisplays: { try await SimulatorDisplayCommands.commands(with: simulator).list() },
+        readTouchscreens: { try await SimulatorDisplayCommands.commands(with: simulator).touchscreens() })
+    } catch let SimulatorCoreDeviceError.unsupported(detail) {
+      // Internal to this module, so callers could only report it as an unexplained failure.
+      throw SimulatorDisplayError.touchRoutingUnsupported(detail)
     }
-    return try SimulatorTouchTarget.resolve(displayUniqueID: displayUniqueID, displays: displays, touchscreens: screens)
   }
 
   /// Returns nil only when the provider lacks the capability needed to select a display.
