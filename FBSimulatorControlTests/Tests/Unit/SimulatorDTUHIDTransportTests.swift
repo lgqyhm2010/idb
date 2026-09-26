@@ -188,6 +188,32 @@ final class SimulatorDTUHIDTransportTests: XCTestCase {
     XCTAssertEqual(xpc_dictionary_get_uint64(payload, "edge"), UInt64(SimulatorHIDEdge.right.rawValue))
   }
 
+  // The edge goes through the display's rotation with the points: on the upside-down inner display, a
+  // swipe up from the bottom of its interface starts at the top of its panel.
+  func testEdgeOfATouchAimedAtARotatedDisplayIsThePanelEdgeItsPointsStartOn() throws {
+    let transport = makeTransport(DrainRecorder())
+    let upsideDown = SimulatorTouchTarget(
+      displayUniqueID: "inner", digitizerTarget: 2, pixelSize: CGSize(width: 2007, height: 2853), scale: 3,
+      rotation: .upsideDown)
+    let payload = try digitizerPayload(
+      transport.digitizerEvent(CGPoint(x: 334.5, y: 951), eventType: .start, edge: .bottom, target: upsideDown))
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "edge"), UInt64(SimulatorHIDEdge.top.rawValue))
+    let point = xpc_dictionary_get_dictionary(payload, "pointOne")!
+    XCTAssertEqual(xpc_dictionary_get_double(point, "y"), 0.0, accuracy: 1e-9)
+  }
+
+  // Contacts on different touchscreens are separate: one display's contact being down must not turn
+  // another display's start into a position.
+  func testContactsOnDifferentTargetsKeepTheirOwnPhases() {
+    var contacts = DigitizerContacts()
+    XCTAssertEqual(contacts.eventType(for: .down, target: 0), .start)
+    XCTAssertEqual(contacts.eventType(for: .down, target: 2), .start)
+    XCTAssertEqual(contacts.eventType(for: .down, target: 2), .position)
+    XCTAssertEqual(contacts.eventType(for: .up, target: 0), .end)
+    XCTAssertEqual(contacts.eventType(for: .up, target: 2), .end)
+    XCTAssertEqual(contacts.eventType(for: .down, target: 0), .start)
+  }
+
   func testTwoFingerTouchAimedAtADisplayCarriesItsTarget() throws {
     let transport = makeTransport(DrainRecorder())
     let payload = try digitizerPayload(

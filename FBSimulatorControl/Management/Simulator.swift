@@ -275,6 +275,11 @@ extension Simulator {
     SimulatorDisplayCommands.commands(with: self)
   }
 
+  /// Which touchscreen covers which display, kept between touches until the simulator changes state.
+  var touchscreenTopology: SimulatorTouchscreenTopology {
+    commandCache.resolve { SimulatorTouchscreenTopology() }
+  }
+
   public var orientation: SimulatorOrientationCommands {
     SimulatorOrientationCommands.commands(with: self)
   }

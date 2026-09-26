@@ -49,37 +49,29 @@ final class SimulatorTouchTargetTests: XCTestCase {
     }
   }
 
-  // Measured on the iPhone Duo unfolded (inner display rot90): a swipe up from the bottom of the
-  // interface flagged with the bottom edge did nothing, and flagged with the right edge went home. The
-  // edge has to take the same rotation as the point, so the midpoint of each interface edge must land
-  // on the panel edge it is flagged with.
-  func testEdgesAreCarriedThroughTheRotationTheirPointsAre() {
+  // An edge swipe aimed at a rotated display starts on the panel edge its points are carried to, so the
+  // edge it is tagged with is carried through the same rotation.
+  func testEdgesAreCarriedThroughTheDisplayRotationWithTheirPoints() {
     let size = CGSize(width: 2007, height: 2853)  // 669x951 points, unrotated
     let rotations: [SimulatorDisplayRotation] = [.upright, .clockwise, .upsideDown, .counterclockwise]
     for rotation in rotations {
       let target = SimulatorTouchTarget(
         displayUniqueID: "inner", digitizerTarget: 2, pixelSize: size, scale: 3, rotation: rotation)
       let sideways = rotation == .clockwise || rotation == .counterclockwise
-      let width: CGFloat = sideways ? 951 : 669
-      let height: CGFloat = sideways ? 669 : 951
+      let interface = sideways ? CGSize(width: 951, height: 669) : CGSize(width: 669, height: 951)
       let midpoints: [(SimulatorHIDEdge, CGPoint)] = [
-        (.top, CGPoint(x: width / 2, y: 0)),
-        (.left, CGPoint(x: 0, y: height / 2)),
-        (.bottom, CGPoint(x: width / 2, y: height)),
-        (.right, CGPoint(x: width, y: height / 2)),
+        (.top, CGPoint(x: interface.width / 2, y: 0)),
+        (.left, CGPoint(x: 0, y: interface.height / 2)),
+        (.bottom, CGPoint(x: interface.width / 2, y: interface.height)),
+        (.right, CGPoint(x: interface.width, y: interface.height / 2)),
       ]
       for (edge, point) in midpoints {
         let ratio = target.digitizerRatio(for: point)
-        let panelEdge: SimulatorHIDEdge
-        switch (ratio.x, ratio.y) {
-        case (_, 0): panelEdge = .top
-        case (0, _): panelEdge = .left
-        case (_, 1): panelEdge = .bottom
-        default: panelEdge = .right
-        }
-        XCTAssertEqual(target.panelEdge(for: edge), panelEdge, "\(rotation) \(edge)")
+        let panelEdge: SimulatorHIDEdge =
+          abs(ratio.y) < 1e-9 ? .top : abs(ratio.x) < 1e-9 ? .left : abs(ratio.y - 1) < 1e-9 ? .bottom : .right
+        XCTAssertEqual(target.digitizerEdge(for: edge), panelEdge, "\(rotation) \(edge)")
       }
-      XCTAssertEqual(target.panelEdge(for: .none), SimulatorHIDEdge.none, "\(rotation)")
+      XCTAssertEqual(target.digitizerEdge(for: .none), .none, "\(rotation)")
     }
   }
 
@@ -151,6 +143,19 @@ final class SimulatorTouchscreenTopologyTests: XCTestCase {
     func read() -> [SimulatorTouchscreen] {
       count += 1
       return attached.map { SimulatorTouchscreen(displayUniqueID: $0, digitizerTarget: UInt32(count)) }
+    }
+  }
+
+  /// Serves display snapshots in order, repeating the last.
+  private actor Snapshots {
+    private var queue: [[SimulatorDisplay]]
+
+    init(_ snapshots: [[SimulatorDisplay]]) {
+      queue = snapshots
+    }
+
+    func read() -> [SimulatorDisplay] {
+      queue.count > 1 ? queue.removeFirst() : queue[0]
     }
   }
 
@@ -240,6 +245,50 @@ final class SimulatorTouchscreenTopologyTests: XCTestCase {
     XCTAssertEqual(count, 3)
   }
 
+  // A fold landing while the listing is read leaves it numbered for the new arrangement, so it is not
+  // kept against the displays read before it: it is read again against the new ones, and kept for them.
+  func testAListingReadAcrossAFoldIsReadAgainAgainstTheNewDisplays() async throws {
+    let topology = SimulatorTouchscreenTopology()
+    let reads = Reads(attached: ["cover", "inner"])
+    let snapshots = Snapshots([folded, unfolded])
+    let target = try await topology.touchTarget(
+      displayUniqueID: nil, readDisplays: { await snapshots.read() }, readTouchscreens: { await reads.read() })
+    XCTAssertEqual(target.displayUniqueID, "inner")
+    XCTAssertEqual(target.digitizerTarget, 2)
+    var count = await reads.count
+    XCTAssertEqual(count, 2)
+
+    _ = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    count = await reads.count
+    XCTAssertEqual(count, 2)
+  }
+
+  func testDisplaysThatChangeDuringEveryReadAreReported() async throws {
+    let topology = SimulatorTouchscreenTopology()
+    let reads = Reads(attached: ["cover", "inner"])
+    let snapshots = Snapshots([folded, unfolded, folded, unfolded])
+    do {
+      _ = try await topology.touchTarget(
+        displayUniqueID: nil, readDisplays: { await snapshots.read() }, readTouchscreens: { await reads.read() })
+      XCTFail("Displays that never hold still should be reported")
+    } catch SimulatorDisplayError.changed {}
+    let count = await reads.count
+    XCTAssertEqual(count, SimulatorTouchscreenTopology.readAttempts)
+  }
+
+  // A reboot numbers the touchscreens afresh behind displays that look the same, which only the
+  // simulator changing state can tell, so a forgotten listing is read again.
+  func testAForgottenListingIsReadAgain() async throws {
+    let topology = SimulatorTouchscreenTopology()
+    let reads = Reads(attached: ["cover", "inner"])
+    _ = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    await topology.forget()
+    let after = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    XCTAssertEqual(after.digitizerTarget, 2)
+    let count = await reads.count
+    XCTAssertEqual(count, 2)
+  }
+
   func testConcurrentResolutionsShareOneRead() async throws {
     let topology = SimulatorTouchscreenTopology()
     let reads = Reads(attached: ["inner"])
@@ -280,6 +329,16 @@ final class SimulatorTouchscreenTopologyTests: XCTestCase {
     } catch SimulatorDisplayError.noTouchscreen("inner") {
       return true
     }
+  }
+}
+
+private extension SimulatorTouchscreenTopology {
+  /// Resolves against displays that hold still while the listing is read.
+  func touchTarget(
+    displayUniqueID: String?, displays: [SimulatorDisplay],
+    read: @escaping @Sendable () async throws -> [SimulatorTouchscreen]
+  ) async throws -> SimulatorTouchTarget {
+    try await touchTarget(displayUniqueID: displayUniqueID, readDisplays: { displays }, readTouchscreens: read)
   }
 }
 
