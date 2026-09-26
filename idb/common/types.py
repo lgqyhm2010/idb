@@ -399,6 +399,22 @@ AccessibilityTarget = Union[AccessibilityPoint, AccessibilityMarker]
 
 
 @dataclass(frozen=True)
+class AccessibilityApplication:
+    """A running application's whole tree, frontmost or not. When two apps
+    share the screen, "frontmost" names only one of them."""
+
+    bundle_id: str
+
+
+# What a read can target: an element to act on, or a whole named application.
+# Actions take AccessibilityTarget, since a whole application is not something
+# to tap.
+AccessibilityReadTarget = Union[
+    AccessibilityPoint, AccessibilityMarker, AccessibilityApplication
+]
+
+
+@dataclass(frozen=True)
 class AccessibilityDragOptions:
     """The three drag phase durations, in seconds, and the distance between
     interpolated touch points, in screen points. None sends the wire's zero,
@@ -693,6 +709,23 @@ class HIDDisplay:
     unique_id: str
 
 
+class HIDEdgeType(Enum):
+    NONE = 0
+    TOP = 1
+    LEFT = 2
+    BOTTOM = 3
+    RIGHT = 4
+
+
+@dataclass(frozen=True)
+class HIDEdge:
+    """Tags the touches after it in the same HID stream, swipes included, as
+    starting at a screen edge, which is what hands a drag to a system gesture
+    such as the home indicator. NONE clears it."""
+
+    edge: HIDEdgeType
+
+
 HIDEvent = Union[
     HIDPress,
     HIDSwipe,
@@ -702,6 +735,7 @@ HIDEvent = Union[
     HIDShake,
     HIDHinge,
     HIDDisplay,
+    HIDEdge,
 ]
 
 
@@ -1111,6 +1145,18 @@ class Client(ABC):
         duration: float | None = None,
         delta: int | None = None,
         display: str | None = None,
+        edge: HIDEdgeType | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def drag(
+        self,
+        points: list[tuple[float, float]],
+        duration: float = 1.0,
+        delta: float | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
     ) -> None:
         pass
 
@@ -1137,7 +1183,7 @@ class Client(ABC):
     @abstractmethod
     async def accessibility_info(
         self,
-        target: AccessibilityTarget | None,
+        target: AccessibilityReadTarget | None,
         options: AccessibilityInfoOptions,
     ) -> AccessibilityInfo:
         pass

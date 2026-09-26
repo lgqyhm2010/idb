@@ -18,6 +18,8 @@ struct HidMethodHandler {
     // A display selection routes the touches after it in this stream, and only in this stream: the HID
     // connection is shared by every caller, so the selection cannot live on it.
     var routing = TouchRouting()
+    // An edge selection is scoped to the stream for the same reason.
+    var edge = SimulatorHIDEdge.none
     for try await request in requestStream {
       if case let .display(display) = request.event {
         guard !routing.touchIsDown else {
@@ -29,7 +31,11 @@ struct HidMethodHandler {
         routing.select(display, target: target)
         continue
       }
-      let event = try Self.fbSimulatorHIDEvent(from: request)
+      if case let .edge(selection) = request.event {
+        edge = try Self.fbSimulatorHIDEdge(from: selection.edge)
+        continue
+      }
+      let event = try Self.fbSimulatorHIDEvent(from: request, edge: edge)
       if let selection = routing.selectionToResolve(before: event) {
         let target = try await resolveTouchTarget(selection)
         routing.resolved(target)
@@ -38,6 +44,19 @@ struct HidMethodHandler {
       routing.sent(event)
     }
     return .init()
+  }
+
+  static func fbSimulatorHIDEdge(from wire: Idb_HIDEvent.HIDEdgeType) throws -> SimulatorHIDEdge {
+    switch wire {
+    case .edgeNone: .none
+    case .edgeTop: .top
+    case .edgeLeft: .left
+    case .edgeBottom: .bottom
+    case .edgeRight: .right
+    case .UNRECOGNIZED:
+      // Guessing an edge would start a system gesture the caller did not ask for.
+      throw RPCError(code: .invalidArgument, message: "Unrecognized edge")
+    }
   }
 
   private func resolveTouchTarget(_ display: Idb_HIDEvent.HIDDisplay) async throws -> SimulatorTouchTarget {
@@ -128,7 +147,9 @@ struct HidMethodHandler {
     }
   }
 
-  static func fbSimulatorHIDEvent(from request: Idb_HIDEvent) throws -> SimulatorHIDEvent {
+  /// `edge` tags the touches and swipes the request carries; it comes from an earlier `HIDEdge` in the
+  /// stream, since the request itself has nowhere to say it.
+  static func fbSimulatorHIDEvent(from request: Idb_HIDEvent, edge: SimulatorHIDEdge = .none) throws -> SimulatorHIDEvent {
     switch request.event {
     case let .press(press):
       switch press.action.action {
@@ -158,9 +179,9 @@ struct HidMethodHandler {
       case let .touch(touch):
         switch press.direction {
         case .up:
-          return .touch(direction: .up, x: touch.point.x, y: touch.point.y)
+          return .touch(direction: .up, x: touch.point.x, y: touch.point.y, edge: edge)
         case .down:
-          return .touch(direction: .down, x: touch.point.x, y: touch.point.y)
+          return .touch(direction: .down, x: touch.point.x, y: touch.point.y, edge: edge)
         case .UNRECOGNIZED:
           throw RPCError(code: .invalidArgument, message: "Unrecognized press.direction")
         }
@@ -176,7 +197,8 @@ struct HidMethodHandler {
         xEnd: swipe.end.x,
         yEnd: swipe.end.y,
         delta: swipe.delta,
-        duration: swipe.duration)
+        duration: swipe.duration,
+        edge: edge)
 
     case let .delay(delay):
       return SimulatorHIDEvent.delay(delay.duration)
@@ -207,6 +229,9 @@ struct HidMethodHandler {
 
     case .display:
       throw RPCError(code: .invalidArgument, message: "A display selection routes the events after it and is not an event itself")
+
+    case .edge:
+      throw RPCError(code: .invalidArgument, message: "An edge selection tags the touches after it and is not an event itself")
 
     case .none:
       throw RPCError(code: .invalidArgument, message: "Unrecognized request.event")

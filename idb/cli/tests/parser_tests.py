@@ -22,6 +22,7 @@ from idb.cli.main import gen_main as cli_main, get_default_companion_path
 from idb.common import plugin
 from idb.common.command import Command, CommandGroup
 from idb.common.types import (
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -44,6 +45,7 @@ from idb.common.types import (
     HIDButtonType,
     HIDDelay,
     HIDDirection,
+    HIDEdgeType,
     HIDOrientationType,
     IdbException,
     InstalledArtifact,
@@ -2300,6 +2302,55 @@ class TestParser(TestCase):
             p_start=(1, 2), p_end=(3, 4), duration=None, delta=None
         )
 
+    async def test_swipe_from_an_edge(self) -> None:
+        self.client_mock.swipe = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=["ui", "swipe", "1", "2", "3", "4", "--edge", "bottom"]
+        )
+        self.client_mock.swipe.assert_called_once_with(
+            p_start=(1, 2),
+            p_end=(3, 4),
+            duration=None,
+            delta=None,
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_passes_its_path_display_and_edge(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=[
+                "ui",
+                "drag",
+                "236",
+                "668",
+                "236",
+                "600",
+                "700",
+                "330",
+                "--duration",
+                "2",
+                "--display",
+                "active",
+                "--edge",
+                "bottom",
+            ]
+        )
+        self.client_mock.drag.assert_called_once_with(
+            points=[(236.0, 668.0), (236.0, 600.0), (700.0, 330.0)],
+            duration=2.0,
+            delta=None,
+            display="active",
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_needs_whole_pairs_of_at_least_two_points(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        for coordinates in [["1", "2"], ["1", "2", "3"]]:
+            with self.subTest(coordinates=coordinates):
+                exit_code = await cli_main(cmd_input=["ui", "drag", *coordinates])
+                self.assertEqual(exit_code, 1)
+        self.client_mock.drag.assert_not_called()
+
     async def test_contacts_update(self) -> None:
         self.client_mock.contacts_update = AsyncMock(return_value=[])
         await cli_main(cmd_input=["contacts", "update", "/dev/null"])
@@ -2497,6 +2548,14 @@ class TestParser(TestCase):
         await cli_main(cmd_input=["ui", "describe-all"])
         self.client_mock.accessibility_info.assert_called_once_with(
             target=None,
+            options=AccessibilityInfoOptions(nested=False),
+        )
+
+    async def test_accessibility_info_all_of_a_named_app(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(cmd_input=["ui", "describe-all", "--bundle-id", "com.a.b"])
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityApplication(bundle_id="com.a.b"),
             options=AccessibilityInfoOptions(nested=False),
         )
 

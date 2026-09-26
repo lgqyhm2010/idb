@@ -11,7 +11,7 @@ import Foundation
 import GRPCCore
 import IDBGRPCSwift
 
-/// Seam over the two `IDBCommandExecutor` reads this handler drives, so the request-to-options wiring
+/// Seam over the three `IDBCommandExecutor` reads this handler drives, so the request-to-options wiring
 /// can be tested against a double.
 protocol AccessibilityDescribing {
   func accessibility_describe(
@@ -22,6 +22,12 @@ protocol AccessibilityDescribing {
 
   func accessibility_info_at_point(
     _ value: NSValue?,
+    options: AccessibilityRequestOptions,
+    backend: UIAutomationBackend
+  ) async throws -> AccessibilityElementsResponse
+
+  func accessibility_info_for_application(
+    bundleID: String,
     options: AccessibilityRequestOptions,
     backend: UIAutomationBackend
   ) async throws -> AccessibilityElementsResponse
@@ -56,8 +62,16 @@ struct AccessibilityInfoMethodHandler {
         $0.json = String(data: data, encoding: .utf8) ?? ""
       }
     }
-    let response = try await commandExecutor.accessibility_info_at_point(
-      AccessibilityInfoRequestTranslation.point(from: request), options: options, backend: backend)
+    // A bundle id reads that application's whole tree; validate() has already refused it beside a point.
+    let response: AccessibilityElementsResponse
+    if let bundleID = AccessibilityInfoRequestTranslation.bundleID(from: request) {
+      response = try await commandExecutor.accessibility_info_for_application(
+        bundleID: bundleID, options: options,
+        backend: try AccessibilityInfoRequestTranslation.applicationBackend(from: request.backend))
+    } else {
+      response = try await commandExecutor.accessibility_info_at_point(
+        AccessibilityInfoRequestTranslation.point(from: request), options: options, backend: backend)
+    }
     let jsonData = try AccessibilityInfoRequestTranslation.responseJSON(from: response, format: format)
     return .with {
       $0.json = String(data: jsonData, encoding: .utf8) ?? ""

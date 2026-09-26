@@ -261,6 +261,18 @@ public final class IDBCommandExecutor {
     return try await simulator.uiAutomation(backend: backend).describe(query, options: options)
   }
 
+  /// The whole tree of the running application `bundleID`, frontmost or not. Throws if it is not
+  /// running, rather than describing whatever is frontmost in its place. `backend` has no default: the
+  /// CoreSimulator one answers a pid read with no translation object, so the caller has to choose one
+  /// that can read by pid (see `AccessibilityInfoRequestTranslation.applicationBackend(from:)`).
+  public func accessibility_info_for_application(bundleID: String, options: AccessibilityRequestOptions, backend: UIAutomationBackend) async throws -> AccessibilityElementsResponse {
+    guard let simulator = target as? Simulator else {
+      throw IDBCommandError.simulatorOnlyOperation(operation: "provide accessibility commands", targetDescription: String(describing: target))
+    }
+    let pid = try await target.application.processID(forBundleID: bundleID)
+    return try await simulator.uiAutomation(backend: backend).describe(.application(pid: pid), options: options)
+  }
+
   // MARK: - REPL screenshot & recording
 
   /// The companion-host directory the target uses for per-target files. REPL

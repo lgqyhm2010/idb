@@ -178,6 +178,16 @@ final class SimulatorDTUHIDTransportTests: XCTestCase {
     XCTAssertEqual(xpc_dictionary_get_double(point, "y"), 1.0, accuracy: 1e-9)
   }
 
+  func testAnEdgeIsSentAsTheEdgeOfTheRotatedPanel() throws {
+    let transport = makeTransport(DrainRecorder())
+    let rotated = SimulatorTouchTarget(
+      displayUniqueID: "inner", digitizerTarget: 2, pixelSize: CGSize(width: 2007, height: 2853), scale: 3,
+      rotation: .clockwise)
+    let payload = try digitizerPayload(
+      transport.digitizerEvent(CGPoint(x: 475, y: 668), eventType: .start, edge: .bottom, target: rotated))
+    XCTAssertEqual(xpc_dictionary_get_uint64(payload, "edge"), UInt64(SimulatorHIDEdge.right.rawValue))
+  }
+
   // The edge goes through the display's rotation with the points: on the upside-down inner display, a
   // swipe up from the bottom of its interface starts at the top of its panel.
   func testEdgeOfATouchAimedAtARotatedDisplayIsThePanelEdgeItsPointsStartOn() throws {

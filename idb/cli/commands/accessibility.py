@@ -17,6 +17,7 @@ from idb.common.types import (
     ACCESSIBILITY_FILTER_BY_NAME,
     ACCESSIBILITY_FORMAT_BY_NAME,
     ACCESSIBILITY_KEY_BY_NAME,
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -302,6 +303,17 @@ class AccessibilityInfoAllCommand(ClientCommand):
             action="store_true",
             default=False,
         )
+        parser.add_argument(
+            "--bundle-id",
+            help=(
+                "Describe this running app's whole tree instead of the frontmost "
+                "app's. With two apps on screen (iPad windows, a split foldable) "
+                "the frontmost read describes only one of them. An older "
+                "companion ignores it and describes the frontmost app; check "
+                "the root element's pid"
+            ),
+            default=None,
+        )
         _add_match_args(parser)
         _add_filter_arg(parser)
         _add_enricher_args(parser)
@@ -311,7 +323,11 @@ class AccessibilityInfoAllCommand(ClientCommand):
     async def run_with_client(self, args: Namespace, client: Client) -> None:
         requested_format = _format(args)
         info = await client.accessibility_info(
-            target=None,
+            target=(
+                AccessibilityApplication(bundle_id=args.bundle_id)
+                if args.bundle_id
+                else None
+            ),
             options=AccessibilityInfoOptions(
                 nested=args.nested,
                 keys=args.keys,

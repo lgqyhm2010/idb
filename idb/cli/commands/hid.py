@@ -13,7 +13,30 @@ from idb.common.hid import (
     iterator_to_async_iterator,
     key_press_with_modifiers_to_events,
 )
-from idb.common.types import Client, HIDButtonType, HIDOrientationType
+from idb.common.types import (
+    Client,
+    HIDButtonType,
+    HIDEdgeType,
+    HIDOrientationType,
+    IdbException,
+)
+
+
+def add_edge_argument(parser: ArgumentParser) -> None:
+    parser.add_argument(
+        "--edge",
+        choices=[edge.name.lower() for edge in HIDEdgeType if edge != HIDEdgeType.NONE],
+        help="Start the gesture at this screen edge, so the device reads it as a "
+        "system gesture (bottom: the home indicator; top: Notification Centre) "
+        "rather than a drag in the app under it. The start point should lie on "
+        "that edge. A companion that predates edges rejects the gesture.",
+    )
+
+
+def edge_kwargs(args: Namespace) -> dict[str, HIDEdgeType]:
+    """Only a chosen edge is passed on, so a command without --edge calls the
+    client exactly as it did before the option existed."""
+    return {} if args.edge is None else {"edge": HIDEdgeType[args.edge.upper()]}
 
 
 class MultiTapCommand(ClientCommand):
@@ -275,6 +298,7 @@ class SwipeCommand(ClientCommand):
             required=False,
         )
         add_display_argument(parser)
+        add_edge_argument(parser)
         super().add_parser_arguments(parser)
 
     async def run_with_client(self, args: Namespace, client: Client) -> None:
@@ -284,6 +308,53 @@ class SwipeCommand(ClientCommand):
             duration=args.duration,
             delta=args.delta,
             **display_kwargs(args),
+            **edge_kwargs(args),
+        )
+
+
+class DragCommand(ClientCommand):
+    @property
+    def description(self) -> str:
+        return (
+            "Hold one touch down along a path of points and lift it at the last; "
+            "unlike swipe, the path can turn corners"
+        )
+
+    @property
+    def name(self) -> str:
+        return "drag"
+
+    def add_parser_arguments(self, parser: ArgumentParser) -> None:
+        parser.add_argument(
+            "coordinates",
+            help="x y pairs of the points the touch passes through, at least two",
+            type=float,
+            nargs="+",
+        )
+        parser.add_argument(
+            "--duration", help="Drag duration in seconds", type=float, default=1.0
+        )
+        parser.add_argument(
+            "--delta",
+            help="Points between touch samples along the path",
+            type=float,
+            required=False,
+        )
+        add_display_argument(parser)
+        add_edge_argument(parser)
+        super().add_parser_arguments(parser)
+
+    async def run_with_client(self, args: Namespace, client: Client) -> None:
+        coordinates = args.coordinates
+        if len(coordinates) < 4 or len(coordinates) % 2:
+            raise IdbException("drag needs x y pairs for at least two points")
+        points = list(zip(coordinates[0::2], coordinates[1::2]))
+        await client.drag(
+            points=points,
+            duration=args.duration,
+            delta=args.delta,
+            **display_kwargs(args),
+            **edge_kwargs(args),
         )
 
 
