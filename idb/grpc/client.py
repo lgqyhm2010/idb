@@ -30,6 +30,8 @@ from idb.common.format import json_format_debugger_info
 from idb.common.gzip import drain_gzip_decompress, gunzip
 from idb.common.hid import (
     button_press_to_events,
+    drag_to_events,
+    from_edge,
     iterator_to_async_iterator,
     key_press_to_events,
     multi_tap_to_events,
@@ -51,6 +53,7 @@ from idb.common.types import (
     AccessibilityInfoOptions,
     AccessibilityMarker,
     AccessibilityPoint,
+    AccessibilityReadTarget,
     AccessibilityScrollDirection,
     AccessibilitySearchableKey,
     AccessibilitySearchDiagnostics,
@@ -76,6 +79,7 @@ from idb.common.types import (
     FileEntryInfo,
     FileListing,
     HIDButtonType,
+    HIDEdgeType,
     HIDEvent,
     HIDHinge,
     HIDOrientationType,
@@ -524,7 +528,7 @@ class Client(ClientBase):
     @log_and_handle_exceptions("accessibility_info")
     async def accessibility_info(
         self,
-        target: AccessibilityTarget | None,
+        target: AccessibilityReadTarget | None,
         options: AccessibilityInfoOptions,
     ) -> AccessibilityInfo:
         response = await self.stub.accessibility_info(
@@ -1216,9 +1220,26 @@ class Client(ClientBase):
         duration: float | None = None,
         delta: int | None = None,
         display: str | None = None,
+        edge: HIDEdgeType | None = None,
     ) -> None:
         await self.send_events(
-            on_display(display, swipe_to_events(p_start, p_end, duration, delta))
+            on_display(
+                display,
+                from_edge(edge, swipe_to_events(p_start, p_end, duration, delta)),
+            )
+        )
+
+    @log_and_handle_exceptions("hid")
+    async def drag(
+        self,
+        points: list[tuple[float, float]],
+        duration: float = 1.0,
+        delta: float | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
+    ) -> None:
+        await self.send_events(
+            on_display(display, from_edge(edge, drag_to_events(points, duration, delta)))
         )
 
     @log_and_handle_exceptions("hid")

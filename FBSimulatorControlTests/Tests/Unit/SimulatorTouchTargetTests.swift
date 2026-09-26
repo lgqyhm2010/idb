@@ -49,6 +49,40 @@ final class SimulatorTouchTargetTests: XCTestCase {
     }
   }
 
+  // Measured on the iPhone Duo unfolded (inner display rot90): a swipe up from the bottom of the
+  // interface flagged with the bottom edge did nothing, and flagged with the right edge went home. The
+  // edge has to take the same rotation as the point, so the midpoint of each interface edge must land
+  // on the panel edge it is flagged with.
+  func testEdgesAreCarriedThroughTheRotationTheirPointsAre() {
+    let size = CGSize(width: 2007, height: 2853)  // 669x951 points, unrotated
+    let rotations: [SimulatorDisplayRotation] = [.upright, .clockwise, .upsideDown, .counterclockwise]
+    for rotation in rotations {
+      let target = SimulatorTouchTarget(
+        displayUniqueID: "inner", digitizerTarget: 2, pixelSize: size, scale: 3, rotation: rotation)
+      let sideways = rotation == .clockwise || rotation == .counterclockwise
+      let width: CGFloat = sideways ? 951 : 669
+      let height: CGFloat = sideways ? 669 : 951
+      let midpoints: [(SimulatorHIDEdge, CGPoint)] = [
+        (.top, CGPoint(x: width / 2, y: 0)),
+        (.left, CGPoint(x: 0, y: height / 2)),
+        (.bottom, CGPoint(x: width / 2, y: height)),
+        (.right, CGPoint(x: width, y: height / 2)),
+      ]
+      for (edge, point) in midpoints {
+        let ratio = target.digitizerRatio(for: point)
+        let panelEdge: SimulatorHIDEdge
+        switch (ratio.x, ratio.y) {
+        case (_, 0): panelEdge = .top
+        case (0, _): panelEdge = .left
+        case (_, 1): panelEdge = .bottom
+        default: panelEdge = .right
+        }
+        XCTAssertEqual(target.panelEdge(for: edge), panelEdge, "\(rotation) \(edge)")
+      }
+      XCTAssertEqual(target.panelEdge(for: .none), SimulatorHIDEdge.none, "\(rotation)")
+    }
+  }
+
   func testNoDisplaySelectsTheActiveIntegratedOne() throws {
     let target = try SimulatorTouchTarget.resolve(displayUniqueID: nil, displays: [cover, inner], touchscreens: touchscreens)
     XCTAssertEqual(target.displayUniqueID, "inner")

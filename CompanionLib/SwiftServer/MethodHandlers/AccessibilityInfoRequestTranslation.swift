@@ -84,6 +84,33 @@ enum AccessibilityInfoRequestTranslation {
     guard request.marker.isEmpty || request.match.isEmpty else {
       throw RPCError(code: .invalidArgument, message: "set either marker or match, not both")
     }
+    // A point and a marker each name something inside whatever is frontmost; letting a bundle id
+    // quietly win or lose against them would describe an app the caller did not name.
+    guard request.bundleID.isEmpty || (!request.hasPoint && request.marker.isEmpty) else {
+      throw RPCError(code: .invalidArgument, message: "bundle_id cannot be combined with point or marker")
+    }
+  }
+
+  /// The application a request names, or nil to describe the frontmost one.
+  static func bundleID(from request: Idb_AccessibilityInfoRequest) -> String? {
+    request.bundleID.isEmpty ? nil : request.bundleID
+  }
+
+  /// The backend for a read of a named application. The CoreSimulator backend only translates the
+  /// frontmost application or a point — measured on iOS 27.1 it answers a pid read with no translation
+  /// object, whose message blames the caller's point — so an unspecified backend means the bridge, and
+  /// asking for AX by name is refused rather than failed with that message.
+  static func applicationBackend(from wire: Idb_AccessibilityInfoRequest.Backend) throws -> UIAutomationBackend {
+    switch wire {
+    case .unspecified, .UNRECOGNIZED:
+      return backend(from: .axbridge)
+    case .ax:
+      throw RPCError(
+        code: .invalidArgument,
+        message: "the ax backend cannot read an application by bundle id; use axbridge or leave the backend unset")
+    case .axbridge, .axbridgePersistent:
+      return backend(from: wire)
+    }
   }
 
   /// `UNSPECIFIED` and an unrecognized value both fall back to the CoreSimulator backend.

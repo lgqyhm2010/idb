@@ -419,6 +419,12 @@ message AccessibilityInfoRequest {
   // Compare match — and, on a marker read, marker — case-insensitively.
   bool ignore_case = 12;
   Filter filter = 13;
+  // Describe this running application's whole tree instead of the frontmost
+  // one's. When two apps share the screen, as on iPadOS windows or a split
+  // foldable, "frontmost" names only one of them. Cannot be combined with
+  // point or marker. An older server ignores this field and describes the
+  // frontmost application, so a caller must check the root element's pid.
+  string bundle_id = 14;
 }
 
 message AccessibilityInfoResponse {
@@ -718,6 +724,23 @@ message HIDEvent {
     string unique_id = 1;
   }
 
+  enum HIDEdgeType {
+    EDGE_NONE = 0;
+    EDGE_TOP = 1;
+    EDGE_LEFT = 2;
+    EDGE_BOTTOM = 3;
+    EDGE_RIGHT = 4;
+  }
+
+  // Tags the touches that follow it in the same `hid` stream, swipes included,
+  // as starting at a screen edge, until the stream ends or another HIDEdge
+  // arrives. The edge flag is what the guest reads to hand a drag to a system
+  // gesture (the home indicator, Notification Centre) instead of to the app
+  // under it. Buttons and keys are unaffected. EDGE_NONE clears it.
+  message HIDEdge {
+    HIDEdgeType edge = 1;
+  }
+
   // Experimental display-selection clients used field 7.
   reserved 7;
 
@@ -734,6 +757,10 @@ message HIDEvent {
     // instead of reading it as some later event, and touches never silently
     // land on the main screen.
     HIDDisplay display = 100;
+    // Numbered beside display for the same reason: a companion that predates
+    // it must reject the stream, not deliver the drag as an ordinary one that
+    // reports success and triggers no system gesture.
+    HIDEdge edge = 101;
   }
 }
 

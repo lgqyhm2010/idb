@@ -77,6 +77,7 @@ from idb.cli.commands.framework import FrameworkInstallCommand
 from idb.cli.commands.help import HelpCommand
 from idb.cli.commands.hid import (
     ButtonCommand,
+    DragCommand,
     KeyCommand,
     KeySequenceCommand,
     MultiTapCommand,
@@ -325,6 +326,7 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
                 KeyCommand(),
                 KeySequenceCommand(),
                 SwipeCommand(),
+                DragCommand(),
                 RotateCommand(),
                 ShakeCommand(),
             ],

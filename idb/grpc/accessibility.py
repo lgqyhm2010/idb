@@ -6,25 +6,27 @@
 
 
 from idb.common.types import (
+    AccessibilityApplication,
     AccessibilityInfoOptions,
     AccessibilityMarker,
     AccessibilityPoint,
-    AccessibilityTarget,
+    AccessibilityReadTarget,
     IdbException,
 )
 from idb.grpc.idb_pb2 import AccessibilityInfoRequest
 
 
 def accessibility_info_to_grpc(
-    target: AccessibilityTarget | None,
+    target: AccessibilityReadTarget | None,
     options: AccessibilityInfoOptions,
 ) -> AccessibilityInfoRequest:
     """The wire request for a read of `target` under `options`.
 
-    Three targets and one option decide which elements come back: no target is
-    the whole app, a point is the element under it, a marker is the single
-    element that resolves, and `match` narrows the whole-app read to the
-    elements whose `match_key` contains a substring.
+    Four targets and one option decide which elements come back: no target is
+    the whole frontmost app, an application is that app's whole tree whether
+    frontmost or not, a point is the element under it, a marker is the single
+    element that resolves, and `match` narrows a whole-app read to the elements
+    whose `match_key` contains a substring.
     """
     if options.format is not None:
         wire_format = options.format.value
@@ -52,11 +54,14 @@ def accessibility_info_to_grpc(
     # point read returns the one element under the point. Refusing here names
     # the caller's mistake rather than letting the companion's INVALID_ARGUMENT,
     # or a silently dropped field, do it.
-    if options.match and target is not None:
+    whole_app = target is None or isinstance(target, AccessibilityApplication)
+    if options.match and not whole_app:
         raise IdbException(
             "accessibility_info: match narrows a whole-app read, so it "
             f"cannot be combined with a {type(target).__name__} target"
         )
+    if isinstance(target, AccessibilityApplication):
+        request.bundle_id = target.bundle_id
     if isinstance(target, AccessibilityMarker):
         request.marker = target.value
         request.match_key = target.match_key.value

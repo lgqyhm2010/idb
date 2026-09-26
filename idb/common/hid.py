@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import math
 from collections.abc import AsyncIterator, Iterable, Iterator
 from typing import Dict, List, Optional, Tuple
 
@@ -15,6 +16,8 @@ from idb.common.types import (
     HIDDelay,
     HIDDirection,
     HIDDisplay,
+    HIDEdge,
+    HIDEdgeType,
     HIDEvent,
     HIDKey,
     HIDOrientation,
@@ -37,6 +40,14 @@ def on_display(display: str | None, events: list[HIDEvent]) -> list[HIDEvent]:
         return events
     unique_id = "" if display == ACTIVE_DISPLAY else display
     return [HIDDisplay(unique_id=unique_id), *events]
+
+
+def from_edge(edge: HIDEdgeType | None, events: list[HIDEvent]) -> list[HIDEvent]:
+    """Tags the touches in `events` as starting at a screen edge, so the guest
+    reads the drag as a system gesture. None leaves them ordinary touches."""
+    if edge is None or edge == HIDEdgeType.NONE:
+        return events
+    return [HIDEdge(edge=edge), *events]
 
 
 def rotate_to_events(orientation: HIDOrientationType) -> list[HIDEvent]:
@@ -100,6 +111,45 @@ def swipe_to_events(
     start = Point(x=p_start[0], y=p_start[1])
     end = Point(x=p_end[0], y=p_end[1])
     return [HIDSwipe(start=start, end=end, delta=delta, duration=duration)]
+
+
+# Points between drag samples when the caller does not say.
+DEFAULT_DRAG_DELTA = 10.0
+
+
+def drag_to_events(
+    points: list[tuple[float, float]],
+    duration: float = 1.0,
+    delta: float | None = None,
+) -> list[HIDEvent]:
+    """One contact held down along a polyline through `points`, lifted at the
+    last. A swipe only goes in a straight line; system gestures such as
+    dragging an app by its home indicator to one side of the screen turn a
+    corner. Samples are `delta` points apart and share `duration` evenly."""
+    if len(points) < 2:
+        raise ValueError("A drag needs at least two points")
+    if duration < 0:
+        raise ValueError("A drag cannot take negative time")
+    step = delta if delta and delta > 0 else DEFAULT_DRAG_DELTA
+    samples = [points[0]]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        count = max(1, math.ceil(math.hypot(x1 - x0, y1 - y0) / step))
+        samples.extend(
+            (x0 + (x1 - x0) * i / count, y0 + (y1 - y0) * i / count)
+            for i in range(1, count + 1)
+        )
+    pause = duration / len(samples)
+    events: list[HIDEvent] = []
+    for x, y in samples:
+        events.append(
+            HIDPress(action=HIDTouch(point=Point(x=x, y=y)), direction=HIDDirection.DOWN)
+        )
+        events.append(HIDDelay(duration=pause))
+    x, y = samples[-1]
+    events.append(
+        HIDPress(action=HIDTouch(point=Point(x=x, y=y)), direction=HIDDirection.UP)
+    )
+    return events
 
 
 def _key_down_event(keycode: int) -> HIDEvent:

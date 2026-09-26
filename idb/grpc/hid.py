@@ -13,6 +13,8 @@ from idb.common.types import (
     HIDDelay,
     HIDDirection,
     HIDDisplay,
+    HIDEdge,
+    HIDEdgeType,
     HIDEvent,
     HIDHinge,
     HIDKey,
@@ -32,6 +34,8 @@ from idb.grpc.idb_pb2 import HIDEvent as GrpcHIDEvent, Point as GrpcPoint
 GrpcHIDButton = GrpcHIDEvent.HIDButton
 GrpcHIDDelay = GrpcHIDEvent.HIDDelay
 GrpcHIDDisplay = GrpcHIDEvent.HIDDisplay
+GrpcHIDEdge = GrpcHIDEvent.HIDEdge
+GrpcHIDEdgeType = GrpcHIDEvent.HIDEdgeType
 GrpcHIDHinge = GrpcHIDEvent.HIDHinge
 GrpcHIDKey = GrpcHIDEvent.HIDKey
 GrpcHIDPinch = GrpcHIDEvent.HIDPinch
@@ -66,6 +70,14 @@ ORIENTATION_TYPE_PAIRS: "List[Tuple[HIDOrientationType, GrpcHIDOrientationType]]
     (HIDOrientationType.PORTRAIT_UPSIDE_DOWN, GrpcHIDEvent.PORTRAIT_UPSIDE_DOWN),
     (HIDOrientationType.LANDSCAPE_LEFT, GrpcHIDEvent.LANDSCAPE_LEFT),
     (HIDOrientationType.LANDSCAPE_RIGHT, GrpcHIDEvent.LANDSCAPE_RIGHT),
+]
+
+EDGE_TYPE_PAIRS: "List[Tuple[HIDEdgeType, GrpcHIDEdgeType]]" = [
+    (HIDEdgeType.NONE, GrpcHIDEvent.EDGE_NONE),
+    (HIDEdgeType.TOP, GrpcHIDEvent.EDGE_TOP),
+    (HIDEdgeType.LEFT, GrpcHIDEvent.EDGE_LEFT),
+    (HIDEdgeType.BOTTOM, GrpcHIDEvent.EDGE_BOTTOM),
+    (HIDEdgeType.RIGHT, GrpcHIDEvent.EDGE_RIGHT),
 ]
 
 
@@ -173,5 +185,9 @@ def event_to_grpc(event: HIDEvent) -> GrpcHIDEvent:
         return GrpcHIDEvent(shake=shake_to_grpc(event))
     elif isinstance(event, HIDDisplay):
         return GrpcHIDEvent(display=GrpcHIDDisplay(unique_id=event.unique_id))
+    elif isinstance(event, HIDEdge):
+        return GrpcHIDEvent(
+            edge=GrpcHIDEdge(edge=_translation_from_pairs(EDGE_TYPE_PAIRS, event.edge))
+        )
     else:
         raise Exception(f"Invalid event {event}")

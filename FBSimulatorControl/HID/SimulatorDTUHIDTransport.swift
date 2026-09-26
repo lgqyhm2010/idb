@@ -358,7 +358,9 @@ actor SimulatorDTUHIDTransport {
       pointOne: normalized(first),
       pointTwo: second.map(normalized),
       eventType: eventType,
-      edge: UInt64(edge.rawValue),
+      // The edge travels with the point: both are given in the interface orientation and read off the
+      // unrotated panel.
+      edge: UInt64((target?.panelEdge(for: edge) ?? edge).rawValue),
       // Widening: the touchscreen listing carries the low byte of a 0x100-namespace service ID.
       target: target.map { UInt64($0.digitizerTarget) } ?? 0)
   }

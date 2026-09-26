@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from grpclib.const import Status
 from grpclib.exceptions import GRPCError
 from idb.common.types import (
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -108,6 +109,25 @@ class AccessibilityInfoRequestTests(TestCase):
         self.assertEqual(request.point.x, 10)
         self.assertEqual(request.point.y, 20)
         self.assertEqual(request.marker, "")
+
+    def test_application_target_names_its_app_and_nothing_inside_it(self) -> None:
+        request = accessibility_info_to_grpc(
+            AccessibilityApplication(bundle_id="com.example.app"),
+            AccessibilityInfoOptions(),
+        )
+        self.assertEqual(request.bundle_id, "com.example.app")
+        self.assertFalse(request.HasField("point"))
+        self.assertEqual(request.marker, "")
+
+    def test_match_narrows_a_named_apps_whole_tree(self) -> None:
+        # A named app is a whole-app read, so a match narrows it just as it
+        # narrows the frontmost read.
+        request = accessibility_info_to_grpc(
+            AccessibilityApplication(bundle_id="com.example.app"),
+            AccessibilityInfoOptions(match="Cart"),
+        )
+        self.assertEqual(request.bundle_id, "com.example.app")
+        self.assertEqual(request.match, "Cart")
 
     # Match
 

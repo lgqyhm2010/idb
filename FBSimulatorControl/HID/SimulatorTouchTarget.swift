@@ -57,6 +57,28 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
     return CGPoint(x: panel.x / width, y: panel.y / height)
   }
 
+  /// An edge of the display's interface orientation, as the edge of its unrotated panel the digitizer
+  /// reads — the same rotation `digitizerRatio(for:)` carries a point through. Without it an edge swipe
+  /// up from the bottom of a rotated display is flagged with a side of the panel it did not start at,
+  /// and the guest treats it as an ordinary drag.
+  public func panelEdge(for edge: SimulatorHIDEdge) -> SimulatorHIDEdge {
+    switch (rotation, edge) {
+    case (_, .none), (.upright, _): return edge
+    case (.clockwise, .top): return .left
+    case (.clockwise, .left): return .bottom
+    case (.clockwise, .bottom): return .right
+    case (.clockwise, .right): return .top
+    case (.upsideDown, .top): return .bottom
+    case (.upsideDown, .left): return .right
+    case (.upsideDown, .bottom): return .top
+    case (.upsideDown, .right): return .left
+    case (.counterclockwise, .top): return .right
+    case (.counterclockwise, .left): return .top
+    case (.counterclockwise, .bottom): return .left
+    case (.counterclockwise, .right): return .bottom
+    }
+  }
+
   /// Joins a display snapshot to the touchscreen listing. `displayUniqueID` nil selects the active
   /// integrated display. Every way the join can fail is an error rather than a fall back to the main
   /// screen: a touch that lands somewhere other than where it was aimed reports success and changes
