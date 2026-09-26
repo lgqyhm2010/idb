@@ -96,11 +96,10 @@ public struct SimulatorDisplayCommands {
     let simulator = self.simulator
     guard simulator.productFamily.hasTouchscreen else { throw SimulatorHIDError.touchUnsupportedOnAppleTV }
     do {
-      let displays = try await list()
-      let topology = simulator.commandCache.resolve { SimulatorTouchscreenTopology() }
-      return try await topology.touchTarget(displayUniqueID: displayUniqueID, displays: displays) {
-        try await SimulatorDisplayCommands.commands(with: simulator).touchscreens()
-      }
+      return try await simulator.touchscreenTopology.touchTarget(
+        displayUniqueID: displayUniqueID,
+        readDisplays: { try await SimulatorDisplayCommands.commands(with: simulator).list() },
+        readTouchscreens: { try await SimulatorDisplayCommands.commands(with: simulator).touchscreens() })
     } catch let SimulatorCoreDeviceError.unsupported(detail) {
       // Internal to this module, so callers could only report it as an unexplained failure.
       throw SimulatorDisplayError.touchRoutingUnsupported(detail)
