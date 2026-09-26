@@ -53,6 +53,8 @@ struct HidMethodHandler {
       return try await commandExecutor.touch_target(displayUniqueID: Self.displayUniqueID(from: display))
     } catch let error as SimulatorDisplayError {
       throw RPCError(code: Self.rpcCode(for: error), message: error.localizedDescription)
+    } catch let error as SimulatorHIDError {
+      throw RPCError(code: Self.rpcCode(forHIDError: error), message: error.localizedDescription)
     }
   }
 
@@ -61,11 +63,21 @@ struct HidMethodHandler {
     display.uniqueID.isEmpty ? nil : display.uniqueID
   }
 
-  /// Naming a display that does not exist is the caller's mistake; the rest describe the device's state.
+  /// Naming a display that does not exist is the caller's mistake, and a runtime that cannot route by
+  /// display never will; the rest describe the device's state.
   static func rpcCode(for error: SimulatorDisplayError) -> RPCError.Code {
     switch error {
     case .unknownDisplay: .invalidArgument
+    case .touchRoutingUnsupported: .unimplemented
     default: .failedPrecondition
+    }
+  }
+
+  /// A target without a touchscreen has no display to route touches to.
+  static func rpcCode(forHIDError error: SimulatorHIDError) -> RPCError.Code {
+    switch error {
+    case .touchUnsupportedOnAppleTV: .unimplemented
+    default: .internalError
     }
   }
 

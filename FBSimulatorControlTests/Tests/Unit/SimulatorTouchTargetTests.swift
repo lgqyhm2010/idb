@@ -135,19 +135,46 @@ final class SimulatorTouchTargetTests: XCTestCase {
 
 final class SimulatorTouchscreenTopologyTests: XCTestCase {
 
+  /// Lists a touchscreen for each attached display, numbered by how many listings have been read.
   private actor Reads {
     var count = 0
+    private var attached: [String]
+
+    init(attached: [String]) {
+      self.attached = attached
+    }
+
+    func attach(_ displayIDs: [String]) {
+      attached = displayIDs
+    }
+
     func read() -> [SimulatorTouchscreen] {
       count += 1
-      return [SimulatorTouchscreen(displayUniqueID: "inner", digitizerTarget: UInt32(count))]
+      return attached.map { SimulatorTouchscreen(displayUniqueID: $0, digitizerTarget: UInt32(count)) }
     }
+  }
+
+  private let size = CGSize(width: 2007, height: 2853)
+  private var folded: [SimulatorDisplay] {
+    [
+      display("cover", active: true, primary: true, size: size),
+      display("inner", active: false, primary: false, size: size),
+    ]
+  }
+  private var unfolded: [SimulatorDisplay] {
+    [
+      display("cover", active: false, primary: true, size: size),
+      display("inner", active: true, primary: false, size: size),
+    ]
   }
 
   func testTheListingIsReusedWhileTheDisplaysAreTheSame() async throws {
     let topology = SimulatorTouchscreenTopology()
-    let reads = Reads()
-    let first = try await topology.touchscreens(forDisplays: ["cover", "inner"]) { await reads.read() }
-    let second = try await topology.touchscreens(forDisplays: ["inner", "cover"]) { await reads.read() }
+    let reads = Reads(attached: ["cover", "inner"])
+    let first = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    let second = try await topology.touchTarget(displayUniqueID: nil, displays: Array(unfolded.reversed())) {
+      await reads.read()
+    }
     XCTAssertEqual(first, second)
     let count = await reads.count
     XCTAssertEqual(count, 1)
@@ -155,22 +182,73 @@ final class SimulatorTouchscreenTopologyTests: XCTestCase {
 
   func testTheListingIsReadAgainWhenTheDisplaysChange() async throws {
     let topology = SimulatorTouchscreenTopology()
-    let reads = Reads()
-    _ = try await topology.touchscreens(forDisplays: ["cover", "inner"]) { await reads.read() }
-    let after = try await topology.touchscreens(forDisplays: ["cover", "inner", "external"]) { await reads.read() }
-    XCTAssertEqual(after.first?.digitizerTarget, 2)
+    let reads = Reads(attached: ["cover", "inner"])
+    _ = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    let external = display("external", active: false, primary: false, size: size)
+    let after = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded + [external]) {
+      await reads.read()
+    }
+    XCTAssertEqual(after.digitizerTarget, 2)
     let count = await reads.count
     XCTAssertEqual(count, 2)
   }
 
+  // A foldable can attach a display's touchscreen only once that display lights up, so the listing
+  // read while it was dark is not reused for it.
+  func testTheListingIsReadAgainWhenADisplayLightsUp() async throws {
+    let topology = SimulatorTouchscreenTopology()
+    let reads = Reads(attached: ["cover"])
+    let closed = try await topology.touchTarget(displayUniqueID: nil, displays: folded) { await reads.read() }
+    XCTAssertEqual(closed.displayUniqueID, "cover")
+
+    await reads.attach(["cover", "inner"])
+    let open = try await topology.touchTarget(displayUniqueID: nil, displays: unfolded) { await reads.read() }
+    XCTAssertEqual(open.displayUniqueID, "inner")
+    XCTAssertEqual(open.digitizerTarget, 2)
+    let count = await reads.count
+    XCTAssertEqual(count, 2)
+  }
+
+  // A kept listing can be stale although the displays look the same, so a display it has no
+  // touchscreen for is looked up once more in a fresh listing; a fresh listing is believed.
+  func testAMissInAKeptListingIsReadOnceMoreBeforeItIsReported() async throws {
+    let topology = SimulatorTouchscreenTopology()
+    let reads = Reads(attached: [])
+
+    // Fresh listing: the miss is reported without another read.
+    var missed = try await innerHasNoTouchscreen(topology, reads)
+    XCTAssertTrue(missed)
+    var count = await reads.count
+    XCTAssertEqual(count, 1)
+
+    // Kept listing: read once more, and the miss stands when the fresh one agrees.
+    missed = try await innerHasNoTouchscreen(topology, reads)
+    XCTAssertTrue(missed)
+    count = await reads.count
+    XCTAssertEqual(count, 2)
+
+    // Kept listing: the fresh one finds the touchscreen that attached since.
+    await reads.attach(["inner"])
+    let target = try await topology.touchTarget(displayUniqueID: "inner", displays: unfolded) { await reads.read() }
+    XCTAssertEqual(target.digitizerTarget, 3)
+    count = await reads.count
+    XCTAssertEqual(count, 3)
+
+    // The fresh listing is the one kept afterwards.
+    _ = try await topology.touchTarget(displayUniqueID: "inner", displays: unfolded) { await reads.read() }
+    count = await reads.count
+    XCTAssertEqual(count, 3)
+  }
+
   func testConcurrentResolutionsShareOneRead() async throws {
     let topology = SimulatorTouchscreenTopology()
-    let reads = Reads()
-    async let first = topology.touchscreens(forDisplays: ["inner"]) {
+    let reads = Reads(attached: ["inner"])
+    let displays = unfolded
+    async let first = topology.touchTarget(displayUniqueID: "inner", displays: displays) {
       try await Task.sleep(for: .milliseconds(50))
       return await reads.read()
     }
-    async let second = topology.touchscreens(forDisplays: ["inner"]) {
+    async let second = topology.touchTarget(displayUniqueID: "inner", displays: displays) {
       try await Task.sleep(for: .milliseconds(50))
       return await reads.read()
     }
@@ -182,14 +260,26 @@ final class SimulatorTouchscreenTopologyTests: XCTestCase {
 
   func testAFailedReadIsNotRemembered() async throws {
     let topology = SimulatorTouchscreenTopology()
-    let reads = Reads()
+    let reads = Reads(attached: ["inner"])
     do {
-      _ = try await topology.touchscreens(forDisplays: ["inner"]) { throw SimulatorDisplayError.changed }
+      _ = try await topology.touchTarget(displayUniqueID: "inner", displays: unfolded) {
+        throw SimulatorDisplayError.changed
+      }
       XCTFail("The failing read should throw")
     } catch {}
-    _ = try await topology.touchscreens(forDisplays: ["inner"]) { await reads.read() }
+    _ = try await topology.touchTarget(displayUniqueID: "inner", displays: unfolded) { await reads.read() }
     let count = await reads.count
     XCTAssertEqual(count, 1)
+  }
+
+  /// Whether resolving the inner display reports that it has no touchscreen.
+  private func innerHasNoTouchscreen(_ topology: SimulatorTouchscreenTopology, _ reads: Reads) async throws -> Bool {
+    do {
+      _ = try await topology.touchTarget(displayUniqueID: "inner", displays: unfolded) { await reads.read() }
+      return false
+    } catch SimulatorDisplayError.noTouchscreen("inner") {
+      return true
+    }
   }
 }
 

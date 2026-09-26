@@ -108,4 +108,10 @@ final class HidRequestTranslationTests: XCTestCase {
       XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
     }
   }
+
+  // A runtime or target that cannot route touches by display never will, however often it is asked.
+  func testDisplayRoutingThatCannotWorkHereIsUnimplemented() {
+    XCTAssertEqual(HidMethodHandler.rpcCode(for: .touchRoutingUnsupported("x")), .unimplemented)
+    XCTAssertEqual(HidMethodHandler.rpcCode(forHIDError: .touchUnsupportedOnAppleTV), .unimplemented)
+  }
 }
