@@ -262,8 +262,10 @@ public final class IDBCommandExecutor {
   }
 
   /// The whole tree of the running application `bundleID`, frontmost or not. Throws if it is not
-  /// running, rather than describing whatever is frontmost in its place.
-  public func accessibility_info_for_application(bundleID: String, options: AccessibilityRequestOptions, backend: UIAutomationBackend = .accessibility) async throws -> AccessibilityElementsResponse {
+  /// running, rather than describing whatever is frontmost in its place. `backend` has no default: the
+  /// CoreSimulator one answers a pid read with no translation object, so the caller has to choose one
+  /// that can read by pid (see `AccessibilityInfoRequestTranslation.applicationBackend(from:)`).
+  public func accessibility_info_for_application(bundleID: String, options: AccessibilityRequestOptions, backend: UIAutomationBackend) async throws -> AccessibilityElementsResponse {
     guard let simulator = target as? Simulator else {
       throw IDBCommandError.simulatorOnlyOperation(operation: "provide accessibility commands", targetDescription: String(describing: target))
     }
