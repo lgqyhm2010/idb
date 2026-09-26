@@ -143,6 +143,9 @@ extension AXBridgeTreeReader {
           screen: AXTreeWalk.screenInfo(fromTree: read.tree),
           truncated: read.truncated
         )
+    case .pointOnDisplay:
+      // The bridge hit-tests in the guest's main-screen space; there is no display to aim it at.
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Describing a point on another display")
     case .frontmost, .application:
       let plan = Self.readPlan(
         for: options,

@@ -26,6 +26,9 @@ public struct SimulatorDisplay: Equatable, Sendable {
   public let bounds: CGRect
   public let scale: Double
   public let rotation: SimulatorDisplayRotation
+  /// The id the display's CoreDevice record carries — what an accessibility hit-test names the display
+  /// by (on the iPhone Duo the inner display is 3). Nil when the provider does not report one.
+  public var displayId: UInt32? = nil
 
   /// Pixel dimensions after applying the current interface rotation.
   public var size: CGSize {

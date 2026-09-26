@@ -2575,6 +2575,16 @@ class TestParser(TestCase):
             options=AccessibilityInfoOptions(nested=False),
         )
 
+    async def test_accessibility_info_at_point_on_a_display(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(
+            cmd_input=["ui", "describe-point", "--display", "active", "10", "20"]
+        )
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityPoint(x=10, y=20),
+            options=AccessibilityInfoOptions(nested=False, display="active"),
+        )
+
     async def test_accessibility_info_at_point_nested(self) -> None:
         self.client_mock.accessibility_info = AsyncMock()
         await cli_main(cmd_input=["ui", "describe-point", "--nested", "10", "20"])

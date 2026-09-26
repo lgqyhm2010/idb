@@ -26,6 +26,7 @@ enum SimulatorDisplayProtocol {
       let pointScale: Int64
       let currentOrientation: SimulatorDisplayRotation
       let type: [String: XPCValue]
+      let displayId: UInt64?
     }
 
     let current: Bool
@@ -79,7 +80,8 @@ enum SimulatorDisplayProtocol {
       displays.append(
         SimulatorDisplay(
           uniqueID: id, name: record.name, isActive: active, isPrimary: record.primary, isIntegrated: validated.integrated,
-          bounds: validated.bounds, scale: Double(record.pointScale), rotation: record.currentOrientation))
+          bounds: validated.bounds, scale: Double(record.pointScale), rotation: record.currentOrientation,
+          displayId: record.displayId.flatMap(UInt32.init(exactly:))))
     }
     return displays.sorted { $0.uniqueID < $1.uniqueID }
   }

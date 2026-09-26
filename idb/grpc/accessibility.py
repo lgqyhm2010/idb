@@ -6,6 +6,7 @@
 
 
 from idb.common.types import (
+    ACTIVE_DISPLAY,
     AccessibilityApplication,
     AccessibilityInfoOptions,
     AccessibilityMarker,
@@ -55,6 +56,11 @@ def accessibility_info_to_grpc(
     # the caller's mistake rather than letting the companion's INVALID_ARGUMENT,
     # or a silently dropped field, do it.
     whole_app = target is None or isinstance(target, AccessibilityApplication)
+    if options.display is not None and not isinstance(target, AccessibilityPoint):
+        raise IdbException(
+            "accessibility_info: a display says where a point is, so it needs a "
+            "point target"
+        )
     if options.match and not whole_app:
         raise IdbException(
             "accessibility_info: match narrows a whole-app read, so it "
@@ -69,6 +75,13 @@ def accessibility_info_to_grpc(
     elif isinstance(target, AccessibilityPoint):
         request.point.x = target.x
         request.point.y = target.y
+        if options.display is not None:
+            # An empty unique id selects the active display, so presence has
+            # to be marked explicitly rather than implied by a non-default value.
+            request.display.SetInParent()
+            request.display.unique_id = (
+                "" if options.display == ACTIVE_DISPLAY else options.display
+            )
     elif options.match:
         request.match = options.match
         request.match_key = options.match_key.value

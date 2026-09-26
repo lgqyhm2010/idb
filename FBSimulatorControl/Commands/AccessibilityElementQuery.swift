@@ -14,6 +14,11 @@ import Foundation
 /// specific application by process identifier.
 public enum AccessibilityElementQuery: Equatable, Sendable {
   case point(CGPoint)
+  /// The element at a point on a display other than the main one, given in that display's unrotated
+  /// panel points and named by its CoreDevice display id. Only the accessibility backend can hit-test
+  /// another display; every other backend and every write refuses it rather than hit-testing the main
+  /// screen, which on an unfolded foldable is dark and answers nothing.
+  case pointOnDisplay(CGPoint, displayId: UInt32)
   /// An element whose `key` value *contains* `value` — a substring match, not an equality test, so
   /// `"General"` finds an element labelled `"General Settings"`. Every backend matches the same way;
   /// the first element found in tree order wins.
@@ -37,7 +42,7 @@ public extension AccessibilityElementQuery {
   /// document shape, so this is what tells a consumer which verb produced the one it is holding.
   var targetDescriptor: AccessibilityTargetDescriptor {
     switch self {
-    case let .point(point):
+    case let .point(point), let .pointOnDisplay(point, _):
       return .point(point)
     case let .marker(value, key, _, _):
       return .marker(value: value, matchKey: key.rawValue)
@@ -56,6 +61,8 @@ extension AccessibilityElementQuery: CustomStringConvertible {
     switch self {
     case let .point(point):
       return "the element at (\(Double(point.x)), \(Double(point.y)))"
+    case let .pointOnDisplay(point, displayId):
+      return "the element at (\(Double(point.x)), \(Double(point.y))) on display \(displayId)"
     case let .marker(value, key, _, ignoresCase):
       // Naming the case-insensitivity matters most in the failure: "no element whose AXLabel contains
       // "ok"" reads as a claim about the screen, when the caller wants to know whether "OK" was

@@ -425,6 +425,12 @@ message AccessibilityInfoRequest {
   // point or marker. An older server ignores this field and describes the
   // frontmost application, so a caller must check the root element's pid.
   string bundle_id = 14;
+  // Hit-test the point on this display instead of the main one; the point is
+  // in the display's interface orientation, as a touch aimed at it is. An
+  // empty unique_id selects the active integrated display. Applies to a point
+  // read only. An older server ignores it and hit-tests the main screen, which
+  // on an unfolded foldable answers nothing.
+  HIDEvent.HIDDisplay display = 15;
 }
 
 message AccessibilityInfoResponse {

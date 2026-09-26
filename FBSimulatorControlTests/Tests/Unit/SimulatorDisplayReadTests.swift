@@ -10,16 +10,22 @@ import Foundation
 import XCTest
 @preconcurrency import XPC
 
-private func displayValue(id: String, active: Bool, primary: Bool = false, rotation: String = "rot0") -> xpc_object_t {
+private func displayValue(
+  id: String, active: Bool, primary: Bool = false, rotation: String = "rot0", displayId: UInt64? = nil
+) -> xpc_object_t {
   let dictionary = SimulatorCoreDevice.dictionary
   let array = SimulatorCoreDevice.array
-  return dictionary([
+  let value = dictionary([
     "uniqueId": xpc_string_create(id), "name": xpc_string_create(id),
     "active": xpc_bool_create(active), "primary": xpc_bool_create(primary),
     "bounds": array([array([xpc_double_create(0), xpc_double_create(0)]), array([xpc_double_create(2007), xpc_double_create(2853)])]),
     "pointScale": xpc_int64_create(3), "currentOrientation": xpc_string_create(rotation),
     "type": dictionary(["integrated": dictionary([:])]),
   ])
+  if let displayId {
+    xpc_dictionary_set_uint64(value, "displayId", displayId)
+  }
+  return value
 }
 
 private func displayReply(_ values: [xpc_object_t], current: Bool = true) -> xpc_object_t {
@@ -92,6 +98,18 @@ final class SimulatorDisplayReadTests: XCTestCase {
       XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([value])), key)
     }
     XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([displayValue(id: "", active: true)])))
+  }
+
+  // Measured on the iPhone Duo: the CoreDevice records number the main display 1 and the inner one 3, and
+  // an accessibility hit-test names a display by that number.
+  func testDisplayIdIsReadWhenReported() throws {
+    let displays = try SimulatorDisplayProtocol.displays(
+      displayReply([
+        displayValue(id: "cover", active: false, primary: true, displayId: 1),
+        displayValue(id: "inner", active: true, rotation: "rot90", displayId: 3),
+        displayValue(id: "unnumbered", active: false),
+      ]))
+    XCTAssertEqual(displays.map(\.displayId), [1, 3, nil])
   }
 
   func testExplicitActivitySelectsInnerDespiteNonemptyPrimaryBounds() throws {

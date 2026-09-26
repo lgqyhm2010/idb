@@ -752,7 +752,7 @@ final class AccessibilitySerializationTests: XCTestCase {
     options.filter = .interactable
     options.format = .nested
 
-    let response = try AXTranslationRequest(kind: .point(.zero)).run(element, options: options)
+    let response = try AXTranslationRequest(kind: .point(.zero, displayId: 0)).run(element, options: options)
     guard case let .single(target) = response.elements else {
       return XCTFail("a point read yields one element, got \(response.elements)")
     }

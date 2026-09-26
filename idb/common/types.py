@@ -510,6 +510,11 @@ class AccessibilityInfoOptions:
     # Compare `match` — and a marker, on a read — case-insensitively.
     ignore_case: bool = False
     filter: AccessibilityElementFilter | None = None
+    # Hit-test a point read on this display instead of the main one: a display
+    # unique id from `idb list-displays`, or ACTIVE_DISPLAY for the lit
+    # integrated display. The point is in the display's interface orientation,
+    # as a touch aimed at it is. Only meaningful with a point target.
+    display: str | None = None
 
 
 class AccessibilityScrollDirection(Enum):

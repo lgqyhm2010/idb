@@ -26,6 +26,7 @@ public enum IDBCommandError: Error {
   case noDebugServer
   case debugServerAlreadyRunning
   case notPersistedApplication(bundleID: String, suitable: [String])
+  case displayIdUnreported(displayUniqueID: String)
   case noAppBundleExtracted
   case userDevelopmentSigningRequired(applicationDescription: String)
 }
@@ -61,6 +62,8 @@ extension IDBCommandError: LocalizedError {
       return "No app bundle could be extracted"
     case let .userDevelopmentSigningRequired(applicationDescription):
       return "Requested debuggable install of \(applicationDescription) but User Development signing is required"
+    case let .displayIdUnreported(displayUniqueID):
+      return "The simulator does not report an id for display \(displayUniqueID), so it cannot be hit-tested"
     }
   }
 }
@@ -259,6 +262,22 @@ public final class IDBCommandExecutor {
     }
     let query: AccessibilityElementQuery = value.map { .point($0.pointValue) } ?? .frontmost
     return try await simulator.uiAutomation(backend: backend).describe(query, options: options)
+  }
+
+  /// The element at `point` on a display other than the main one. `point` is in the display's
+  /// interface orientation, as a touch aimed at it is; `displayUniqueID` nil selects the active
+  /// integrated display. The hit-test is made on that display, in its panel space — hit-testing the main
+  /// screen instead, as a plain point read does, answers nothing on an unfolded foldable.
+  public func accessibility_info_at_point(_ point: CGPoint, onDisplay displayUniqueID: String?, options: AccessibilityRequestOptions, backend: UIAutomationBackend = .accessibility) async throws -> AccessibilityElementsResponse {
+    guard let simulator = target as? Simulator else {
+      throw IDBCommandError.simulatorOnlyOperation(operation: "provide accessibility commands", targetDescription: String(describing: target))
+    }
+    let display = try await touch_target(displayUniqueID: displayUniqueID)
+    guard let displayId = display.displayId else {
+      throw IDBCommandError.displayIdUnreported(displayUniqueID: display.displayUniqueID)
+    }
+    return try await simulator.uiAutomation(backend: backend).describe(
+      .pointOnDisplay(display.panelPoint(for: point), displayId: displayId), options: options)
   }
 
   /// The whole tree of the running application `bundleID`, frontmost or not. Throws if it is not

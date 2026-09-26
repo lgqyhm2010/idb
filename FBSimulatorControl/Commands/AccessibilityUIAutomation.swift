@@ -40,7 +40,7 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
       // match rather than the application root, so the bounds it reports describe the match — they have
       // to be discarded, and replaced where the read does know better.
       switch query {
-      case .point:
+      case .point, .pointOnDisplay:
         return response.replacingScreen(nil)
       case .marker:
         return response.replacingScreen(element.rootBounds.flatMap(AXTranslationRequest.screenInfo(fromBounds:)))

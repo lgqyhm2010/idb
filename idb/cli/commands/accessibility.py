@@ -17,6 +17,7 @@ from idb.common.types import (
     ACCESSIBILITY_FILTER_BY_NAME,
     ACCESSIBILITY_FORMAT_BY_NAME,
     ACCESSIBILITY_KEY_BY_NAME,
+    ACTIVE_DISPLAY,
     AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
@@ -364,6 +365,15 @@ class AccessibilityInfoAtPointCommand(ClientCommand):
         )
         parser.add_argument("x", help="The x-coordinate", type=int)
         parser.add_argument("y", help="The y-coordinate", type=int)
+        parser.add_argument(
+            "--display",
+            help="Hit-test the point on this display instead of the main one: a "
+            f"unique id from `idb list-displays`, or '{ACTIVE_DISPLAY}' for the lit "
+            "integrated display. The point is in that display's interface "
+            "orientation, as `idb ui tap --display` takes it. Without it an "
+            "unfolded foldable's inner display answers nothing. An older companion "
+            "ignores it and hit-tests the main screen.",
+        )
         _add_enricher_args(parser)
         _add_backend_arg(parser)
         _add_format_arg(parser)
@@ -379,6 +389,7 @@ class AccessibilityInfoAtPointCommand(ClientCommand):
                 format=requested_format,
                 profile=args.profile,
                 collect_frame_coverage=args.collect_frame_coverage,
+                display=args.display,
             ),
         )
         _warn_if_complete_downgraded(requested_format, info.json)

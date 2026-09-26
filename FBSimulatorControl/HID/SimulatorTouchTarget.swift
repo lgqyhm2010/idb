@@ -30,6 +30,8 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
   public let scale: Double
   /// The interface rotation relative to the unrotated panel.
   public let rotation: SimulatorDisplayRotation
+  /// The display's CoreDevice id, which an accessibility hit-test on it needs; nil if not reported.
+  public var displayId: UInt32? = nil
 
   public init(
     displayUniqueID: String, digitizerTarget: UInt32, pixelSize: CGSize, scale: Double,
@@ -55,6 +57,14 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
     case .counterclockwise: panel = CGPoint(x: width - point.y, y: point.x)
     }
     return CGPoint(x: panel.x / width, y: panel.y / height)
+  }
+
+  /// A point in the display's interface orientation as a point on its unrotated panel — the space an
+  /// accessibility hit-test on the display is asked in, while the elements it answers with report
+  /// frames in the interface orientation (measured on the iPhone Duo's inner display).
+  public func panelPoint(for point: CGPoint) -> CGPoint {
+    let ratio = digitizerRatio(for: point)
+    return CGPoint(x: ratio.x * pixelSize.width / CGFloat(scale), y: ratio.y * pixelSize.height / CGFloat(scale))
   }
 
   /// An edge of the display's interface orientation, as the edge of its unrotated panel the digitizer
@@ -101,12 +111,14 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
     guard let touchscreen = touchscreens.first(where: { $0.displayUniqueID == display.uniqueID }) else {
       throw SimulatorDisplayError.noTouchscreen(display.uniqueID)
     }
-    return SimulatorTouchTarget(
+    var target = SimulatorTouchTarget(
       displayUniqueID: display.uniqueID,
       digitizerTarget: touchscreen.digitizerTarget,
       pixelSize: display.bounds.size,
       scale: display.scale,
       rotation: display.rotation)
+    target.displayId = display.displayId
+    return target
   }
 }
 

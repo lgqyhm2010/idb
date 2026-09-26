@@ -83,6 +83,25 @@ final class SimulatorTouchTargetTests: XCTestCase {
     }
   }
 
+  // Measured on the iPhone Duo unfolded (inner display rot90): a hit-test at panel point (300, 700) on
+  // display 3 answered the element under interface point (251, 300).
+  func testPanelPointIsTheInterfacePointOnTheUnrotatedPanel() {
+    let target = SimulatorTouchTarget(
+      displayUniqueID: "inner", digitizerTarget: 2, pixelSize: CGSize(width: 2007, height: 2853), scale: 3,
+      rotation: .clockwise)
+    let panel = target.panelPoint(for: CGPoint(x: 251, y: 300))
+    XCTAssertEqual(panel.x, 300, accuracy: 1e-9)
+    XCTAssertEqual(panel.y, 700, accuracy: 1e-9)
+  }
+
+  func testTheResolvedTargetCarriesTheDisplayId() throws {
+    var numbered = inner
+    numbered.displayId = 3
+    let target = try SimulatorTouchTarget.resolve(
+      displayUniqueID: "inner", displays: [cover, numbered], touchscreens: touchscreens)
+    XCTAssertEqual(target.displayId, 3)
+  }
+
   func testNoDisplaySelectsTheActiveIntegratedOne() throws {
     let target = try SimulatorTouchTarget.resolve(displayUniqueID: nil, displays: [cover, inner], touchscreens: touchscreens)
     XCTAssertEqual(target.displayUniqueID, "inner")

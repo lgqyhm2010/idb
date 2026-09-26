@@ -29,8 +29,10 @@ final class AXTranslationRequest {
     /// The frontmost application's element tree, with frame-coverage calculation
     /// and remote (separate-process) content discovery.
     case frontmostApplication
-    /// The single element at a screen point.
-    case point(CGPoint)
+    /// The single element at a point on one display, in that display's unrotated panel points.
+    /// Display 0 is the main-screen alias; other displays are named by the id their CoreDevice record
+    /// carries, which is how a foldable's inner display is hit-tested.
+    case point(CGPoint, displayId: UInt32)
     /// A specific application's element tree, anchored by process identifier — no hit-test and no
     /// frontmost resolution. Serialized like `frontmostApplication` (full tree + coverage).
     case applicationForPid(pid_t)
@@ -77,8 +79,8 @@ final class AXTranslationRequest {
     switch kind {
     case .frontmostApplication:
       return translator.frontmostApplication(withDisplayId: 0, bridgeDelegateToken: token)
-    case .point(let point):
-      return translator.object(at: point, displayId: 0, bridgeDelegateToken: token)
+    case let .point(point, displayId):
+      return translator.object(at: point, displayId: displayId, bridgeDelegateToken: token)
     case .applicationForPid(let pid):
       return translator.translationApplicationObject(forPid: pid)
     }

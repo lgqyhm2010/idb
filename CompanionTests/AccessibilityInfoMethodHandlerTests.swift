@@ -50,6 +50,18 @@ private final class RecordingAccessibilityExecutor: AccessibilityDescribing {
     applicationBackend = backend
     return AccessibilityElementsResponse(elements: .single(AccessibilityDocumentElement()))
   }
+
+  private(set) var displayReads: [(point: CGPoint, display: String?)] = []
+
+  func accessibility_info_at_point(
+    _ point: CGPoint,
+    onDisplay displayUniqueID: String?,
+    options: AccessibilityRequestOptions,
+    backend: UIAutomationBackend
+  ) async throws -> AccessibilityElementsResponse {
+    displayReads.append((point, displayUniqueID))
+    return AccessibilityElementsResponse(elements: .single(AccessibilityDocumentElement()))
+  }
 }
 
 /// Asserts what the *handler* hands the executor, which is where a describe-by-marker can silently
@@ -138,5 +150,35 @@ final class AccessibilityInfoMethodHandlerTests: XCTestCase {
     }
     XCTAssertEqual(executor.applicationReads, [])
     XCTAssertEqual(executor.pointReadCount, 0)
+  }
+
+  func testAPointOnADisplayIsHitTestedThere() async throws {
+    let executor = RecordingAccessibilityExecutor()
+    var request = Idb_AccessibilityInfoRequest()
+    request.point = .with {
+      $0.x = 251
+      $0.y = 300
+    }
+    request.display = .with { $0.uniqueID = "inner" }
+
+    _ = try await AccessibilityInfoMethodHandler.respond(to: request, using: executor)
+
+    XCTAssertEqual(executor.displayReads.map(\.display), ["inner"])
+    XCTAssertEqual(executor.displayReads.first?.point, CGPoint(x: 251, y: 300))
+    XCTAssertEqual(executor.pointReadCount, 0, "the main screen is dark on an unfolded foldable")
+  }
+
+  func testADisplayWithoutAPointIsRefused() async throws {
+    let executor = RecordingAccessibilityExecutor()
+    var request = Idb_AccessibilityInfoRequest()
+    request.display = .with { $0.uniqueID = "" }
+
+    do {
+      _ = try await AccessibilityInfoMethodHandler.respond(to: request, using: executor)
+      XCTFail("a display with no point names nothing to hit-test")
+    } catch let error as RPCError {
+      XCTAssertEqual(error.code, .invalidArgument)
+    }
+    XCTAssertEqual(executor.pointReadCount + executor.displayReads.count, 0)
   }
 }

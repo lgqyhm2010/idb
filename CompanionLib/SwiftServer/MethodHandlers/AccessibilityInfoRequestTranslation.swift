@@ -89,6 +89,11 @@ enum AccessibilityInfoRequestTranslation {
     guard request.bundleID.isEmpty || (!request.hasPoint && request.marker.isEmpty) else {
       throw RPCError(code: .invalidArgument, message: "bundle_id cannot be combined with point or marker")
     }
+    // A display says where a point is; without a point there is nothing on it to hit-test, and silently
+    // reading the frontmost app instead would answer a question the caller did not ask.
+    guard !request.hasDisplay || request.hasPoint else {
+      throw RPCError(code: .invalidArgument, message: "display applies to a point read only")
+    }
   }
 
   /// The application a request names, or nil to describe the frontmost one.
