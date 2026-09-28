@@ -86,6 +86,21 @@ final class NetworkConfigurationTests: XCTestCase {
     }
   }
 
+  func testListPreservesArrayValuesInTheStore() throws {
+    for service in ["dns", "proxy"] {
+      let runtime = FBNetworkConfigurationTestRuntime()
+      let expected: [Any] = ["first", ["nested": true]]
+      runtime.configuration = expected
+
+      XCTAssertEqual(runtime.run(service: service, action: "list", arguments: []), 0)
+
+      let json = try JSONSerialization.jsonObject(with: Data(runtime.output.utf8))
+      XCTAssertEqual(json as? NSArray, expected as NSArray)
+      XCTAssertEqual(runtime.keys as NSArray, [key(service)] as NSArray)
+      XCTAssertEqual(runtime.writes.count, 0)
+    }
+  }
+
   func testMissingListConfigurationPrintsEmptyObject() {
     for service in ["dns", "proxy"] {
       let runtime = FBNetworkConfigurationTestRuntime()

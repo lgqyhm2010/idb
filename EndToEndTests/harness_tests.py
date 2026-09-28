@@ -32,20 +32,28 @@ from .documentation import Transcript
 from .harness import (
     _optional_binary_from_environment,
     _prepare_artifact_file,
+    AccessibilityApi,
+    AppState,
+    attested_process,
     client_argv,
     Companion,
     CompanionDied,
     Completed,
     Deadline,
+    expected_implementation,
     EXPECTED_IMPLEMENTATION_ENV,
     HarnessError,
     IDB_SETUP_BIN_ENV,
     IdbEndToEndTestCase,
     IdbProcess,
     IdbProcessConfig,
+    MatchKey,
     NotReady,
     ProcessStream,
+    Query,
+    require_route_attestation,
     ROUTE_ATTESTATION_ENV,
+    run_attested_client,
     run_with_registered_cleanup,
     running_bundle_ids_from_listing,
     select_tests_for_capability,
@@ -56,7 +64,11 @@ from .harness import (
     SUITE_CAPABILITY_ENV,
     suite_supports,
     SuiteCapability,
+    UiWait,
+    Until,
+    verify_route_attestation,
     wait_for_accessibility,
+    wait_for_route_attestation,
     wait_until,
 )
 from .recording import Recording
@@ -244,28 +256,125 @@ class ClientArgumentTests(unittest.TestCase):
 
         self.assertEqual(selected, Path(executable.name))
 
+    def test_idb_process_builds_an_attested_alternate_client_command(self) -> None:
+        case = IdbEndToEndTestCase()
+        case.environment = SimpleNamespace(
+            idb_bin=Path("/default-client"),
+            idb_args=("--backend-argument",),
+        )
+        case.companion = SimpleNamespace(address="default.sock")
+        case.recording = mock.sentinel.recording
+        case.requires_route_attestation = True
+        case.resolve_process_executable = True
+        case.route_attestation_timeout_seconds = 30.0
+        companion = SimpleNamespace(address="alternate.sock")
+        config = IdbProcessConfig(read_chunk_bytes=1024)
+        context = mock.sentinel.context
+
+        with mock.patch.object(
+            harness,
+            "attested_process",
+            return_value=context,
+        ) as construct:
+            actual = case.idb_process(
+                "video-stream",
+                "--format=h264",
+                idb_bin=Path("/alternate-client"),
+                process_config=config,
+                companion=companion,
+                cwd=Path("/work"),
+                env={"CUSTOM": "value"},
+            )
+
+        self.assertIs(actual, context)
+        construct.assert_called_once_with(
+            [
+                "/alternate-client",
+                "--backend-argument",
+                "--companion",
+                "alternate.sock",
+                "video-stream",
+                "--format=h264",
+            ],
+            "video-stream --format=h264",
+            display_argv=["idb", "video-stream", "--format=h264"],
+            failure=case.fail,
+            recording=mock.sentinel.recording,
+            config=config,
+            env={"CUSTOM": "value"},
+            cwd=Path("/work"),
+            required=True,
+            attestation_timeout=30.0,
+        )
+
 
 class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
-    def case(self) -> IdbEndToEndTestCase:
-        case = IdbEndToEndTestCase()
-        self.addCleanup(case.doCleanups)
-        return case
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_expected_implementation_is_optional_or_required(self) -> None:
+        self.assertIsNone(expected_implementation())
+        with self.assertRaisesRegex(HarnessError, "attestation is mandatory"):
+            expected_implementation(required=True)
+
+    def test_expected_implementation_accepts_only_exact_route_names(self) -> None:
+        for expected in ("python", "rust"):
+            with (
+                self.subTest(expected=expected),
+                mock.patch.dict(
+                    os.environ,
+                    {EXPECTED_IMPLEMENTATION_ENV: expected},
+                    clear=True,
+                ),
+            ):
+                self.assertEqual(expected_implementation(required=True), expected)
+        with mock.patch.dict(
+            os.environ,
+            {EXPECTED_IMPLEMENTATION_ENV: "unexpected"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(HarnessError, "not 'python' or 'rust'"):
+                expected_implementation()
+
+    def test_route_attestation_distinguishes_pending_wrong_and_exact_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "selected"
+            with self.assertRaises(NotReady):
+                verify_route_attestation(attestation, "rust")
+            with self.assertRaisesRegex(
+                HarnessError,
+                "did not complete route attestation",
+            ):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("")
+            with self.assertRaises(NotReady):
+                verify_route_attestation(attestation, "rust")
+            with self.assertRaisesRegex(
+                HarnessError,
+                "did not complete route attestation",
+            ):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("python\n")
+            with self.assertRaisesRegex(HarnessError, "executed the python sidecar"):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("rust\n")
+            require_route_attestation(attestation, "rust")
 
     @mock.patch.dict(
         os.environ,
         {EXPECTED_IMPLEMENTATION_ENV: "rust"},
         clear=True,
     )
-    async def test_run_client_supplies_and_verifies_a_fresh_path(self) -> None:
+    async def test_run_attested_client_supplies_and_verifies_a_fresh_path(self) -> None:
         paths: list[Path] = []
 
-        async def run_attested(
+        async def execute(
             argv: Sequence[str],
             timeout: float,
             stdin: bytes | None = None,
             env: dict[str, str] | None = None,
         ) -> Completed:
-            self.assertEqual(argv, ["idb", "describe"])
+            self.assertEqual(argv, ["client", "describe"])
             self.assertEqual(timeout, 1.0)
             self.assertIsNone(stdin)
             self.assertIsNotNone(env)
@@ -275,22 +384,59 @@ class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
             path.write_text("rust\n")
             return Completed(0, b"ok", b"")
 
-        with mock.patch.object(harness, "run", side_effect=run_attested):
-            case = self.case()
-            first = await case.run_client(["idb", "describe"], timeout=1.0)
-            second = await case.run_client(["idb", "describe"], timeout=1.0)
+        with mock.patch.object(harness, "run", side_effect=execute):
+            first = await run_attested_client(["client", "describe"], timeout=1.0)
+            second = await run_attested_client(["client", "describe"], timeout=1.0)
 
         self.assertEqual(first.stdout, b"ok")
         self.assertEqual(second.stdout, b"ok")
         self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(not path.parent.exists() for path in paths))
 
     @mock.patch.dict(
         os.environ,
         {EXPECTED_IMPLEMENTATION_ENV: "rust"},
         clear=True,
     )
-    async def test_run_client_rejects_the_wrong_route(self) -> None:
-        async def run_wrong_route(
+    async def test_run_attested_client_accepts_an_explicit_mixed_route_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "python-selected"
+
+            async def execute(
+                argv: Sequence[str],
+                timeout: float,
+                stdin: bytes | None = None,
+                env: dict[str, str] | None = None,
+            ) -> Completed:
+                self.assertEqual(argv, ["client", "disconnect"])
+                self.assertEqual(timeout, 1.0)
+                self.assertIsNone(stdin)
+                assert env is not None
+                self.assertEqual(Path(env[ROUTE_ATTESTATION_ENV]), attestation)
+                attestation.write_bytes(b"python\n")
+                return Completed(0, b"", b"")
+
+            with mock.patch.object(harness, "run", side_effect=execute):
+                completed = await run_attested_client(
+                    ["client", "disconnect"],
+                    timeout=1.0,
+                    expected="python",
+                    attestation_path=attestation,
+                    required=True,
+                )
+
+            self.assertEqual(completed, Completed(0, b"", b""))
+            self.assertEqual(attestation.read_bytes(), b"python\n")
+
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_run_attested_client_rejects_the_wrong_route(self) -> None:
+        async def execute(
             argv: Sequence[str],
             timeout: float,
             stdin: bytes | None = None,
@@ -301,59 +447,117 @@ class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
             return Completed(0, b"", b"")
 
         with (
-            mock.patch.object(harness, "run", side_effect=run_wrong_route),
+            mock.patch.object(harness, "run", side_effect=execute),
             self.assertRaisesRegex(HarnessError, "executed the python sidecar"),
         ):
-            await self.case().run_client(["idb", "describe"], timeout=1.0)
+            await run_attested_client(["client", "describe"], timeout=1.0)
 
-    async def test_streaming_process_attests_before_it_is_yielded(self) -> None:
+    @mock.patch.dict(os.environ, {}, clear=True)
+    async def test_required_route_fails_before_running_a_command(self) -> None:
+        execute = mock.AsyncMock()
+        with (
+            mock.patch.object(harness, "run", new=execute),
+            self.assertRaisesRegex(HarnessError, "attestation is mandatory"),
+        ):
+            await run_attested_client(
+                ["client", "describe"],
+                timeout=1.0,
+                required=True,
+            )
+        execute.assert_not_awaited()
+
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_attested_process_is_command_neutral_and_uses_fresh_paths(
+        self,
+    ) -> None:
+        paths: list[Path] = []
         with tempfile.TemporaryDirectory() as directory:
-            attestation = Path(directory) / "selected"
-            environment = dict(os.environ)
-            environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+            working_directory = Path(directory)
             script = (
                 "import os, time; from pathlib import Path; "
                 f"p=Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]); "
-                "p.write_text(''); time.sleep(0.1); "
+                "p.write_text(''); time.sleep(0.05); "
                 "p.with_suffix('.tmp').write_text('rust\\n'); "
                 "p.with_suffix('.tmp').replace(p); "
-                "print('ready', flush=True); time.sleep(60)"
+                "print(os.getcwd() + '|' + os.environ['CUSTOM'] + '|' + str(p), "
+                "flush=True); time.sleep(60)"
             )
-            async with IdbProcess(
-                [sys.executable, "-u", "-c", script],
-                "log",
-                env=environment,
-                route_attestation=(attestation, "rust"),
-                config=IdbProcessConfig(
-                    graceful_stop_seconds=0.1,
-                    kill_wait_seconds=1.0,
-                ),
-            ) as process:
-                self.assertEqual(attestation.read_text(), "rust\n")
-                self.assertEqual((await process.read_some(1.0)).strip(), b"ready")
+            for value in ("first", "second"):
+                async with attested_process(
+                    [sys.executable, "-u", "-c", script],
+                    "management probe",
+                    cwd=working_directory,
+                    env={"CUSTOM": value},
+                    required=True,
+                    config=IdbProcessConfig(
+                        graceful_stop_seconds=0.1,
+                        kill_wait_seconds=1.0,
+                    ),
+                ) as process:
+                    report = (await process.read_some(1.0)).decode().strip()
+                    cwd, actual, raw_path = report.split("|", 2)
+                    path = Path(raw_path)
+                    paths.append(path)
+                    self.assertEqual(cwd, str(working_directory))
+                    self.assertEqual(actual, value)
+                    self.assertEqual(path.read_text(), "rust\n")
+                self.assertTrue(process.closed)
+                self.assertFalse(path.parent.exists())
+        self.assertEqual(len(set(paths)), 2)
 
-    async def test_streaming_process_rejects_the_wrong_route_before_yield(self) -> None:
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_attestation_failure_reaps_process_and_removes_fresh_path(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            attestation = Path(directory) / "selected"
-            environment = dict(os.environ)
-            environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+            capture = Path(directory) / "capture"
             script = (
                 "import os, time; from pathlib import Path; "
-                f"Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]).write_text('python\\n'); "
-                "time.sleep(60)"
+                f"p=Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]); "
+                "Path(os.environ['CAPTURE']).write_text(str(os.getpid()) + '\\n' + str(p)); "
+                "p.write_text('python\\n'); time.sleep(60)"
             )
             with self.assertRaisesRegex(HarnessError, "executed the python sidecar"):
-                async with IdbProcess(
+                async with attested_process(
                     [sys.executable, "-u", "-c", script],
-                    "log",
-                    env=environment,
-                    route_attestation=(attestation, "rust"),
+                    "management probe",
+                    env={"CAPTURE": str(capture)},
+                    required=True,
                     config=IdbProcessConfig(
                         graceful_stop_seconds=0.1,
                         kill_wait_seconds=1.0,
                     ),
                 ):
-                    self.fail("the process was yielded before route attestation")
+                    self.fail("a wrong route must not yield the process")
+            raw_pid, raw_path = capture.read_text().splitlines()
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(raw_pid), 0)
+            self.assertFalse(Path(raw_path).parent.exists())
+
+    async def test_wait_rejects_a_process_that_exited_after_attesting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "selected"
+            attestation.write_text("rust\n")
+            process = mock.Mock(returncode=7)
+            process.stderr_capture.tail = b"broken pipe"
+            with self.assertRaisesRegex(
+                HarnessError,
+                "exited with 7 immediately after route attestation.*broken pipe",
+            ):
+                await wait_for_route_attestation(
+                    attestation,
+                    "rust",
+                    process,
+                    timeout=0,
+                )
 
 
 class IdbProcessTests(unittest.IsolatedAsyncioTestCase):
@@ -536,6 +740,20 @@ os.write(1, b'stdin:' + data)
                 await running.send(b"too late")
             await running.close_stdin()
             await running.close_stdin()
+
+    async def test_close_stdin_tolerates_a_broken_pipe_and_is_idempotent(
+        self,
+    ) -> None:
+        process = self.process("")
+        stdin = mock.Mock()
+        stdin.wait_closed = mock.AsyncMock(side_effect=BrokenPipeError)
+        process._process = mock.Mock(stdin=stdin)
+
+        await process.close_stdin()
+        await process.close_stdin()
+
+        stdin.close.assert_called_once_with()
+        stdin.wait_closed.assert_awaited_once_with()
 
     async def test_broken_reader_fails_and_reaps_the_producer(self) -> None:
         async def broken_consumer(stream: ProcessStream) -> None:
@@ -741,7 +959,7 @@ class SuiteCapabilityTests(unittest.TestCase):
         "test_ui_describe_resolves_a_point_and_a_marker": (
             SuiteCapability.ACCESSIBILITY_READ
         ),
-        "test_ui_scroll_moves_settings_rows_down_and_up": (
+        "test_ui_scroll_moves_rows_down_and_up": (
             SuiteCapability.ACCESSIBILITY_INTERACTION
         ),
         "test_ui_tap_opens_general_by_point": (
@@ -1114,6 +1332,7 @@ class FailureReportingTests(unittest.TestCase):
 
 class CommandTestCaseStub(HarnessCaseStub):
     idb = IdbEndToEndTestCase.idb
+    _run_once = IdbEndToEndTestCase._run_once
     idb_expect_failure = IdbEndToEndTestCase.idb_expect_failure
     fail_or_skip_for = IdbEndToEndTestCase.fail_or_skip_for
     run_client = IdbEndToEndTestCase.run_client
@@ -1205,6 +1424,10 @@ class DeadlineAfter:
         return self
 
     @property
+    def remaining(self) -> float:
+        return 1.0 if self.checks >= 0 else 0.0
+
+    @property
     def passed(self) -> bool:
         self.checks -= 1
         return self.checks < 0
@@ -1265,12 +1488,8 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_read_before_the_tree_was_ready(self) -> None:
         outcome, run, _ = await self.attempt(DESCRIBE_ALL, [NOT_READY, SUCCEEDED])
 
-        # BUG: a read that found no translation object fails on its first
-        # attempt, though nothing ran and the next read answers. Flipped in
-        # the following commit.
-        self.assertIsInstance(outcome, Failed)
-        self.assertIn("No translation object", str(outcome))
-        self.assertEqual(run.await_count, 1)
+        self.assertEqual(outcome, SUCCEEDED)
+        self.assertEqual(run.await_count, 2)
 
     async def test_a_tap_before_the_tree_was_ready_is_not_repeated(self) -> None:
         outcome, run, _ = await self.attempt(TAP, [NOT_READY, SUCCEEDED])
@@ -1308,6 +1527,334 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(outcome, SUCCEEDED)
         self.assertEqual(steps, [None, "Set the search field's value"])
+
+
+BANNER = Query("ShortLook.Platter.Content.Seamless")
+SCREEN = {"width": 402.0, "height": 874.0}
+
+
+def read(*ys: float, identifier: str = BANNER.value) -> Completed:
+    """A complete read of the banner, with one element at each y given."""
+    return Completed(
+        0,
+        json.dumps(
+            {
+                "backend": "axbridge-exclusive",
+                "screen": SCREEN,
+                "elements": [
+                    {
+                        "identifier": identifier,
+                        "type": "Other",
+                        "label": "Breaking",
+                        "frame": {"x": 9.0, "y": y, "width": 384.0, "height": 88.0},
+                    }
+                    for y in ys
+                ],
+            }
+        ).encode(),
+        b"",
+    )
+
+
+NOT_REPORTED = Completed(
+    1,
+    b"",
+    b'found no element whose AXUniqueId contains "ShortLook.Platter.Content.Seamless"\n',
+)
+
+
+class WaitCaseStub(CommandTestCaseStub):
+    wait_for = IdbEndToEndTestCase.wait_for
+    tap_when_settled = IdbEndToEndTestCase.tap_when_settled
+    setup_idb = IdbEndToEndTestCase.setup_idb
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.environment.setup_idb_bin = Path("/tmp/setup-idb")
+
+
+class ElementWaitTests(unittest.IsolatedAsyncioTestCase):
+    """Waiting for an element through reads of it, and tapping where it settled."""
+
+    async def wait(
+        self,
+        answers: Sequence[Completed],
+        operation: Callable[[WaitCaseStub], Awaitable[object]],
+        deadline: DeadlineAfter | None = None,
+    ) -> tuple[object, mock.AsyncMock, mock.Mock]:
+        case = WaitCaseStub()
+        recording = mock.Mock(spec=Recording)
+        case.recording = recording
+        case.transcript = Transcript(rules=())
+        run = mock.AsyncMock(side_effect=answers)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(harness, "run", new=run))
+            stack.enter_context(
+                mock.patch.object(harness, "POLL_INTERVAL_SECONDS", new=0)
+            )
+            if deadline is not None:
+                stack.enter_context(
+                    mock.patch.object(harness, "Deadline", new=deadline)
+                )
+            try:
+                outcome = await operation(case)
+            except Failed as failed:
+                outcome = failed
+        return outcome, run, recording
+
+    def api(self, run: mock.AsyncMock, index: int) -> str:
+        """The accessibility api the command run at `index` asked for."""
+        argv = run.await_args_list[index].args[0]
+        return argv[argv.index("--api") + 1]
+
+    def commands(self, run: mock.AsyncMock) -> list[tuple[str, ...]]:
+        """The subcommand of every idb command run, after the companion address."""
+        return [
+            tuple(call.args[0][call.args[0].index("ui") :][:2])
+            for call in run.await_args_list
+        ]
+
+    async def test_an_element_that_is_not_there_yet_is_waited_for(self) -> None:
+        outcome, run, _ = await self.wait(
+            [NOT_REPORTED, read(92)], lambda case: case.wait_for(BANNER)
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_a_substring_match_sends_the_wait_to_the_whole_screen(
+        self,
+    ) -> None:
+        outcome, run, _ = await self.wait(
+            [
+                read(92, identifier=BANNER.value + ".Title"),
+                read(92, identifier=BANNER.value + ".Title"),
+                read(92),
+            ],
+            lambda case: case.wait_for(BANNER),
+        )
+
+        self.assertEqual(outcome.element["identifier"], BANNER.value)
+        # `ui describe` would keep answering with the element that shadows it.
+        self.assertEqual(
+            self.commands(run),
+            [("ui", "describe"), ("ui", "describe-all"), ("ui", "describe-all")],
+        )
+        self.assertEqual(self.api(run, 1), "axbridge")
+
+    async def test_a_match_on_a_label(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(Query("Breaking", MatchKey.LABEL)),
+        )
+
+        self.assertEqual(outcome.element["label"], "Breaking")
+        self.assertEqual(outcome.document["screen"], SCREEN)
+
+    async def test_an_element_partly_off_screen_is_not_on_screen(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_an_element_is_settled_once_reads_agree_on_its_frame(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(40), read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 4)
+
+    async def test_an_element_reported_twice_settles(self) -> None:
+        # The accessibility tree can report one element under two parents.
+        outcome, run, _ = await self.wait(
+            [read(92, 92), read(92, 92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_an_element_that_leaves_between_reads_starts_settling_again(
+        self,
+    ) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92), NOT_REPORTED, read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 4)
+
+    async def test_transient_answers_are_waited_through(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92), UNANSWERED, NOT_READY, read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        # The reads either side of the transient answers are not two in a row.
+        self.assertEqual(run.await_count, 5)
+
+    async def test_an_unrelated_failure_fails_at_once(self) -> None:
+        outcome, run, _ = await self.wait(
+            [FAILED, read(92)], lambda case: case.wait_for(BANNER)
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertEqual(run.await_count, 1)
+
+    async def test_an_element_that_never_settles_fails_the_wait(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(40), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn(f"{BANNER} was not settled on screen within", str(outcome))
+        self.assertIn("still moving", str(outcome))
+        self.assertEqual(run.await_count, 3)
+
+    async def test_a_single_match_off_screen_names_only_its_frame(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(900)] * 3,
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn("'y': 900", str(outcome))
+        self.assertNotIn("matching element", str(outcome))
+
+    async def test_several_matches_off_screen_are_told_apart(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(900, 1000)] * 3,
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn("not wholly on the screen", str(outcome))
+        self.assertIn("2 matching elements:", str(outcome))
+        self.assertIn(
+            '  frame: [1] {"height": 88.0, "width": 384.0, "x": 9.0, "y": 900}'
+            ' [2] {"height": 88.0, "width": 384.0, "x": 9.0, "y": 1000}',
+            str(outcome),
+        )
+
+    async def test_only_the_read_that_ends_the_wait_is_published(self) -> None:
+        _, _, recording = await self.wait(
+            [read(-66), read(92), read(92)],
+            lambda case: case.wait_for(
+                BANNER, until=Until.SETTLED, step="Read the banner"
+            ),
+        )
+
+        steps = [
+            call.kwargs.get("step")
+            for call in recording.event.call_args_list
+            if call.args == ("command_finished",)
+        ]
+        self.assertEqual(steps, [None, None, "Read the banner"])
+
+    async def test_each_read_describes_the_element_with_the_keys_asked_for_and_matched_on(
+        self,
+    ) -> None:
+        _, run, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(BANNER, keys=("AXLabel", "AXFrame")),
+        )
+
+        argv = run.await_args_list[0].args[0]
+        self.assertEqual(
+            argv[argv.index("ui") :],
+            [
+                "ui",
+                "describe",
+                BANNER.value,
+                "--match-key",
+                "AXUniqueId",
+                "--api",
+                "axbridge",
+                "--format",
+                "complete",
+                "--key",
+                "AXLabel",
+                "--key",
+                "AXFrame",
+                "--key",
+                "AXUniqueId",
+                "--key",
+                "frame",
+                "--json",
+            ],
+        )
+
+    async def test_a_narrowed_read_of_a_typed_query_reports_the_type(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(
+                Query("Breaking", MatchKey.LABEL, element_type="Other"),
+                keys=("AXLabel",),
+            ),
+        )
+
+        argv = run.await_args_list[0].args[0]
+        keys = [argv[i + 1] for i, argument in enumerate(argv) if argument == "--key"]
+        self.assertEqual(keys, ["AXLabel", "frame", "type"])
+        self.assertEqual(outcome.element["label"], "Breaking")
+
+    async def test_each_command_is_bounded_by_what_is_left_of_the_wait(
+        self,
+    ) -> None:
+        _, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait(), timeout=0),
+        )
+
+        timeouts = [call.kwargs["timeout"] for call in run.await_args_list]
+        self.assertEqual(
+            timeouts,
+            [1.0 + harness.MIN_READ_TIMEOUT_SECONDS, harness.MIN_READ_TIMEOUT_SECONDS],
+        )
+
+    async def test_ui_wait_finds_the_element_before_it_is_read(self) -> None:
+        outcome, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait()),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(self.commands(run), [("ui", "wait"), ("ui", "describe")])
+        self.assertEqual(run.await_args_list[0].args[0][0], "/tmp/setup-idb")
+        self.assertEqual(self.api(run, 0), "axbridge")
+
+    async def test_ui_wait_can_find_the_element_through_another_api(self) -> None:
+        _, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait(AccessibilityApi.AX)),
+        )
+
+        self.assertEqual(self.commands(run), [("ui", "wait"), ("ui", "describe")])
+        self.assertEqual(self.api(run, 0), "ax")
+        self.assertEqual(self.api(run, 1), "axbridge")
+
+    async def test_a_tap_goes_to_the_centre_of_the_settled_frame(self) -> None:
+        _, run, _ = await self.wait(
+            [read(-66), read(92), read(92), SUCCEEDED],
+            lambda case: case.tap_when_settled(BANNER, "--reason", "it is there"),
+        )
+
+        argv = run.await_args_list[-1].args[0]
+        self.assertEqual(
+            argv[argv.index("ui") :],
+            ["ui", "tap", "201", "136", "--reason", "it is there"],
+        )
 
 
 class CompanionLifecycleTests(unittest.TestCase):
@@ -1550,6 +2097,77 @@ class WaitUntilTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(raised.exception), "the companion is gone")
 
 
+class AppCaseStub(HarnessCaseStub):
+    wait_for_app = IdbEndToEndTestCase.wait_for_app
+
+    def __init__(
+        self,
+        running: Sequence[set[str] | Exception] = (),
+        installed: Sequence[set[str] | Exception] = (),
+    ) -> None:
+        super().__init__()
+        self.simctl = SimpleNamespace(
+            running_bundle_ids=mock.AsyncMock(side_effect=running),
+            installed_bundle_ids=mock.AsyncMock(side_effect=installed),
+        )
+
+
+@mock.patch.object(harness, "POLL_INTERVAL_SECONDS", 0.0)
+class AppWaitTests(unittest.IsolatedAsyncioTestCase):
+    """Waiting for an app to reach a state simctl reports."""
+
+    async def test_running_is_waited_for_until_launchctl_lists_it(self) -> None:
+        case = AppCaseStub(running=[set(), {"com.example.app"}])
+
+        await case.wait_for_app("com.example.app", AppState.RUNNING)
+
+        self.assertEqual(case.simctl.running_bundle_ids.await_count, 2)
+        case.simctl.installed_bundle_ids.assert_not_awaited()
+
+    async def test_stopped_is_waited_for_until_launchctl_no_longer_lists_it(
+        self,
+    ) -> None:
+        case = AppCaseStub(running=[{"com.example.app"}, {"com.example.other"}])
+
+        await case.wait_for_app("com.example.app", AppState.STOPPED)
+
+        self.assertEqual(case.simctl.running_bundle_ids.await_count, 2)
+
+    async def test_installed_and_absent_read_the_installed_apps(self) -> None:
+        case = AppCaseStub(installed=[set(), {"com.example.app"}, set()])
+
+        await case.wait_for_app("com.example.app", AppState.INSTALLED)
+        await case.wait_for_app("com.example.app", AppState.ABSENT)
+
+        self.assertEqual(case.simctl.installed_bundle_ids.await_count, 3)
+        case.simctl.running_bundle_ids.assert_not_awaited()
+
+    async def test_a_timeout_fails_the_test_with_what_simctl_last_reported(
+        self,
+    ) -> None:
+        case = AppCaseStub(running=[{"com.example.app"}])
+
+        with self.assertRaises(Failed) as failed:
+            await case.wait_for_app("com.example.app", AppState.STOPPED, timeout=0.0)
+
+        self.assertEqual(
+            str(failed.exception),
+            "com.example.app did not become stopped within 0s: "
+            "simctl reports it running",
+        )
+
+    async def test_a_simctl_failure_fails_the_test_at_once(self) -> None:
+        case = AppCaseStub(
+            installed=[HarnessError("simctl listapps failed (rc=1): boom"), set()]
+        )
+
+        with self.assertRaises(Failed) as failed:
+            await case.wait_for_app("com.example.app", AppState.INSTALLED)
+
+        self.assertEqual(str(failed.exception), "simctl listapps failed (rc=1): boom")
+        self.assertEqual(case.simctl.installed_bundle_ids.await_count, 1)
+
+
 class EnvironmentSelectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -1671,7 +2289,7 @@ class UnavailableRecordingTests(unittest.IsolatedAsyncioTestCase):
                         for line in Path(recording.trace.name).read_text().splitlines()
                     ]
                 finally:
-                    recording.trace.close()
+                    recording.close_logs()
         self.assertFalse(recording.ready)
         self.assertIn("exited with 1", recording.error)
         command = next(event for event in events if event["event"] == "command_started")
@@ -1789,6 +2407,123 @@ class BinaryPathTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(harness.HarnessError):
             await self.resolve(absent)
+
+
+class GuestRPCLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.process = mock.Mock(spec=asyncio.subprocess.Process)
+        self.process.returncode = None
+        self.process.wait = mock.AsyncMock(side_effect=self.reap)
+
+        async def create_process(*args, **kwargs):
+            socket_path = Path(args[args.index("serve") + 1])
+            self.addCleanup(shutil.rmtree, socket_path.parent, ignore_errors=True)
+            self.addCleanup(kwargs["stdout"].close)
+            self.addCleanup(kwargs["stderr"].close)
+            return self.process
+
+        self.create = self.enterContext(
+            mock.patch.object(
+                asyncio, "create_subprocess_exec", side_effect=create_process
+            )
+        )
+        self.connect = self.enterContext(
+            mock.patch.object(asyncio, "open_unix_connection")
+        )
+        self.test = SimpleNamespace(
+            environment=SimpleNamespace(
+                guest_binary=Path("/package/Resources/SimulatorFrameworkBridge-iOS")
+            ),
+            simctl=Simctl("test-udid", Path("/simulators")),
+            udid="test-udid",
+            assertEqual=self.assertEqual,
+            assertGreater=self.assertGreater,
+            assertLessEqual=self.assertLessEqual,
+            assertFalse=self.assertFalse,
+        )
+
+    async def reap(self) -> int:
+        self.process.returncode = 0
+        return 0
+
+    def captured_resources(self) -> tuple[Path, io.BufferedRandom, io.BufferedRandom]:
+        arguments = self.create.call_args.args
+        socket_path = Path(arguments[arguments.index("serve") + 1])
+        stdout = self.create.call_args.kwargs["stdout"]
+        stderr = self.create.call_args.kwargs["stderr"]
+        return socket_path, stdout, stderr
+
+    def assert_no_signals(self) -> None:
+        self.process.kill.assert_not_called()
+        self.process.terminate.assert_not_called()
+        self.process.send_signal.assert_not_called()
+
+    async def test_startup_failure_reaps_without_a_connected_writer(self) -> None:
+        original = RuntimeError("socket setup failed")
+        self.connect.side_effect = original
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                self.fail("a failed startup must not enter the context")
+
+        self.assertIs(raised.exception, original)
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertFalse(socket_path.parent.exists())
+        self.assertTrue(stdout.closed)
+        self.assertTrue(stderr.closed)
+        arguments = self.create.call_args.args
+        self.assertEqual(arguments[arguments.index("--startup-timeout") + 1], "10")
+        self.assertEqual(arguments[arguments.index("--idle-timeout") + 1], "120")
+        self.assertEqual(arguments[arguments.index("--exit-on-disconnect") + 1], "1")
+
+    async def test_startup_failure_keeps_the_original_error_when_reaping_fails(
+        self,
+    ) -> None:
+        original = RuntimeError("socket setup failed")
+        self.connect.side_effect = original
+        self.process.wait.side_effect = asyncio.TimeoutError
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                self.fail("a failed startup must not enter the context")
+
+        self.assertIs(raised.exception, original)
+        self.assertIn("retaining its socket directory", " ".join(original.__notes__))
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertTrue(socket_path.parent.exists())
+        self.assertFalse(stdout.closed)
+        self.assertFalse(stderr.closed)
+
+    async def test_body_failure_survives_disconnect_cleanup_failure(self) -> None:
+        reader = asyncio.StreamReader()
+        payload = json.dumps(
+            {"version": 1, "id": "test-1", "result": {"exitCode": 0, "values": []}}
+        ).encode()
+        reader.feed_data(len(payload).to_bytes(4, "big") + payload)
+        writer = mock.Mock(spec=asyncio.StreamWriter)
+        writer.drain = mock.AsyncMock()
+        writer.wait_closed = mock.AsyncMock()
+        self.connect.return_value = reader, writer
+        self.process.wait.side_effect = asyncio.TimeoutError
+        original = RuntimeError("test assertion failed")
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                raise original
+
+        self.assertIs(raised.exception, original)
+        self.assertIn("retaining its socket directory", " ".join(original.__notes__))
+        writer.close.assert_called_once_with()
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertTrue(socket_path.parent.exists())
+        self.assertFalse(stdout.closed)
+        self.assertFalse(stderr.closed)
 
 
 class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
@@ -1925,3 +2660,7 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(ready.is_file(), "Descendant must be spawned before timeout")
         await asyncio.wait_for(wait_for_file(exited), timeout=10)
+
+
+if __name__ == "__main__":
+    unittest.main()

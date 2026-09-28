@@ -1,0 +1,245 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+@testable import CompanionLib
+import CoreGraphics
+import FBSimulatorControl
+import GRPCCore
+import IDBGRPCSwift
+import XCTest
+
+final class HidRequestTranslationTests: XCTestCase {
+  func testHingeAnglesSurviveTheWire() throws {
+    for degrees in [0.0, 90.0, 135.5, 180.0] {
+      let request = Idb_HIDEvent.with { $0.hinge.angle = degrees }
+      guard case let .hinge(angle) = try HidMethodHandler.request(from: request) else {
+        return XCTFail("Expected a hinge request")
+      }
+      XCTAssertEqual(angle.degrees, degrees)
+    }
+  }
+
+  func testInvalidAnglesAreInvalidArguments() {
+    for degrees in [-1, 180.001, Double.nan, .infinity, -.infinity] {
+      let request = Idb_HIDEvent.with { $0.hinge.angle = degrees }
+      XCTAssertThrowsError(try HidMethodHandler.request(from: request)) { error in
+        XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+      }
+    }
+  }
+
+  func testOrientationsKeepTheirNamesOnTheWire() throws {
+    let expected: [(Idb_HIDEvent.HIDOrientationType, SimulatorHIDDeviceOrientation)] = [
+      (.portrait, .portrait),
+      (.portraitUpsideDown, .portraitUpsideDown),
+      (.landscapeLeft, .landscapeLeft),
+      (.landscapeRight, .landscapeRight),
+    ]
+    for (wire, orientation) in expected {
+      let request = Idb_HIDEvent.with { $0.orientation.orientation = wire }
+      XCTAssertEqual(try HidMethodHandler.request(from: request), .orientation(orientation))
+    }
+  }
+
+  func testAnUnrecognizedOrientationIsAnInvalidArgument() {
+    let request = Idb_HIDEvent.with { $0.orientation.orientation = .UNRECOGNIZED(99) }
+    XCTAssertThrowsError(try HidMethodHandler.request(from: request)) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  func testButtonsKeepTheirNamesOnTheWire() throws {
+    let expected: [(Idb_HIDEvent.HIDButtonType, SimulatorHIDButton)] = [
+      (.applePay, .applePay),
+      (.home, .homeButton),
+      (.lock, .lock),
+      (.sideButton, .sideButton),
+      (.siri, .siri),
+      (.playPause, .playPause),
+      (.volumeUp, .volumeUp),
+      (.volumeDown, .volumeDown),
+      (.eject, .eject),
+    ]
+    for (wire, button) in expected {
+      for (wireDirection, direction) in [(Idb_HIDEvent.HIDDirection.down, SimulatorHIDDirection.down), (.up, .up)] {
+        let request = Idb_HIDEvent.with {
+          $0.press.action.button.button = wire
+          $0.press.direction = wireDirection
+        }
+        XCTAssertEqual(try HidMethodHandler.request(from: request), .input(.button(direction: direction, button: button)))
+      }
+    }
+  }
+
+  func testAnUnrecognizedButtonIsAnInvalidArgument() {
+    let request = Idb_HIDEvent.with { $0.press.action.button.button = .UNRECOGNIZED(99) }
+    XCTAssertThrowsError(try HidMethodHandler.request(from: request)) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  func testShakeTranslatesToShake() throws {
+    let request = Idb_HIDEvent.with { $0.shake = Idb_HIDEvent.HIDShake() }
+    XCTAssertEqual(try HidMethodHandler.request(from: request), .shake)
+  }
+
+  func testDisplaySelectionNamesADisplayOrTheActiveOne() {
+    XCTAssertEqual(HidMethodHandler.displayUniqueID(from: .with { $0.uniqueID = "inner" }), "inner")
+    XCTAssertNil(HidMethodHandler.displayUniqueID(from: .init()))
+  }
+
+  func testDisplaySelectionIsNotItselfAnEvent() {
+    let request = Idb_HIDEvent.with { $0.display.uniqueID = "inner" }
+    XCTAssertThrowsError(try HidMethodHandler.request(from: request)) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  // A rotation or a fold moves the display under a resolved target, so the selection is resolved again
+  // before the next touch, and not before events that have no display.
+  func testASelectionIsResolvedAgainBeforeTheFirstTouchAfterARotationOrAFold() throws {
+    let fold = try SimulatorHingeAngle(degrees: 0)
+    for change: HidMethodHandler.Request in [.orientation(.landscapeLeft), .hinge(fold)] {
+      var routing = HidMethodHandler.TouchRouting()
+      routing.select(.with { $0.uniqueID = "inner" }, target: innerTarget)
+      XCTAssertNil(routing.selectionToResolve(before: tap))
+      routing.sent(change)
+      XCTAssertNil(routing.selectionToResolve(before: .keyboard(direction: .down, keyCode: 4)))
+      XCTAssertEqual(routing.selectionToResolve(before: tap)?.uniqueID, "inner")
+      routing.resolved(innerTarget)
+      XCTAssertNil(routing.selectionToResolve(before: tap))
+    }
+  }
+
+  func testAShakeLeavesTheTargetWhereItIs() {
+    var routing = HidMethodHandler.TouchRouting()
+    routing.select(.with { $0.uniqueID = "inner" }, target: innerTarget)
+    routing.sent(.shake)
+    XCTAssertNil(routing.selectionToResolve(before: tap), "a shake moves no display")
+    XCTAssertEqual(routing.target, innerTarget)
+  }
+
+  // A contact goes to one touchscreen from its start to its end, so a rotation while it is down waits
+  // for it to lift before the target moves.
+  func testASelectionIsNotResolvedAgainWhileATouchIsDown() {
+    var routing = HidMethodHandler.TouchRouting()
+    routing.select(.with { $0.uniqueID = "inner" }, target: innerTarget)
+    routing.sent(.input(.touch(direction: .down, x: 1, y: 1)))
+    XCTAssertTrue(routing.touchIsDown)
+    routing.sent(.orientation(.landscapeLeft))
+    let lift = SimulatorHIDEvent.touch(direction: .up, x: 1, y: 1)
+    XCTAssertNil(routing.selectionToResolve(before: lift))
+    routing.sent(.input(lift))
+    XCTAssertFalse(routing.touchIsDown)
+    XCTAssertNotNil(routing.selectionToResolve(before: tap))
+  }
+
+  func testWithoutASelectionNothingIsResolved() {
+    var routing = HidMethodHandler.TouchRouting()
+    routing.sent(.orientation(.landscapeLeft))
+    XCTAssertNil(routing.selectionToResolve(before: tap))
+    XCTAssertNil(routing.target)
+  }
+
+  private let tap = SimulatorHIDEvent.composite([
+    .touch(direction: .down, x: 1, y: 1),
+    .touch(direction: .up, x: 1, y: 1),
+  ])
+
+  private let innerTarget = SimulatorTouchTarget(
+    displayUniqueID: "inner", digitizerTarget: 2, pixelSize: CGSize(width: 2007, height: 2853), scale: 3)
+
+  // Touch routing names a display that must be the active integrated one: a display it does not have is
+  // the caller's mistake, and one that exists but is not lit is the device's state.
+  func testUnknownDisplayIsTheCallersMistakeAndTheRestAreDeviceState() {
+    let expected: [(any Error, RPCError.Code)] = [
+      (SimulatorDisplayError.unknownDisplay("x", known: []), .invalidArgument),
+      (SimulatorDisplayInteractionError.inactiveDisplay("x"), .failedPrecondition),
+      (SimulatorDisplayError.noTouchscreen("x"), .failedPrecondition),
+      (SimulatorDisplayError.noActiveIntegratedDisplay, .failedPrecondition),
+      (SimulatorDisplayError.ambiguousActiveDisplays(["x", "y"]), .failedPrecondition),
+      (SimulatorDisplayError.changed, .failedPrecondition),
+    ]
+    for (error, code) in expected {
+      XCTAssertEqual(DisplayErrorTranslation.status(for: error)?.code, code, "\(error)")
+    }
+  }
+
+  func testEdgeSelectionTagsTouches() throws {
+    let request = Idb_HIDEvent.with {
+      $0.press.action.touch.point = .with {
+        $0.x = 10
+        $0.y = 20
+      }
+      $0.press.direction = .down
+    }
+    XCTAssertEqual(
+      try HidMethodHandler.request(from: request, edge: .bottom),
+      .input(.touch(direction: .down, x: 10, y: 20, edge: .bottom)))
+    XCTAssertEqual(
+      try HidMethodHandler.request(from: request),
+      .input(.touch(direction: .down, x: 10, y: 20, edge: .none)),
+      "without a selection a touch is an ordinary one")
+  }
+
+  func testEdgeSelectionTagsEverySampleOfASwipe() throws {
+    let request = Idb_HIDEvent.with {
+      $0.swipe.start = .with {
+        $0.x = 100
+        $0.y = 400
+      }
+      $0.swipe.end = .with {
+        $0.x = 100
+        $0.y = 200
+      }
+      $0.swipe.delta = 50
+      $0.swipe.duration = 0.2
+    }
+    guard case let .input(swipe) = try HidMethodHandler.request(from: request, edge: .bottom) else {
+      return XCTFail("Expected swipe input")
+    }
+    let touches = try XCTUnwrap(swipe.subEvents).compactMap { event -> SimulatorHIDEdge? in
+      guard case let .touch(_, _, _, edge) = event else { return nil }
+      return edge
+    }
+    XCTAssertFalse(touches.isEmpty)
+    XCTAssertEqual(
+      Set(touches), [.bottom],
+      "the guest reads the flag off whichever contact it inspects, so an untagged sample breaks the gesture")
+  }
+
+  func testEdgeTypesMapOneToOne() throws {
+    XCTAssertEqual(try HidMethodHandler.fbSimulatorHIDEdge(from: .edgeNone), SimulatorHIDEdge.none)
+    XCTAssertEqual(try HidMethodHandler.fbSimulatorHIDEdge(from: .edgeTop), .top)
+    XCTAssertEqual(try HidMethodHandler.fbSimulatorHIDEdge(from: .edgeLeft), .left)
+    XCTAssertEqual(try HidMethodHandler.fbSimulatorHIDEdge(from: .edgeBottom), .bottom)
+    XCTAssertEqual(try HidMethodHandler.fbSimulatorHIDEdge(from: .edgeRight), .right)
+    XCTAssertThrowsError(try HidMethodHandler.fbSimulatorHIDEdge(from: .UNRECOGNIZED(9))) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  func testEdgeSelectionIsNotItselfAnEvent() {
+    let request = Idb_HIDEvent.with { $0.edge.edge = .edgeBottom }
+    XCTAssertThrowsError(try HidMethodHandler.request(from: request)) { error in
+      XCTAssertEqual((error as? RPCError)?.code, .invalidArgument)
+    }
+  }
+
+  // A runtime or target that cannot route touches by display never will, however often it is asked.
+  func testDisplayRoutingThatCannotWorkHereIsUnimplemented() {
+    let expected: [any Error] = [
+      SimulatorDisplayError.touchRoutingUnsupported("x"),
+      SimulatorDisplayInteractionError.unsupportedCapability("x"),
+      SimulatorHIDError.touchUnsupportedOnAppleTV,
+      SimulatorHIDError.touchTargetUnsupportedOnIndigoTransport(displayUniqueID: "x"),
+    ]
+    for error in expected {
+      XCTAssertEqual(DisplayErrorTranslation.status(for: error)?.code, .unimplemented, "\(error)")
+    }
+  }
+}

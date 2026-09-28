@@ -217,6 +217,21 @@ public final class IDBCommandExecutor {
     try await simulator.uiAutomation(backend: backend).wait(query, timeout: timeout, pollInterval: pollInterval)
   }
 
+  public func accessibility_quiescence(
+    query: AccessibilityElementQuery,
+    parameters: QuiescenceParameters,
+    backend: UIAutomationBackend
+  ) async throws -> AsyncThrowingStream<QuiescenceEvent, Error> {
+    guard let simulator = target as? Simulator else {
+      throw IDBCommandError.simulatorOnlyOperation(operation: "stream accessibility quiescence", targetDescription: String(describing: target))
+    }
+    return try await simulator.uiAutomation(backend: backend).quiescence(query, parameters: parameters)
+  }
+
+  public func process_id(forBundleID bundleID: String) async throws -> pid_t {
+    try await target.application.processID(forBundleID: bundleID)
+  }
+
   public func accessibility_scroll(
     query: AccessibilityElementQuery,
     backend: UIAutomationBackend = .accessibility,
@@ -264,20 +279,30 @@ public final class IDBCommandExecutor {
     return try await simulator.uiAutomation(backend: backend).describe(query, options: options)
   }
 
-  /// The element at `point` on a display other than the main one. `point` is in the display's
-  /// interface orientation, as a touch aimed at it is; `displayUniqueID` nil selects the active
-  /// integrated display. The hit-test is made on that display, in its panel space — hit-testing the main
-  /// screen instead, as a plain point read does, answers nothing on an unfolded foldable.
+  /// The element at `point` on a display. `point` is in the display's interface orientation, as a touch
+  /// aimed at it is; `displayUniqueID` nil selects the active integrated display. Only the display report
+  /// is read to choose it: a hit-test needs no touchscreen. The device's only integrated display is read
+  /// as a plain point read, with any backend. Any other display is hit-tested by its id at the point on
+  /// its unrotated panel — hit-testing the main screen instead answers nothing on an unfolded foldable —
+  /// which only the CoreSimulator backend can ask.
   public func accessibility_info_at_point(_ point: CGPoint, onDisplay displayUniqueID: String?, options: AccessibilityRequestOptions, backend: UIAutomationBackend = .accessibility) async throws -> AccessibilityElementsResponse {
     guard let simulator = target as? Simulator else {
       throw IDBCommandError.simulatorOnlyOperation(operation: "provide accessibility commands", targetDescription: String(describing: target))
     }
-    let display = try await touch_target(displayUniqueID: displayUniqueID)
-    guard let displayId = display.displayId else {
-      throw IDBCommandError.displayIdUnreported(displayUniqueID: display.displayUniqueID)
+    switch try await simulator.displays.hitTestTarget(displayUniqueID: displayUniqueID) {
+    case .mainScreen:
+      return try await accessibility_info_at_point(NSValue(point: point), options: options, backend: backend)
+    case let .display(display):
+      guard backend == .accessibility else {
+        throw UIAutomationError.operationUnsupported(backend: backend, operation: "Describing a point on another display")
+      }
+      guard let displayId = display.displayId else {
+        throw IDBCommandError.displayIdUnreported(displayUniqueID: display.uniqueID)
+      }
+      let panelPoint = try display.geometry.unrotatedPoint(from: point)
+      return try await simulator.uiAutomation(backend: backend).describe(
+        .pointOnDisplay(point, panelPoint: panelPoint, displayId: displayId), options: options)
     }
-    return try await simulator.uiAutomation(backend: backend).describe(
-      .pointOnDisplay(display.panelPoint(for: point), displayId: displayId), options: options)
   }
 
   /// The whole tree of the running application `bundleID`, frontmost or not. Throws if it is not
@@ -576,8 +601,8 @@ public final class IDBCommandExecutor {
 
   /// `touchTarget` routes the event's touches to one display's touchscreen; nil sends them to the main screen.
   public func hid(_ event: SimulatorHIDEvent, touchTarget: SimulatorTouchTarget? = nil) async throws {
-    let hid = try await connectToHID()
-    try await event.send(on: hid, target: touchTarget)
+    // The shared HID outlives the call, and `simulator.hid.disconnect()` drains it when closing it.
+    try await connectToHID().send(event: event, target: touchTarget, logger: logger, drain: .onClose)
   }
 
   /// The touchscreen of a display; nil selects the active integrated display.
@@ -612,12 +637,20 @@ public final class IDBCommandExecutor {
     try await simulatorTarget().orientation.current()
   }
 
-  public func set_orientation(_ orientation: SimulatorDeviceOrientation) async throws {
-    try await simulatorTarget().orientation.setOrientation(orientation)
+  public func set_orientation(_ orientation: SimulatorHIDDeviceOrientation, convention: SimulatorOrientationConvention) async throws {
+    try await simulatorTarget().orientation.set(orientation, convention: convention)
+  }
+
+  public func shake() async throws {
+    try await simulatorTarget().hardware.shake()
   }
 
   public func hinge_angle() async throws -> Double {
-    try await simulatorTarget().hinge.angle().degrees
+    try await simulatorTarget().hinge.current().degrees
+  }
+
+  public func set_hinge_angle(_ angle: SimulatorHingeAngle) async throws {
+    try await simulatorTarget().hinge.set(angle)
   }
 
   public func get_current_locale_identifier() async throws -> String {
@@ -719,6 +752,10 @@ public final class IDBCommandExecutor {
 
   public func deliveredNotifications(forBundleID bundleID: String) async throws -> [DeliveredNotification] {
     try await simulatorTarget().notification.deliveredNotifications(forBundleID: bundleID)
+  }
+
+  public func clearDeliveredNotifications(forBundleID bundleID: String) async throws {
+    try await simulatorTarget().notification.clearDeliveredNotifications(forBundleID: bundleID)
   }
 
   public func sendPushNotification(forBundleID bundleID: String, jsonPayload: String) async throws {

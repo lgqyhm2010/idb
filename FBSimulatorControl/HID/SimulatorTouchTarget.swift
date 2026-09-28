@@ -30,8 +30,6 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
   public let scale: Double
   /// The interface rotation relative to the unrotated panel.
   public let rotation: SimulatorDisplayRotation
-  /// The display's CoreDevice id, which an accessibility hit-test on it needs; nil if not reported.
-  public var displayId: UInt32? = nil
 
   public init(
     displayUniqueID: String, digitizerTarget: UInt32, pixelSize: CGSize, scale: Double,
@@ -59,14 +57,6 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
     return CGPoint(x: panel.x / width, y: panel.y / height)
   }
 
-  /// A point in the display's interface orientation as a point on its unrotated panel — the space an
-  /// accessibility hit-test on the display is asked in, while the elements it answers with report
-  /// frames in the interface orientation (measured on the iPhone Duo's inner display).
-  public func panelPoint(for point: CGPoint) -> CGPoint {
-    let ratio = digitizerRatio(for: point)
-    return CGPoint(x: ratio.x * pixelSize.width / CGFloat(scale), y: ratio.y * pixelSize.height / CGFloat(scale))
-  }
-
   /// An edge of the display's interface orientation, as the edge of its unrotated panel the digitizer
   /// reads it on: the same rotation `digitizerRatio(for:)` carries points through, so a contact's
   /// edge stays the one its coordinates start at.
@@ -89,35 +79,29 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
   }
 
   /// Joins a display snapshot to the touchscreen listing. `displayUniqueID` nil selects the active
-  /// integrated display. Every way the join can fail is an error rather than a fall back to the main
-  /// screen: a touch that lands somewhere other than where it was aimed reports success and changes
-  /// nothing the caller can see.
+  /// integrated display; a named display has to be listed, and has to be the active integrated
+  /// display, as `SimulatorDisplayInteractionResolver` requires. Every way the join can fail is an
+  /// error rather than a fall back to the main screen: a touch that lands somewhere other than where
+  /// it was aimed reports success and changes nothing the caller can see.
   static func resolve(
     displayUniqueID: String?, displays: [SimulatorDisplay], touchscreens: [SimulatorTouchscreen]
   ) throws -> SimulatorTouchTarget {
-    let display: SimulatorDisplay
-    if let displayUniqueID {
-      guard let named = displays.first(where: { $0.uniqueID == displayUniqueID }) else {
-        throw SimulatorDisplayError.unknownDisplay(displayUniqueID, known: displays.map(\.uniqueID))
-      }
-      display = named
-    } else {
-      display = try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays)
+    if let displayUniqueID, !displays.contains(where: { $0.uniqueID == displayUniqueID }) {
+      throw SimulatorDisplayError.unknownDisplay(displayUniqueID, known: displays.map(\.uniqueID))
     }
-    guard display.isActive else {
-      throw SimulatorDisplayError.inactiveDisplay(display.uniqueID)
+    let display = try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays)
+    if let displayUniqueID, displayUniqueID != display.uniqueID {
+      throw SimulatorDisplayInteractionError.inactiveDisplay(displayUniqueID)
     }
     guard let touchscreen = touchscreens.first(where: { $0.displayUniqueID == display.uniqueID }) else {
       throw SimulatorDisplayError.noTouchscreen(display.uniqueID)
     }
-    var target = SimulatorTouchTarget(
+    return SimulatorTouchTarget(
       displayUniqueID: display.uniqueID,
       digitizerTarget: touchscreen.digitizerTarget,
       pixelSize: display.bounds.size,
       scale: display.scale,
       rotation: display.rotation)
-    target.displayId = display.displayId
-    return target
   }
 }
 

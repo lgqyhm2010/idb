@@ -32,83 +32,42 @@ private enum ProxyConfiguration {
   }
 }
 
-@objc public final class ProxyServiceStaticFuncs: NSObject {
+public enum FBProxyService {
 
-  @objc(buildHTTPProxyDict:port:)
   public static func buildHTTPProxyDict(host: String, port: Int32) -> [String: Any] {
     ProxyConfiguration.http(host: host, port: port).dictionary
   }
 
-  @objc(buildSOCKSProxyDict:port:)
   public static func buildSOCKSProxyDict(host: String, port: Int32) -> [String: Any] {
     ProxyConfiguration.socks(host: host, port: port).dictionary
   }
 
-  @objc(buildEmptyProxyDict)
   public static func buildEmptyProxyDict() -> [String: Any] {
     ProxyConfiguration.cleared.dictionary
   }
 
-  @objc(handleProxyAction:arguments:)
   public static func handleProxyAction(action: String, arguments: [String]) -> Int {
-    let store = FBNetworkConfigurationStore.proxy()
-    guard let store else {
-      return 1
-    }
+    handleProxyAction(action: action, arguments: arguments, output: nil)
+  }
 
-    let selectedAction = NetworkConfigurationAction(rawValue: action)
-    if selectedAction == .list {
-      let read = store.readConfiguration()
-      guard let read else {
-        return 1
-      }
-      if let dict = read.configuration {
-        if let json = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted),
-          let str = String(data: json, encoding: .utf8)
-        {
-          // patternlint-disable-next-line avoid-print-to-prevent-production-overhead
-          print(str)
-        }
-      } else {
-        // patternlint-disable-next-line avoid-print-to-prevent-production-overhead
-        print("{}")
-      }
-      return 0
-    }
-
-    guard store.prepareToWrite() else {
-      return 1
-    }
-
-    let proxyDict: [String: Any]
-    if selectedAction == .set {
-      if arguments.count < 2 {
+  static func handleProxyAction(action: String, arguments: [String], output: BridgeOutput?) -> Int {
+    NetworkConfigurationService(
+      name: "proxy",
+      logTag: "[ProxyService]",
+      store: FBNetworkConfigurationStore.proxy(),
+      clearedConfiguration: buildEmptyProxyDict(),
+      clearingMessage: "Clearing proxy settings",
+      updatedMessage: "Proxy settings updated successfully"
+    ) { arguments in
+      guard arguments.count >= 2 else {
         NSLog("[ProxyService] set requires <host> <port> [http|socks]")
-        return 1
+        return nil
       }
       let host = arguments[0]
       let port = (arguments[1] as NSString).intValue
       let type = arguments.count >= 3 ? arguments[2] : "http"
-
-      proxyDict = ProxyConfiguration(host: host, port: port, type: type).dictionary
       NSLog("[ProxyService] Setting %@ proxy to %@:%d", type, host, port)
-    } else if selectedAction == .clear {
-      proxyDict = ProxyServiceStaticFuncs.buildEmptyProxyDict()
-      NSLog("[ProxyService] Clearing proxy settings")
-    } else {
-      NSLog("[ProxyService] Unknown action: %@. Use 'set', 'clear', or 'list'.", action)
-      return 1
-    }
-
-    let success = store.writeConfiguration(proxyDict)
-
-    guard success else {
-      return 1
-    }
-
-    store.notifyChange()
-
-    NSLog("[ProxyService] Proxy settings updated successfully")
-    return 0
+      return ProxyConfiguration(host: host, port: port, type: type).dictionary
+    }.handle(action: action, arguments: arguments, output: output)
   }
 }

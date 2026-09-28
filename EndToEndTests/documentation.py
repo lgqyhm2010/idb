@@ -41,17 +41,17 @@ DEMO_ATTRIBUTE = "__idb_documented_demo__"
 
 # The demos the website publishes, and the test that performs each one.
 DOCUMENTED_DEMOS: Mapping[str, str] = {
-    "open-a-settings-page-by-id": (
+    "open-a-page-by-id": (
         "EndToEndTests.test_accessibility.AccessibilityTests"
         ".test_ui_opens_general_by_identifier_and_confirms_it"
     ),
     "scroll-a-list": (
         "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_ui_scroll_moves_settings_rows_down_and_up"
+        ".test_ui_scroll_moves_rows_down_and_up"
     ),
     "deliver-a-notification-and-watch-it-clear": (
         "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_a_delivered_notification_is_held_until_it_is_opened"
+        ".test_a_delivered_notification_is_held_until_it_is_cleared"
     ),
     "read-a-web-page-in-safari": (
         "EndToEndTests.test_accessibility.AccessibilityTests"

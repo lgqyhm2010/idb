@@ -7,6 +7,7 @@
 
 @preconcurrency import CoreSimulator
 import Darwin
+@preconcurrency import FBControlCore
 import Foundation
 import XPC
 
@@ -15,16 +16,57 @@ import XPC
 enum SimulatorXPCConnectionError: Error, Equatable {
   /// The private `_4sim` endpoint symbols are not in this process. A property of the toolchain.
   case symbolsUnavailable
+  /// The simulator is not booted, so it vends nothing yet.
+  case notBooted(service: String, state: TargetState)
   /// The simulator's bootstrap namespace has no such service, or the lookup failed.
   case lookupFailed(service: String, underlying: NSError?)
   /// The endpoint or connection could not be created from the looked-up port.
   case connectionFailed
 
   /// CoreSimulator reports a service the runtime does not vend as `SimError` 405, as opposed to a
-  /// lookup that failed for an operational reason.
+  /// lookup that failed for an operational reason. It gives every lookup before the boot completes
+  /// the same 405, which is why the connector reports those as `notBooted` without looking up.
   var isServiceUnsupported: Bool {
     guard case let .lookupFailed(_, underlying) = self else { return false }
     return underlying?.domain == "com.apple.CoreSimulator.SimError" && underlying?.code == 405
+  }
+}
+
+/// Where a guest service name becomes a host connection to it. Every XPC connection into a simulator,
+/// CoreDevice and DTUHID alike, is built here, so it is the one place a test substitutes its own
+/// peers. The connection is returned unresumed.
+struct SimulatorXPCConnector: Sendable {
+  let state: @Sendable () -> TargetState
+  let lookup: @Sendable (_ service: String) throws -> xpc_connection_t
+  /// Resolves once the simulator is no longer booting.
+  let bootFinished: @Sendable () async throws -> Void
+
+  func connect(_ service: String) throws -> xpc_connection_t {
+    let state = state()
+    guard state == .booted else {
+      throw SimulatorXPCConnectionError.notBooted(service: service, state: state)
+    }
+    return try lookup(service)
+  }
+}
+
+extension SimulatorXPCConnector {
+  /// Looks services up in `simulator`'s bootstrap namespace. Holds the `SimDevice` rather than the
+  /// `Simulator`, whose command cache keeps this connector's owners.
+  static func simulator(_ simulator: Simulator) -> SimulatorXPCConnector {
+    let device = simulator.device
+    let queue = simulator.workQueue
+    let state: @Sendable () -> TargetState = { TargetState(rawValue: UInt(device.state)) ?? .unknown }
+    return SimulatorXPCConnector(
+      state: state,
+      lookup: { service in
+        try SimulatorXPCConnection.connect(service: service) { service in
+          var error: NSError?
+          let port = device.lookup(service, error: &error)
+          return (port, error)
+        }
+      },
+      bootFinished: { try await pollUntilTrue(on: queue) { state() != .booting } })
   }
 }
 
@@ -42,14 +84,6 @@ enum SimulatorXPCConnection {
   private typealias EndpointFromPort = @convention(c) (mach_port_t, UInt64, UInt64) -> Unmanaged<AnyObject>?
   private typealias ConnectionFromEndpoint = @convention(c) (xpc_object_t) -> Unmanaged<AnyObject>?
   private typealias EnableSim2Host = @convention(c) (xpc_connection_t) -> Void
-
-  static func connect(simulator: Simulator, service: String) throws -> xpc_connection_t {
-    try connect(service: service) { service in
-      var error: NSError?
-      let port = simulator.device.lookup(service, error: &error)
-      return (port, error)
-    }
-  }
 
   static func connect(service: String, lookup: ServiceLookup) throws -> xpc_connection_t {
     guard let handle = dlopen(nil, RTLD_NOW) else { throw SimulatorXPCConnectionError.symbolsUnavailable }

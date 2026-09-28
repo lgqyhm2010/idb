@@ -21,11 +21,16 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nullable, nonatomic, copy) NSString *clearError;
 @property (nullable, nonatomic, copy) NSString *fetchError;
 @property (nonatomic, copy) NSString *omittedCompletion;
+@property (nonatomic, copy) NSString *deferredCompletion;
+- (void)install;
+- (void)uninstall;
+- (void)completePendingCallbacks;
 @property (nonatomic, copy) NSString *raisedOperation;
 @property (nonatomic, copy) NSArray<NSDictionary<NSString *, id> *> *records;
 @property (nonatomic, readonly) NSMutableArray<NSString *> *operations;
 @property (nonatomic, readonly) NSMutableArray<NSString *> *factoryCalls;
 @property (nonatomic, readonly) NSMutableDictionary<NSString *, id> *arguments;
-- (NSDictionary<NSString *, id> *)runAction:(NSString *)action bundleID:(nullable NSString *)bundleID types:(NSArray<NSString *> *)types;
+/** Runs `service` with the runtime installed and stdout captured, returning its status and output or the exception it raised. */
+- (NSDictionary<NSString *, id> *)runService:(NSInteger (^NS_NOESCAPE)(void))service NS_SWIFT_NAME(run(_:));
 @end
 NS_ASSUME_NONNULL_END
