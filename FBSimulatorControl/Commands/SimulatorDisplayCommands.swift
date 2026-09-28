@@ -71,7 +71,7 @@ public struct SimulatorDisplayCommands {
     SimulatorDisplayCommands(simulator: simulator)
   }
 
-  /// Reads configured displays. Requires a current report with explicit per-display activity.
+  /// Reads configured displays from a current report: see `SimulatorDisplayProtocol.displays`.
   public func list() async throws -> [SimulatorDisplay] {
     try await read(decode: SimulatorDisplayProtocol.displays)
   }
@@ -109,12 +109,13 @@ public struct SimulatorDisplayCommands {
     }
   }
 
-  /// Returns nil only when the provider lacks the capability needed to select a display.
+  /// Returns nil when there is no display to select — the provider cannot say which is active, or the
+  /// device has one integrated display — so the main display is captured.
   func activeIntegratedDisplayIfSupported() async throws -> SimulatorDisplay? {
     do {
       switch try await read(decode: SimulatorDisplayProtocol.snapshot) {
       case let .displays(displays): return try Self.activeIntegratedDisplay(in: displays)
-      case .legacyProvider: return nil
+      case .legacyProvider, .soleIntegratedDisplay: return nil
       }
     } catch SimulatorCoreDeviceError.unsupported(_) {
       return nil

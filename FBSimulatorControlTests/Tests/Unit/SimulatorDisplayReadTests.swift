@@ -11,19 +11,28 @@ import XCTest
 @preconcurrency import XPC
 
 private func displayValue(
-  id: String, active: Bool, primary: Bool = false, rotation: String = "rot0", displayId: UInt64? = nil
+  id: String?, active: Bool?, primary: Bool = false, rotation: String = "rot0", displayId: UInt64? = nil,
+  backlight: String? = nil, type: String = "integrated"
 ) -> xpc_object_t {
   let dictionary = SimulatorCoreDevice.dictionary
   let array = SimulatorCoreDevice.array
   let value = dictionary([
-    "uniqueId": xpc_string_create(id), "name": xpc_string_create(id),
-    "active": xpc_bool_create(active), "primary": xpc_bool_create(primary),
+    "name": xpc_string_create(id ?? type), "primary": xpc_bool_create(primary),
     "bounds": array([array([xpc_double_create(0), xpc_double_create(0)]), array([xpc_double_create(2007), xpc_double_create(2853)])]),
     "pointScale": xpc_int64_create(3), "currentOrientation": xpc_string_create(rotation),
-    "type": dictionary(["integrated": dictionary([:])]),
+    "type": dictionary([type: dictionary([:])]),
   ])
+  if let id {
+    xpc_dictionary_set_string(value, "uniqueId", id)
+  }
+  if let active {
+    xpc_dictionary_set_bool(value, "active", active)
+  }
   if let displayId {
     xpc_dictionary_set_uint64(value, "displayId", displayId)
+  }
+  if let backlight {
+    xpc_dictionary_set_string(value, "backlightState", backlight)
   }
   return value
 }
@@ -58,28 +67,75 @@ private final class DisplayTransportStub: SimulatorCoreDeviceTransport, @uncheck
 
 final class SimulatorDisplayReadTests: XCTestCase {
   func testLegacyReportWithoutIdentityOrActivityDeclinesCaptureCapability() throws {
-    let value = displayValue(id: "legacy", active: true)
-    xpc_dictionary_set_value(value, "active", nil)
-    xpc_dictionary_set_value(value, "uniqueId", nil)
-    XCTAssertEqual(try SimulatorDisplayProtocol.snapshot(displayReply([value])), .legacyProvider)
-    XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([value])))
-    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([value], current: false)))
+    let values = [displayValue(id: nil, active: nil, displayId: 1), displayValue(id: nil, active: nil, displayId: 3)]
+    XCTAssertEqual(try SimulatorDisplayProtocol.snapshot(displayReply(values)), .legacyProvider)
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply(values)))
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply(values, current: false)))
     // A legacy record is still held to the rest of the shape.
-    xpc_dictionary_set_int64(value, "pointScale", 0)
-    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([value])))
+    xpc_dictionary_set_int64(values[0], "pointScale", 0)
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply(values)))
+  }
+
+  // Measured on iOS 26.2 (iPhone 17 Pro, iPad Pro 11-inch M5): no identity or layout activity, every
+  // backlight `unknown`. The one integrated display is the screen; the listing names it without
+  // claiming an identity any touchscreen covers.
+  func testLegacyReportListsItsSoleIntegratedDisplayAsActive() throws {
+    let values = [
+      displayValue(id: nil, active: nil, primary: true, displayId: 1, backlight: "unknown"),
+      displayValue(id: nil, active: nil, displayId: 2, backlight: "unknown", type: "external"),
+      displayValue(id: nil, active: nil, displayId: 3, backlight: "unknown", type: "wireless"),
+    ]
+    XCTAssertEqual(try SimulatorDisplayProtocol.snapshot(displayReply(values)), .soleIntegratedDisplay)
+    let displays = try SimulatorDisplayProtocol.displays(displayReply(values))
+    XCTAssertEqual(displays.map(\.uniqueID), ["legacy-1", "legacy-2", "legacy-3"])
+    XCTAssertEqual(displays.map(\.isActive), [true, false, false])
+    XCTAssertEqual(try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays).uniqueID, "legacy-1")
+    XCTAssertThrowsError(
+      try SimulatorTouchTarget.resolve(displayUniqueID: "legacy-1", displays: displays, touchscreens: []))
+  }
+
+  // Measured on iOS 27.0 (iPhone 18 Pro, iPad Pro 11-inch M5): every display identified, none with
+  // layout activity, the backlight saying which is lit.
+  func testBacklightSelectsDisplayWhenLayoutActivityIsAbsent() throws {
+    let values = [
+      displayValue(id: "lcd", active: nil, primary: true, displayId: 1, backlight: "activeOn"),
+      displayValue(id: "tv", active: nil, displayId: 2, backlight: "off", type: "external"),
+      displayValue(id: "wireless", active: nil, displayId: 3, backlight: "off", type: "wireless"),
+      displayValue(id: "resizable", active: nil, displayId: 4, backlight: "off", type: "virtual"),
+    ]
+    XCTAssertEqual(try SimulatorDisplayProtocol.snapshot(displayReply(values)), .soleIntegratedDisplay)
+    let displays = try SimulatorDisplayProtocol.displays(displayReply(values))
+    XCTAssertEqual(try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays).uniqueID, "lcd")
+    // A sole integrated display is the screen even while its backlight is off.
+    xpc_dictionary_set_string(values[0], "backlightState", "off")
+    XCTAssertEqual(try SimulatorDisplayProtocol.snapshot(displayReply(values)), .soleIntegratedDisplay)
+  }
+
+  func testBacklightSelectsBetweenIntegratedDisplays() throws {
+    let values = [
+      displayValue(id: "cover", active: nil, primary: true, backlight: "off"),
+      displayValue(id: "inner", active: nil, rotation: "rot90", backlight: "activeDimmed"),
+    ]
+    guard case let .displays(displays) = try SimulatorDisplayProtocol.snapshot(displayReply(values)) else {
+      return XCTFail("Two integrated displays have to be selected between")
+    }
+    XCTAssertEqual(try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays).uniqueID, "inner")
+    for unknown in ["unknown", "somethingNew"] {
+      xpc_dictionary_set_string(values[1], "backlightState", unknown)
+      XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply(values)), unknown)
+    }
   }
 
   func testPartialOrMalformedCaptureCapabilityDoesNotFallBack() {
     XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([SimulatorCoreDevice.dictionary([:])])))
-    let partial = displayValue(id: "inner", active: true)
-    xpc_dictionary_set_value(partial, "active", nil)
-    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([partial])))
+    let partial = [displayValue(id: "cover", active: true), displayValue(id: "inner", active: nil)]
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply(partial)))
+    let unknown = [displayValue(id: "cover", active: nil), displayValue(id: "inner", active: nil)]
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply(unknown)))
     let malformed = displayValue(id: "inner", active: true)
     xpc_dictionary_set_string(malformed, "active", "true")
     XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([malformed])))
-    let legacy = displayValue(id: "legacy", active: true)
-    xpc_dictionary_set_value(legacy, "active", nil)
-    xpc_dictionary_set_value(legacy, "uniqueId", nil)
+    let legacy = displayValue(id: nil, active: nil)
     XCTAssertThrowsError(try SimulatorDisplayProtocol.snapshot(displayReply([displayValue(id: "inner", active: true), legacy])))
   }
 
@@ -124,11 +180,13 @@ final class SimulatorDisplayReadTests: XCTestCase {
     XCTAssertEqual(selected.scale, 3)
   }
 
-  func testActivityCannotBeInferredFromMissingFieldOrStaleReport() {
+  func testActivityCannotBeInferredFromMissingFieldOrStaleReport() throws {
     let value = displayValue(id: "cover", active: true, primary: true)
     XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([value], current: false)))
     xpc_dictionary_set_value(value, "active", nil)
-    XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([value])))
+    XCTAssertThrowsError(try SimulatorDisplayProtocol.displays(displayReply([value, displayValue(id: "inner", active: nil)])))
+    // With one integrated display there is nothing to infer: it is the screen.
+    XCTAssertEqual(try SimulatorDisplayProtocol.displays(displayReply([value])).map(\.isActive), [true])
   }
 
   func testAmbiguousAndMissingActiveIntegratedDisplaysFail() throws {
