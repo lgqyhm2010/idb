@@ -72,10 +72,13 @@ struct AccessibilityInfoMethodHandler {
     // A bundle id reads that application's whole tree; validate() has already refused it beside a point.
     let response: AccessibilityElementsResponse
     if request.hasDisplay {
-      // validate() has already required a point beside a display.
-      response = try await commandExecutor.accessibility_info_at_point(
-        CGPoint(x: request.point.x, y: request.point.y),
-        onDisplay: HidMethodHandler.displayUniqueID(from: request.display), options: options, backend: backend)
+      // validate() has already required a point beside a display. A display error gets the status it
+      // gets on the HID stream, rather than reaching the client as an internal error.
+      response = try await DisplayErrorTranslation.translatingErrors {
+        try await commandExecutor.accessibility_info_at_point(
+          CGPoint(x: request.point.x, y: request.point.y),
+          onDisplay: HidMethodHandler.displayUniqueID(from: request.display), options: options, backend: backend)
+      }
     } else if let bundleID = AccessibilityInfoRequestTranslation.bundleID(from: request) {
       response = try await commandExecutor.accessibility_info_for_application(
         bundleID: bundleID, options: options,

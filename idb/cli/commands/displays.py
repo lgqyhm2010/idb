@@ -16,11 +16,11 @@ from idb.common.types import ACTIVE_DISPLAY, Client
 def add_display_argument(parser: ArgumentParser) -> None:
     parser.add_argument(
         "--display",
-        help="Route the touch to one display's touchscreen: a unique id from "
-        f"`idb list-displays`, or '{ACTIVE_DISPLAY}' for the lit integrated "
-        "display. Without it the touch goes to the main display. A display that "
-        "is unknown, dark or has no touchscreen fails the command rather than "
-        "falling back to the main display.",
+        help="Route the touch to the active integrated display's touchscreen, "
+        f"named by its unique id from `idb list-displays` or as '{ACTIVE_DISPLAY}'. "
+        "Without it the touch goes to the main display. Naming a display that is "
+        "unknown, is not the active integrated display or has no touchscreen "
+        "fails the command rather than falling back to the main display.",
     )
 
 

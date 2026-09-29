@@ -7,11 +7,11 @@
 
 #import "PhotosTestRuntime.h"
 
-#import <SimulatorFrameworkBridgeLib/PhotoLibraryService+Testing.h>
-
 @interface FBPhotosTestRuntime ()
 @property (nonatomic) BOOL insideTransaction;
 @property (nonatomic) BOOL allMutationsInsideTransaction;
+@property (nonatomic, readwrite) BOOL transactionRanOnWorkerThread;
+@property (nullable, nonatomic, readwrite, copy) NSString *escapedTransactionException;
 @end
 
 @interface FBPhotoProbe : NSObject
@@ -44,12 +44,32 @@
   if ([self.runtime.failure isEqualToString:@"transactionException"]) {
     [NSException raise:@"PhotosTest" format:@"transaction failed"];
   }
-  self.runtime.insideTransaction = YES;
-  @try {
-    block();
-  } @finally {
-    self.runtime.insideTransaction = NO;
-    [self.runtime.operations addObject:@"transactionEnd"];
+  NSThread *callingThread = NSThread.currentThread;
+  void (^transaction)(void) = ^{
+    self.runtime.transactionRanOnWorkerThread = NSThread.currentThread != callingThread;
+    self.runtime.insideTransaction = YES;
+    @try {
+      block();
+    } @catch (NSException *exception) {
+      if (!self.runtime.runTransactionsOnWorkerQueue) {
+        @throw;
+      }
+      // Record escapes on the worker so a regression fails an assertion instead of killing XCTest.
+      self.runtime.escapedTransactionException = exception.name;
+    } @finally {
+      self.runtime.insideTransaction = NO;
+      [self.runtime.operations addObject:@"transactionEnd"];
+    }
+  };
+  if (self.runtime.runTransactionsOnWorkerQueue) {
+    dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+      transaction();
+      dispatch_semaphore_signal(completed);
+    });
+    dispatch_semaphore_wait(completed, DISPATCH_TIME_FOREVER);
+  } else {
+    transaction();
   }
 }
 
@@ -124,7 +144,7 @@
   return self;
 }
 
-- (int)run
+- (NSInteger)runClear:(NSInteger (^NS_NOESCAPE)(FBPhotoLibraryClient *client))clear
 {
   FBPhotoProbe *library = [FBPhotoProbe new];
   library.runtime = self;
@@ -135,13 +155,15 @@
     asset.index = index;
     [assets addObject:asset];
   }
-  return FBPhotoLibraryClearWithLibrary((PHPhotoLibrary *)library, (PHFetchResult<PHAsset *> *)assets);
+  FBPhotoLibraryClient *client = [FBPhotoLibraryClient makeWithPhotoLibrary:(PHPhotoLibrary *)library
+                                                                     assets:(PHFetchResult<PHAsset *> *)assets];
+  return client ? clear(client) : 1;
 }
 
-- (NSDictionary<NSString *, id> *)runCatchingException
+- (NSDictionary<NSString *, id> *)runCatchingExceptionClear:(NSInteger (^NS_NOESCAPE)(FBPhotoLibraryClient *client))clear
 {
   @try {
-    return @{@"status" : @([self run])};
+    return @{@"status" : @([self runClear:clear])};
   } @catch (NSException *exception) {
     return @{@"exception" : exception.name};
   }

@@ -7,14 +7,21 @@
 
 #import <Foundation/Foundation.h>
 
+#import <SimulatorFrameworkBridgeRuntime/PhotoLibraryClient.h>
+
 NS_ASSUME_NONNULL_BEGIN
 @interface FBPhotosTestRuntime : NSObject
 @property (nonatomic) NSUInteger assetCount;
 @property (nonatomic, copy) NSString *failure;
 @property (nonatomic) BOOL saveSucceeds;
+@property (nonatomic) BOOL runTransactionsOnWorkerQueue;
+@property (nonatomic, readonly) BOOL transactionRanOnWorkerThread;
+@property (nullable, nonatomic, readonly, copy) NSString *escapedTransactionException;
 @property (nonatomic, readonly) NSMutableArray<NSString *> *operations;
 @property (nonatomic, readonly) BOOL allMutationsInsideTransaction;
-- (int)run;
-- (NSDictionary<NSString *, id> *)runCatchingException;
+/** Runs `clear` against a client over the fake library; 1 without calling it if no client can be made. */
+- (NSInteger)runClear:(NSInteger (^NS_NOESCAPE)(FBPhotoLibraryClient *client))clear NS_SWIFT_NAME(run(clear:));
+- (NSDictionary<NSString *, id> *)runCatchingExceptionClear:(NSInteger (^NS_NOESCAPE)(FBPhotoLibraryClient *client))clear
+  NS_SWIFT_NAME(runCatchingException(clear:));
 @end
 NS_ASSUME_NONNULL_END

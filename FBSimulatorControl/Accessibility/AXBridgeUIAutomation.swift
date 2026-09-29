@@ -1,0 +1,444 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+import CoreGraphics
+import FBControlCore
+import Foundation
+
+/// The `UIAutomation` backend that reads via the `SimulatorFrameworkBridge` guest `accessibility`
+/// service — an in-simulator accessibility client with no test bundle.
+///
+/// Writes are semantic accessibility actions addressed by point: a one-shot guest cannot hold an
+/// element handle across requests, so a `.marker` write resolves its point host-side and carries an
+/// assertion the guest re-checks before acting, so a screen that moved does not receive the write.
+///
+// SAFETY: stored state is immutable. Persistent transport state is actor-isolated and the one-shot
+// transport is a value type.
+// patternlint-disable-next-line unchecked-sendable
+final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
+
+  /// `true` asserts automation mode, `false` asserts it off, `nil` observes without touching the
+  /// device. Without the mode UIKit collapses subtrees and can serve cached children describing a
+  /// screen no longer displayed.
+  let requestedAutomationMode: Bool?
+
+  private let simulator: Simulator
+
+  /// How this reader reaches the guest.
+  let transport: any AXBridgeTransport
+
+  /// The transport lifecycle this reader was vended for. Held only so `backend` reports the case the
+  /// caller selected; the injected transport already encodes the behavioural difference.
+  private let persistence: AXBridgePersistence
+
+  /// How frontmost reads resolve the foreground app. Defaults to the authoritative `.windowServer`; a
+  /// caller can select the positional `.centerPoint` or `.runningBoard`.
+  private let frontmostMethod: AXBridgeFrontmostMethod
+
+  init(
+    simulator: Simulator,
+    transport: any AXBridgeTransport,
+    persistence: AXBridgePersistence,
+    frontmostMethod: AXBridgeFrontmostMethod = .windowServer,
+    automationMode: Bool? = true
+  ) {
+    self.simulator = simulator
+    self.transport = transport
+    self.persistence = persistence
+    self.frontmostMethod = frontmostMethod
+    self.requestedAutomationMode = automationMode
+  }
+
+  // MARK: - Reads
+
+  func describe(
+    _ query: AccessibilityElementQuery,
+    options: AccessibilityRequestOptions
+  ) async throws -> AccessibilityElementsResponse {
+    try await describeTree(query, options: options)
+  }
+
+  nonisolated var backend: UIAutomationBackend {
+    .axBridge(
+      persistence: persistence, frontmostMethod: frontmostMethod, automationMode: requestedAutomationMode)
+  }
+
+  /// Converts application-level bridge failures to the public UI automation errors.
+  private func translatingBackendErrors<T>(_ body: () async throws -> T) async throws -> T {
+    do {
+      return try await body()
+    } catch let AXBridgeError.applicationUnavailable(pid) {
+      throw UIAutomationError.applicationUnavailable(backend: backend, pid: pid)
+    } catch let AXBridgeError.applicationNotResponding(pid) {
+      throw UIAutomationError.applicationNotResponding(backend: backend, pid: pid)
+    }
+  }
+
+  /// Assembles what both sides measured; the phases come off the envelope `AXTreeRead` already parsed.
+  private static func timings(
+    response: Data, sent: CFAbsoluteTime, returned: CFAbsoluteTime, read: AXTreeRead
+  ) -> AXReadTimings {
+    let decoded = CFAbsoluteTimeGetCurrent()
+    let phases = read.phases
+    return AXReadTimings(
+      roundTrip: returned - sent,
+      decode: decoded - returned,
+      traverse: phases.traverse,
+      machRoundTrips: phases.machRoundTrips,
+      responseBytes: Int64(response.count)
+    )
+  }
+
+  /// A single fetch that asks for reachability hit-tests every node and times out rather than
+  /// answering, so those keys force the per-node walk.
+  static func autoTraversal(for options: AccessibilityRequestOptions) -> AXTraversal {
+    guard options.serializationKeys.isDisjoint(with: AXKeys.reachabilityKeys) else {
+      return .viewHierarchy
+    }
+    return .singleFetch
+  }
+
+  /// `.application` reads the named pid; every other query is one fused guest call that resolves the
+  /// frontmost app at the screen-centre anchor and reads its tree. `.point` goes through `hitTest`.
+  func readRawTree(
+    for query: AccessibilityElementQuery,
+    attributes: [String]?,
+    explainUnreachable: Bool,
+    traversal: AXTraversal
+  ) async throws -> AXTreeRead {
+    try await translatingBackendErrors {
+      if case let .application(pid) = query {
+        let options = AXBridgeReadRequest(
+          maxDepth: AXReadLimits.maxReadDepth,
+          maxNodes: AXReadLimits.maxReadNodes,
+          attributes: attributes,
+          explainUnreachable: explainUnreachable,
+          traversal: traversal,
+          automationMode: requestedAutomationMode
+        )
+        let sent = CFAbsoluteTimeGetCurrent()
+        let response = try await transport.send(.read(pid: pid, options: options))
+        let returned = CFAbsoluteTimeGetCurrent()
+        var read = try AXTreeRead(wholeTreeResponse: response, pid: pid)
+        read.timings = Self.timings(response: response, sent: sent, returned: returned, read: read)
+        return read
+      }
+      let anchor = frontmostAnchor()
+      let options = AXBridgeReadRequest(
+        maxDepth: AXReadLimits.maxReadDepth,
+        maxNodes: AXReadLimits.maxReadNodes,
+        attributes: attributes,
+        explainUnreachable: explainUnreachable,
+        traversal: traversal,
+        automationMode: requestedAutomationMode
+      )
+      let sent = CFAbsoluteTimeGetCurrent()
+      let response = try await transport.send(
+        .readFrontmost(x: anchor.x, y: anchor.y, method: frontmostMethod, options: options)
+      )
+      let returned = CFAbsoluteTimeGetCurrent()
+      var read = try AXTreeRead(frontmostResponse: response, method: frontmostMethod)
+      read.timings = Self.timings(response: response, sent: sent, returned: returned, read: read)
+      return read
+    }
+  }
+
+  func hitTest(
+    at point: CGPoint,
+    options: AccessibilityRequestOptions
+  ) async throws -> AccessibilityElementsResponse? {
+    try await translatingBackendErrors {
+      let response = try await transport.send(
+        .hitTest(
+          x: Double(point.x), y: Double(point.y),
+          attributes: AXWire.Node.fetchList(for: options.serializationKeys))
+      )
+      guard let hit = try AXTreeRead(hitTestResponse: response) else {
+        return nil
+      }
+      let element = AXTreeWalk.buildPlatformElementTree(from: hit.tree, pid: hit.pid)
+      var formatted = AXNodeSerializer.formattedDescription(
+        ofElement: element, token: "", nestedFormat: options.nestedFormat, keys: options.serializationKeys, collector: nil
+      )
+      // The hit element is exempt from the filter; its descendants are not.
+      if let children = formatted.children {
+        formatted.children = options.filter.apply(to: children, screen: nil)
+      }
+      return AccessibilityElementsResponse(elements: .single(formatted))
+        .withProvenance(backend: backend.name, target: .point(point))
+    }
+  }
+
+  func wait(
+    _ query: AccessibilityElementQuery,
+    timeout: TimeInterval,
+    pollInterval: TimeInterval
+  ) async throws {
+    try await UIAutomationPolling.waitForMarker(
+      query, backend: backend, timeout: timeout, pollInterval: pollInterval
+    ) { markerValue, key, _ in
+      // Re-read frontmost each poll so an app that launches mid-wait is picked up.
+      do {
+        // Raw read (not `describeTree`) so truncation is not warned per poll. `.viewHierarchy` because the
+        // single fetch is unmeasured on a transitioning screen.
+        let read = try await self.readRawTree(for: .frontmost, attributes: nil, explainUnreachable: false, traversal: .viewHierarchy)
+        let elements = AXTreeWalk.describeAllElements(
+          fromTree: read.tree, keys: AXKeys.defaultSet.union([key.serializationKey]), nestedFormat: false, pid: read.pid
+        )
+        var result = AXTreeWalk.search(inElements: elements, markerValue: markerValue, key: key)
+        if read.truncated {
+          result.diagnostics?.truncated = true
+        }
+        return result.map { _ in true }
+      } catch let error as UIAutomationError {
+        switch error {
+        case .applicationUnavailable, .applicationNotResponding:
+          return AccessibilitySearchResult(match: nil, diagnostics: AccessibilitySearchDiagnostics(readError: error.localizedDescription))
+        case .elementNotFound, .elementNotOnScreen, .frameUnavailable, .noElementAtPoint,
+          .timedOut, .markerRequired, .pointOrMarkerRequired, .invalidPollInterval,
+          .operationUnsupported, .valueMismatch, .elementMoved, .traversalCannotAnswer:
+          throw error
+        }
+      } catch let error as AXBridgeError {
+        guard error.isTransientDuringMarkerWait else {
+          throw error
+        }
+        return AccessibilitySearchResult(match: nil, diagnostics: AccessibilitySearchDiagnostics(readError: error.localizedDescription))
+      }
+    }
+  }
+
+  // MARK: - Quiescence
+
+  /// Needs a transport that holds its connection open: the guest streams events down it until one side
+  /// hangs up.
+  func quiescence(
+    _ query: AccessibilityElementQuery,
+    parameters: QuiescenceParameters
+  ) async throws -> AsyncThrowingStream<QuiescenceEvent, Error> {
+    let pid: pid_t?
+    switch query {
+    case let .application(requested):
+      pid = requested
+    case .frontmost:
+      pid = nil
+    case .point, .pointOnDisplay, .marker:
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Quiescence of a point or marker")
+    }
+    guard let transport = transport as? any AXBridgeStreamingTransport else {
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Quiescence")
+    }
+    let frames = try await transport.stream(
+      .quiescence(pid: pid, busyThresholdMs: parameters.busyThresholdMs, quietWindowMs: parameters.quietWindowMs))
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          try await translatingBackendErrors {
+            for try await frame in frames {
+              continuation.yield(try QuiescenceEvent(axBridgeFrame: frame, pid: pid))
+            }
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  // MARK: - Writes
+
+  func tap(
+    _ query: AccessibilityElementQuery,
+    options: TapOptions
+  ) async throws {
+    // The AX runtime's press is instantaneous with nowhere to put a hold; reject `duration` rather
+    // than silently downgrading a long-press to a tap.
+    guard options.duration == nil else {
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "A tap with a hold duration")
+    }
+    try await resolveAndWrite(.perform(.press), for: query, operation: "A tap", callerAssertion: options.assertion)
+  }
+
+  func setValue(_ value: String, for query: AccessibilityElementQuery) async throws {
+    try await resolveAndWrite(.setValue(value), for: query, operation: "Setting a value", callerAssertion: nil)
+  }
+
+  func scroll(_ query: AccessibilityElementQuery, direction: AccessibilityScrollDirection) async throws {
+    let scrolled = try await scrollTarget(for: query, backend: backend)
+    try await resolveAndWrite(.perform(Self.action(for: direction)), for: scrolled, operation: "Scroll", callerAssertion: nil)
+  }
+
+  /// Synthesized over HID: a drag is a touch path, not an action on a single element, so the guest has
+  /// no verb for it.
+  func drag(
+    from source: AccessibilityElementQuery,
+    to destination: AccessibilityElementQuery,
+    options: DragOptions
+  ) async throws {
+    let start = try await resolveWriteTarget(for: source, operation: DragEndpoint.operation, callerAssertion: nil).point
+    let end = try await resolveWriteTarget(for: destination, operation: DragEndpoint.operation, callerAssertion: nil).point
+    try await simulator.sendHIDGesture(
+      .drag(
+        Double(start.x), yStart: Double(start.y), xEnd: Double(end.x), yEnd: Double(end.y),
+        delta: options.delta, pressDuration: options.pressDuration, duration: options.duration,
+        releaseDuration: options.releaseDuration
+      )
+    )
+  }
+
+  /// A marker names an element; the point it resolves to is an inference from one tree read, and the
+  /// guest refuses the write when the element it hit no longer carries the asserted value. Nothing is
+  /// written in that case, so the read can be taken again and the write sent once more — and only idb
+  /// holds the tree the marker resolved against, so no caller could do this instead.
+  private func resolveAndWrite(
+    _ kind: AXBridgeWriteRequest.Kind,
+    for query: AccessibilityElementQuery,
+    operation: String,
+    callerAssertion: TapOptions.Assertion?
+  ) async throws {
+    do {
+      let target = try await resolveWriteTarget(for: query, operation: operation, callerAssertion: callerAssertion)
+      try await write(kind, to: target, query: query)
+    } catch UIAutomationError.elementMoved {
+      try Task.checkCancellation()
+      _ = simulator.logger.log("axbridge \(operation): the element moved before the write landed; re-reading the tree once")
+      let target = try await resolveWriteTarget(for: query, operation: operation, callerAssertion: callerAssertion)
+      try await write(kind, to: target, query: query)
+    }
+  }
+
+  private func resolveWriteTarget(
+    for query: AccessibilityElementQuery,
+    operation: String,
+    callerAssertion: TapOptions.Assertion?
+  ) async throws -> AXWriteTarget {
+    do {
+      return try await writeTarget(for: query, operation: operation, callerAssertion: callerAssertion)
+    } catch UIAutomationError.applicationNotResponding {
+      // Only target resolution is repeated. A write timeout does not establish whether it was applied.
+      try Task.checkCancellation()
+      _ = simulator.logger.log("axbridge \(operation): target read timed out; retrying once before sending the write")
+      return try await writeTarget(for: query, operation: operation, callerAssertion: callerAssertion)
+    }
+  }
+
+  /// The semantic action a scroll direction asks for.
+  private static func action(for direction: AccessibilityScrollDirection) -> AXWire.Action {
+    switch direction {
+    case .up: .scrollUp
+    case .down: .scrollDown
+    case .left: .scrollLeft
+    case .right: .scrollRight
+    case .visible: .scrollToVisible
+    }
+  }
+
+  /// A write that landed on nothing is an error, not a success; see `emptyWriteTargetError`.
+  private func write(
+    _ kind: AXBridgeWriteRequest.Kind,
+    to target: AXWriteTarget,
+    query: AccessibilityElementQuery
+  ) async throws {
+    try await translatingWriteErrors(query) {
+      let response = try await transport.send(
+        .write(
+          AXBridgeWriteRequest(
+            kind: kind,
+            x: Double(target.point.x),
+            y: Double(target.point.y),
+            pid: target.pid,
+            assertion: target.assertion
+          )
+        )
+      )
+      guard try AXTreeRead.writeLanded(fromResponse: response) else {
+        throw self.emptyWriteTargetError(for: query, at: target.point)
+      }
+    }
+  }
+
+  /// Adds the refused-assertion case, which only a write can meet, to the shared backend-error
+  /// translation; the guest cannot know which marker sent the write.
+  private func translatingWriteErrors(_ query: AccessibilityElementQuery, _ body: () async throws -> Void) async throws {
+    do {
+      try await translatingBackendErrors(body)
+    } catch let AXBridgeError.assertionFailed(message) {
+      guard case let .marker(value, key, _, _) = query else {
+        throw AXBridgeError.assertionFailed(message)
+      }
+      throw UIAutomationError.elementMoved(backend: backend, key: key.rawValue, value: value)
+    }
+  }
+
+  func frame(_ query: AccessibilityElementQuery) async throws -> CGRect {
+    try await frameFromTree(query)
+  }
+
+  // MARK: - Frontmost anchor
+
+  /// The screen-centre anchor, in points, for the in-guest frontmost hit-test.
+  private func frontmostAnchor() -> (x: Double, y: Double) {
+    let info = simulator.screenInfo
+    return Self.anchorPoint(
+      widthPixels: info?.widthPixels ?? 828, heightPixels: info?.heightPixels ?? 1792, scale: info?.scale ?? 2
+    )
+  }
+
+  static func anchorPoint(widthPixels: UInt, heightPixels: UInt, scale: Float) -> (x: Double, y: Double) {
+    let pointsPerPixel = scale > 0 ? Double(scale) : 1
+    return (Double(widthPixels) / pointsPerPixel / 2, Double(heightPixels) / pointsPerPixel / 2)
+  }
+
+  func warnIfUnsatisfiable(_ keys: Set<AXKeys>, traversal: AXTraversal) {
+    guard !keys.isEmpty else {
+      return
+    }
+    _ = simulator.logger.log(
+      "The \(traversal.rawValue) traversal cannot fetch "
+        + keys.map(\.rawValue).sorted().joined(separator: ", ")
+        + " for every element; a missing value may mean the attribute was unfetchable, not unset"
+    )
+  }
+
+  func warnIfTruncated(_ truncated: Bool) {
+    guard truncated else { return }
+    _ = simulator.logger.log("axbridge read hit the bound (maxDepth \(AXReadLimits.maxReadDepth), maxNodes \(AXReadLimits.maxReadNodes)); the returned tree is truncated and incomplete.")
+  }
+
+  func profile(
+    for read: AXTreeRead, elementCount: Int, serializeDuration: CFAbsoluteTime,
+    traversal: AXTraversal
+  ) -> AccessibilityProfile? {
+    guard let timings = read.timings else {
+      return nil
+    }
+    return .guestBridge(
+      AXBridgeProfile(
+        elementCount: Int64(elementCount),
+        totalDuration: timings.roundTrip + timings.decode + serializeDuration,
+        acquireDuration: timings.residual,
+        readDuration: timings.traverse ?? 0,
+        serializeDuration: serializeDuration,
+        traversal: traversal,
+        machRoundTrips: timings.machRoundTrips,
+        hostDecodeDuration: timings.decode,
+        responseBytes: timings.responseBytes
+      ))
+  }
+
+  func warnIfReachabilityAcrossTree(_ keys: Set<AXKeys>) {
+    guard keys.contains(.interactable) || keys.contains(.occludedBy) else { return }
+    _ = simulator.logger.log(AccessibilityGuidance.reachabilityAcrossTree)
+  }
+
+  func warnIfMostElementsUnframed(_ frames: AccessibilityFrameSummary?) {
+    guard let advice = AccessibilityGuidance.zeroFrameAdvice(frames), let frames else { return }
+    _ = simulator.logger.log("axbridge read reported \(frames.zeroFrame) of \(frames.total) elements with no frame. \(advice)")
+  }
+}

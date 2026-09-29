@@ -34,13 +34,8 @@ enum SimulatorCoreDeviceError: Error, LocalizedError {
 enum SimulatorCoreDevice {
   static let cancellationKey = "CoreDevice.XPCMessageKey.cancellationRequested"
 
-  /// Decodes a reply object. An XPC error object means the peer went away before answering; a
-  /// decoding failure means the peer answered with something the protocol does not describe.
+  /// Decodes a reply object; a failure means the peer answered with something the protocol does not describe.
   static func decode<T: Decodable>(_ type: T.Type, from object: xpc_object_t) throws -> T {
-    if xpc_get_type(object) == XPC_TYPE_ERROR {
-      let description = xpc_dictionary_get_string(object, XPC_ERROR_KEY_DESCRIPTION).map { String(cString: $0) }
-      throw SimulatorCoreDeviceError.unavailable(description ?? "Connection closed before reply")
-    }
     do {
       return try XPCDecoder().decode(type, from: object)
     } catch let error as DecodingError {
@@ -48,9 +43,9 @@ enum SimulatorCoreDevice {
     }
   }
 
-  static func connect(simulator: Simulator, service: String) throws -> xpc_connection_t {
+  static func connect(using connector: SimulatorXPCConnector, service: String) throws -> xpc_connection_t {
     do {
-      return try SimulatorXPCConnection.connect(simulator: simulator, service: service)
+      return try connector.connect(service)
     } catch let error as SimulatorXPCConnectionError {
       throw SimulatorCoreDeviceError(connection: error)
     }
@@ -64,10 +59,21 @@ extension SimulatorCoreDeviceError {
     switch error {
     case .symbolsUnavailable:
       self = .unsupported("Simulator XPC symbols")
+    case let .notBooted(service, state):
+      self = .unavailable("\(service): the simulator is \(state.stateString.rawValue), not booted")
     case let .lookupFailed(service, underlying):
       self = error.isServiceUnsupported ? .unsupported(service) : .unavailable(underlying?.localizedDescription ?? service)
     case .connectionFailed:
       self = .unavailable("Simulator XPC connection")
+    }
+  }
+
+  /// A request the peer did not answer.
+  init(channel error: SimulatorXPCError) {
+    switch error {
+    case let .peerUnavailable(detail): self = .unavailable(detail)
+    case .timedOut: self = .timedOut
+    case .invalidated: self = .unavailable(error.description)
     }
   }
 

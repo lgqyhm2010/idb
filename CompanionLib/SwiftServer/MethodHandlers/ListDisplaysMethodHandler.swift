@@ -13,7 +13,10 @@ struct ListDisplaysMethodHandler {
   let commandExecutor: IDBCommandExecutor
 
   func handle(request: Idb_ListDisplaysRequest, context: ServerContext) async throws -> Idb_ListDisplaysResponse {
-    let (displays, touchscreenDisplayIDs) = try await commandExecutor.list_displays()
+    // A display report this simulator cannot make sense of is a capability it lacks, not an internal error.
+    let (displays, touchscreenDisplayIDs) = try await DisplayErrorTranslation.translatingErrors {
+      try await commandExecutor.list_displays()
+    }
     return Self.response(displays: displays, touchscreenDisplayIDs: touchscreenDisplayIDs)
   }
 

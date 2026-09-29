@@ -7,9 +7,8 @@
 
 import Foundation
 
-@objc
-public final class FBAXBridgeArguments: NSObject {
-  @objc public static func request(action: String, arguments: [String]) -> [String: Any] {
+public enum FBAXBridgeArguments {
+  public static func request(action: String, arguments: [String]) -> [String: Any] {
     var request: [String: Any] = ["verb": action]
     // The CLI consumes pairs, ignores unknown/dangling flags, and lets the last duplicate win.
     for index in stride(from: 0, to: max(0, arguments.count - 1), by: 2) {
@@ -17,8 +16,11 @@ public final class FBAXBridgeArguments: NSObject {
       let string = value as NSString
       switch arguments[index] {
       case "--pid": request["pid"] = string.intValue
+      case "--display-id":
+        if let displayID = UInt32(value), displayID > 0 { request["displayID"] = displayID } else { request["displayID"] = value }
       case "--max-depth": request["maxDepth"] = string.intValue
       case "--max-nodes": request["maxNodes"] = string.intValue
+      case "--automation-mode": request["automationMode"] = string.boolValue
       case "--translator-vocabulary": request["translatorVocabulary"] = string.boolValue
       case "--snapshot-tree": request["snapshotTree"] = string.boolValue
       case "--explain-unreachable": request["explainUnreachable"] = string.boolValue
@@ -37,35 +39,11 @@ public final class FBAXBridgeArguments: NSObject {
         }
       case "--assert-key": request["assertKey"] = value
       case "--assert-value": request["assertValue"] = value
+      case "--busy-threshold-ms": request["busyThresholdMs"] = string.intValue
+      case "--quiet-window-ms": request["quietWindowMs"] = string.intValue
       default: break
       }
     }
     return request
-  }
-
-  @objc public static func idleTimeout(arguments: [String], fallback: Int32) -> Int32 {
-    guard let value = firstValue(for: "--idle-timeout", in: arguments) else {
-      return fallback
-    }
-    let scanner = Scanner(string: value)
-    guard let seconds = scanner.scanInt32(), scanner.isAtEnd, seconds > 0 else {
-      NSLog("[AccessibilityService] ignoring unusable --idle-timeout '%@'; using %ds", value, fallback)
-      return fallback
-    }
-    return seconds
-  }
-
-  @objc public static func exitOnDisconnect(arguments: [String]) -> Bool {
-    (firstValue(for: "--exit-on-disconnect", in: arguments) as NSString?)?.boolValue ?? false
-  }
-
-  // Serve options have always used the first duplicate, unlike accessibility request flags.
-  private static func firstValue(for flag: String, in arguments: [String]) -> String? {
-    for index in stride(from: 0, to: max(0, arguments.count - 1), by: 2) {
-      if arguments[index] == flag {
-        return arguments[index + 1]
-      }
-    }
-    return nil
   }
 }

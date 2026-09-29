@@ -13,7 +13,23 @@ import Foundation
 private let UNAuthorizationStatusNotDetermined: UInt = 0
 private let UNAuthorizationStatusAuthorized: UInt = 2
 
-private func printSectionJSON(bundleID: String, section: FBNotificationSection) -> Bool {
+private func printSectionJSON(bundleID: String, section: FBNotificationSection, output: BridgeOutput?) -> Bool {
+  if let output {
+    guard section.isFound else { return output.write(["bundleID": bundleID, "found": false]) }
+    let values: FBNotificationSectionValues
+    do { values = try section.readValues() } catch {
+      output.failure("Could not read notification settings: \(error.localizedDescription)")
+      return false
+    }
+    return output.write([
+      "bundleID": bundleID,
+      "found": true,
+      "allowsNotifications": values.allowsNotifications,
+      "authorizationStatus": values.authorizationStatus,
+      "showsInNotificationCenter": values.showsInNotificationCenter.map { $0 as Any } ?? NSNull(),
+      "showsInLockScreen": values.showsInLockScreen.map { $0 as Any } ?? NSNull(),
+    ])
+  }
   // The existing C output stops the bundle identifier at its first NUL.
   let printedBundleID = String(bundleID.prefix { $0 != "\0" })
   guard section.isFound else {
@@ -32,39 +48,42 @@ private func printSectionJSON(bundleID: String, section: FBNotificationSection) 
   return true
 }
 
-@objc public final class NotificationSettingsServiceStaticFuncs: NSObject {
-  @objc(handleNotificationSettingsAction:bundleID:)
+public enum FBNotificationSettingsService {
   public static func handleNotificationSettingsAction(action: String?, bundleID: String?) -> Int {
-    guard let client = FBNotificationSettingsClient.live() else {
-      return 1
-    }
-    return handleNotificationSettingsActionWithClient(action: action, bundleID: bundleID, client: client)
+    handleNotificationSettingsAction(action: action, bundleID: bundleID, output: nil)
   }
 
-  @objc(handleNotificationSettingsActionWithGateway:bundleID:gateway:)
+  static func handleNotificationSettingsAction(action: String?, bundleID: String?, output: BridgeOutput?) -> Int {
+    guard let client = FBNotificationSettingsClient.live() else {
+      return output?.failure("The notification settings private API is unavailable") ?? 1
+    }
+    return handleNotificationSettingsActionWithClient(action: action, bundleID: bundleID, client: client, output: output)
+  }
+
   public static func handleNotificationSettingsActionWithGateway(action: String?, bundleID: String?, gateway: Any) -> Int {
-    handleNotificationSettingsActionWithClient(action: action, bundleID: bundleID, client: FBNotificationSettingsClient(gateway: gateway))
+    handleNotificationSettingsActionWithClient(action: action, bundleID: bundleID, client: FBNotificationSettingsClient(gateway: gateway), output: nil)
   }
 }
 
 private func handleNotificationSettingsActionWithClient(
   action: String?,
   bundleID: String?,
-  client: FBNotificationSettingsClient
+  client: FBNotificationSettingsClient,
+  output: BridgeOutput?
 ) -> Int {
   do {
     let selectedAction = action.flatMap(NotificationSettingsAction.init(rawValue:))
     if selectedAction == .check || selectedAction == .list {
       if let bundleID {
         let section = try client.section(forIdentifier: bundleID)
-        guard printSectionJSON(bundleID: bundleID, section: section) else {
+        guard printSectionJSON(bundleID: bundleID, section: section, output: output) else {
           return 1
         }
       } else {
         let identifiers = try client.allSectionIDs()
         for sectionID in identifiers {
           let section = try client.section(forIdentifier: sectionID)
-          guard printSectionJSON(bundleID: sectionID, section: section) else {
+          guard printSectionJSON(bundleID: sectionID, section: section, output: output) else {
             return 1
           }
         }
@@ -112,6 +131,6 @@ private func handleNotificationSettingsActionWithClient(
     NSLog("[NotificationSettings] %@ notifications for %@", action ?? "(null)", bundleID)
     return 0
   } catch {
-    return 1
+    return output?.failure("Notification settings failed: \(error.localizedDescription)") ?? 1
   }
 }

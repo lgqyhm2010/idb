@@ -28,6 +28,8 @@ service CompanionService {
       returns (AccessibilityInfoResponse) {}
   rpc accessibility_action(AccessibilityActionRequest)
       returns (AccessibilityActionResponse) {}
+  rpc accessibility_quiescence(AccessibilityQuiescenceRequest)
+      returns (stream AccessibilityQuiescenceResponse) {}
   rpc focus(FocusRequest) returns (FocusResponse) {}
   rpc get_orientation(GetOrientationRequest) returns (GetOrientationResponse) {}
   rpc set_orientation(SetOrientationRequest) returns (SetOrientationResponse) {}
@@ -40,6 +42,8 @@ service CompanionService {
       returns (SendNotificationResponse) {}
   rpc delivered_notifications(DeliveredNotificationsRequest)
       returns (DeliveredNotificationsResponse) {}
+  rpc clear_delivered_notifications(ClearDeliveredNotificationsRequest)
+      returns (ClearDeliveredNotificationsResponse) {}
   rpc simulate_memory_warning(SimulateMemoryWarningRequest)
       returns (SimulateMemoryWarningResponse) {}
   // Settings
@@ -426,10 +430,14 @@ message AccessibilityInfoRequest {
   // frontmost application, so a caller must check the root element's pid.
   string bundle_id = 14;
   // Hit-test the point on this display instead of the main one; the point is
-  // in the display's interface orientation, as a touch aimed at it is. An
-  // empty unique_id selects the active integrated display. Applies to a point
-  // read only. An older server ignores it and hit-tests the main screen, which
-  // on an unfolded foldable answers nothing.
+  // in the display's interface orientation, as a touch aimed at it is. Any lit
+  // display can be named, integrated or not; an empty unique_id selects the
+  // active integrated display. Naming a device's only integrated display reads
+  // the point exactly as without a display; any other display is read by the
+  // AX backend only, which an unset backend selects. Setting it without a
+  // point, or beside a marker, is INVALID_ARGUMENT. An older server ignores it
+  // and hit-tests the main screen, which on an unfolded foldable answers
+  // nothing.
   HIDEvent.HIDDisplay display = 15;
 }
 
@@ -554,6 +562,63 @@ message AccessibilityActionResponse {
   }
 }
 
+// Streams an application's quiescence until the client cancels or the
+// application exits. Simulator targets on the AXBRIDGE backend only.
+message AccessibilityQuiescenceRequest {
+  // No target follows the frontmost application.
+  oneof target {
+    uint64 pid = 1;
+    string bundle_id = 2;
+  }
+  // Each tunable is in its own oneof for presence, since zero is a meaningful
+  // value: unset takes the companion's default.
+  oneof busy_threshold {
+    // How long a signal may go unanswered before the application is busy.
+    uint32 busy_threshold_ms = 3;
+  }
+  oneof quiet_window {
+    // How long every signal must stay answered before the application is
+    // quiet.
+    uint32 quiet_window_ms = 4;
+  }
+}
+
+message AccessibilityQuiescenceResponse {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    BUSY = 1;
+    SETTLING = 2;
+    QUIET = 3;
+  }
+  enum Signal {
+    SIGNAL_UNSPECIFIED = 0;
+    RUN_LOOP_IDLE = 1;
+    ANIMATIONS_INACTIVE = 2;
+  }
+  // Sent once the state is known and then on every change.
+  message StateChanged {
+    State state = 1;
+    // The signals that have gone unanswered; set only when BUSY.
+    repeated Signal busy_signals = 2;
+  }
+  // A touch sequence finished. Informational: it does not change the state.
+  message TouchesCompleted {}
+  // A stream following the frontmost application moved to pid. Its state
+  // starts over.
+  message TargetChanged {}
+  // The application exited. The last response of the stream.
+  message TargetExited {}
+
+  // The application the event is about.
+  uint64 pid = 1;
+  oneof event {
+    StateChanged state = 2;
+    TouchesCompleted touches_completed = 3;
+    TargetChanged target_changed = 4;
+    TargetExited target_exited = 5;
+  }
+}
+
 message ApproveRequest {
   enum Permission {
     PHOTOS = 0;
@@ -660,6 +725,10 @@ message HIDEvent {
     LOCK = 2;
     SIDE_BUTTON = 3;
     SIRI = 4;
+    PLAY_PAUSE = 5;
+    VOLUME_UP = 6;
+    VOLUME_DOWN = 7;
+    EJECT = 8;
   }
 
   message HIDButton {
@@ -721,9 +790,10 @@ message HIDEvent {
 
   // Routes the touch events that follow it in the same `hid` stream to one
   // display's touchscreen, until the stream ends or another HIDDisplay arrives.
-  // Buttons and keys are unaffected. Selecting a display that is unknown,
-  // inactive or has no touchscreen fails the stream rather than falling back
-  // to the main screen.
+  // Buttons and keys are unaffected. Touches reach only the active integrated
+  // display: selecting a display that is unknown, is not that display or has
+  // no touchscreen fails the stream rather than falling back to the main
+  // screen.
   message HIDDisplay {
     // A `ListDisplaysResponse.Display.unique_id`. Empty selects the active
     // integrated display.
@@ -1444,6 +1514,12 @@ message DeliveredNotification {
 message DeliveredNotificationsResponse {
   repeated DeliveredNotification notifications = 1;
 }
+
+message ClearDeliveredNotificationsRequest {
+  string bundle_id = 1;
+}
+
+message ClearDeliveredNotificationsResponse {}
 
 message DapRequest {
   message Start {
