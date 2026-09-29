@@ -119,6 +119,28 @@ class AccessibilityInfoRequestTests(TestCase):
         self.assertFalse(request.HasField("point"))
         self.assertEqual(request.marker, "")
 
+    def test_a_point_on_a_display_names_the_display(self) -> None:
+        named = accessibility_info_to_grpc(
+            AccessibilityPoint(x=251, y=300), AccessibilityInfoOptions(display="inner")
+        )
+        self.assertEqual(named.display.unique_id, "inner")
+        active = accessibility_info_to_grpc(
+            AccessibilityPoint(x=251, y=300), AccessibilityInfoOptions(display="active")
+        )
+        self.assertTrue(
+            active.HasField("display"),
+            "the active display is an empty unique id, so presence must be explicit",
+        )
+        self.assertEqual(active.display.unique_id, "")
+        plain = accessibility_info_to_grpc(
+            AccessibilityPoint(x=251, y=300), AccessibilityInfoOptions()
+        )
+        self.assertFalse(plain.HasField("display"))
+
+    def test_a_display_without_a_point_is_refused(self) -> None:
+        with self.assertRaises(IdbException):
+            accessibility_info_to_grpc(None, AccessibilityInfoOptions(display="active"))
+
     def test_match_narrows_a_named_apps_whole_tree(self) -> None:
         # A named app is a whole-app read, so a match narrows it just as it
         # narrows the frontmost read.

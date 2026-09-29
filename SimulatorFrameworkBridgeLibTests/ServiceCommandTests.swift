@@ -63,6 +63,20 @@ final class ServiceCommandTests: XCTestCase {
       ])
   }
 
+  func testDeliveredNotificationsUsesItsOwnRouteAndOnlyTheBundleID() {
+    let services = RecordingServices()
+    XCTAssertEqual(FBBridgeCommand.dispatch(service: "notifications", action: "delivered", arguments: ["com.example.app", "ignored"], services: services), 23)
+    XCTAssertEqual(FBBridgeCommand.dispatch(service: "notifications", action: "delivered", arguments: [], services: services), 23)
+    XCTAssertEqual(FBBridgeCommand.dispatch(service: "notifications", action: "clear-delivered", arguments: ["com.example.app"], services: services), 23)
+    XCTAssertEqual(
+      services.calls,
+      [
+        Call(service: "deliveredNotifications", action: "delivered", arguments: ["com.example.app"]),
+        Call(service: "deliveredNotifications", action: "delivered", arguments: [nil]),
+        Call(service: "deliveredNotifications", action: "clear-delivered", arguments: ["com.example.app"]),
+      ])
+  }
+
   func testInvalidServiceAndReplCommandsDoNotCallTheLoader() {
     let services = RecordingServices()
     XCTAssertEqual(FBBridgeCommand.dispatch(service: "unknown", action: "start", arguments: [], services: services), 1)
@@ -85,7 +99,7 @@ private struct Call: Equatable {
   let arguments: [String?]
 }
 
-private final class RecordingServices: NSObject, FBBridgeServiceHandling {
+private final class RecordingServices: FBBridgeServiceHandling {
   var calls: [Call] = []
 
   private func record(_ service: String, _ action: String, _ arguments: [String?]) -> Int32 {
@@ -99,6 +113,7 @@ private final class RecordingServices: NSObject, FBBridgeServiceHandling {
   func dynamicStore(_ action: String, arguments: [String]) -> Int32 { record("dynamic-store", action, arguments) }
   func photos(_ action: String) -> Int32 { record("photos", action, []) }
   func notifications(_ action: String, bundleID: String?) -> Int32 { record("notifications", action, [bundleID]) }
+  func deliveredNotifications(_ action: String, bundleID: String?) -> Int32 { record("deliveredNotifications", action, [bundleID]) }
   func privacy(_ action: String, arguments: [String]) -> Int32 { record("privacy", action, arguments) }
   func proxy(_ action: String, arguments: [String]) -> Int32 { record("proxy", action, arguments) }
   func accessibility(_ action: String, arguments: [String]) -> Int32 { record("accessibility", action, arguments) }

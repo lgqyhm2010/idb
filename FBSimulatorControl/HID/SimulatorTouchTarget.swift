@@ -79,23 +79,19 @@ public struct SimulatorTouchTarget: Equatable, Sendable {
   }
 
   /// Joins a display snapshot to the touchscreen listing. `displayUniqueID` nil selects the active
-  /// integrated display. Every way the join can fail is an error rather than a fall back to the main
-  /// screen: a touch that lands somewhere other than where it was aimed reports success and changes
-  /// nothing the caller can see.
+  /// integrated display; a named display has to be listed, and has to be the active integrated
+  /// display, as `SimulatorDisplayInteractionResolver` requires. Every way the join can fail is an
+  /// error rather than a fall back to the main screen: a touch that lands somewhere other than where
+  /// it was aimed reports success and changes nothing the caller can see.
   static func resolve(
     displayUniqueID: String?, displays: [SimulatorDisplay], touchscreens: [SimulatorTouchscreen]
   ) throws -> SimulatorTouchTarget {
-    let display: SimulatorDisplay
-    if let displayUniqueID {
-      guard let named = displays.first(where: { $0.uniqueID == displayUniqueID }) else {
-        throw SimulatorDisplayError.unknownDisplay(displayUniqueID, known: displays.map(\.uniqueID))
-      }
-      display = named
-    } else {
-      display = try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays)
+    if let displayUniqueID, !displays.contains(where: { $0.uniqueID == displayUniqueID }) {
+      throw SimulatorDisplayError.unknownDisplay(displayUniqueID, known: displays.map(\.uniqueID))
     }
-    guard display.isActive else {
-      throw SimulatorDisplayError.inactiveDisplay(display.uniqueID)
+    let display = try SimulatorDisplayCommands.activeIntegratedDisplay(in: displays)
+    if let displayUniqueID, displayUniqueID != display.uniqueID {
+      throw SimulatorDisplayInteractionError.inactiveDisplay(displayUniqueID)
     }
     guard let touchscreen = touchscreens.first(where: { $0.displayUniqueID == display.uniqueID }) else {
       throw SimulatorDisplayError.noTouchscreen(display.uniqueID)

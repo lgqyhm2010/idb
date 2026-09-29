@@ -7,14 +7,9 @@
 
 import Foundation
 
-@objc
-public final class FBAXBridgeWire: NSObject {
-  @objc(requestFromData:) public static func request(from data: Data) -> [String: Any]? {
-    (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-  }
-
+public enum FBAXBridgeWire {
   /// Replaces non-finite numbers with JSON null, preserving other values for the guarded encoder.
-  @objc public static func sanitized(_ value: Any) -> Any {
+  public static func sanitized(_ value: Any) -> Any {
     if let number = value as? NSNumber {
       return CFNumberIsFloatType(number) && !number.doubleValue.isFinite ? NSNull() : number
     }

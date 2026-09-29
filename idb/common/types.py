@@ -41,6 +41,43 @@ class AccessibilityWaitResult:
         return self.found
 
 
+class QuiescenceState(Enum):
+    BUSY = "busy"
+    SETTLING = "settling"
+    QUIET = "quiet"
+
+
+@dataclass(frozen=True)
+class QuiescenceStateChanged:
+    pid: int
+    state: QuiescenceState
+    # Names of the signals left unanswered past the busy threshold; empty unless busy.
+    busy_signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuiescenceTouchesCompleted:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetChanged:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetExited:
+    pid: int
+
+
+QuiescenceEvent = Union[
+    QuiescenceStateChanged,
+    QuiescenceTouchesCompleted,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+]
+
+
 class IdbException(Exception):
     pass
 
@@ -151,6 +188,10 @@ class HIDButtonType(Enum):
     LOCK = 3
     SIDE_BUTTON = 4
     SIRI = 5
+    PLAY_PAUSE = 6
+    VOLUME_UP = 7
+    VOLUME_DOWN = 8
+    EJECT = 9
 
 
 ConnectionDestination = Union[str, Address]
@@ -510,6 +551,11 @@ class AccessibilityInfoOptions:
     # Compare `match` — and a marker, on a read — case-insensitively.
     ignore_case: bool = False
     filter: AccessibilityElementFilter | None = None
+    # Hit-test a point read on this display instead of the main one: the unique
+    # id of any lit display from `idb list-displays`, or ACTIVE_DISPLAY for the
+    # lit integrated display. The point is in the display's interface
+    # orientation, as a touch aimed at it is. Only meaningful with a point target.
+    display: str | None = None
 
 
 class AccessibilityScrollDirection(Enum):
@@ -704,7 +750,8 @@ ACTIVE_DISPLAY = "active"
 @dataclass(frozen=True)
 class HIDDisplay:
     """Routes the touches after it in the same HID stream to one display's
-    touchscreen. An empty unique_id selects the active integrated display."""
+    touchscreen. A named display must be the active integrated display; an
+    empty unique_id selects it."""
 
     unique_id: str
 
@@ -1032,6 +1079,10 @@ class Client(ABC):
         pass
 
     @abstractmethod
+    async def clear_delivered_notifications(self, bundle_id: str) -> None:
+        pass
+
+    @abstractmethod
     async def approve(
         self, bundle_id: str, permissions: set[Permission], scheme: str | None = None
     ) -> None:
@@ -1198,6 +1249,19 @@ class Client(ABC):
     ) -> bool:
         """Wait for a marker; return False on timeout and propagate other failures."""
         pass
+
+    @abstractmethod
+    async def accessibility_quiescence(
+        self,
+        pid: int | None = None,
+        bundle_id: str | None = None,
+        busy_threshold_ms: int | None = None,
+        quiet_window_ms: int | None = None,
+    ) -> AsyncGenerator[QuiescenceEvent, None]:
+        """Stream quiescence events for an application, or the frontmost one when
+        neither pid nor bundle_id is given. A None tunable takes the companion's default."""
+        # pyrefly: ignore [invalid-yield]
+        yield
 
     async def accessibility_wait_result(
         self,

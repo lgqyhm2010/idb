@@ -7,7 +7,7 @@
 
 #import "AccessibilityClient.h"
 
-#import "AXPAttributes.h"
+#import "Private/AXPAttributes.h"
 #import "Private/AccessibilityElement_Private.h"
 
 static void FBAXClientException(NSException *exception, NSError **error)
@@ -26,6 +26,21 @@ static void FBAXClientException(NSException *exception, NSError **error)
     _value = value;
   }
   return self;
+}
+
+// Every read decodes fresh runtime elements, so identity is the runtime's equality (element ID), not the
+// wrapper's pointer.
+- (BOOL)isEqual:(id)object
+{
+  if (![object isKindOfClass:FBAXElement.class]) {
+    return NO;
+  }
+  return [self.value isEqual:((FBAXElement *)object).value];
+}
+
+- (NSUInteger)hash
+{
+  return [self.value hash];
 }
 
 @end
@@ -75,7 +90,13 @@ static void FBAXClientException(NSException *exception, NSError **error)
   self = [super init];
   if (self) {
     _status = outcome.status;
-    _attributes = [outcome.attributes copy];
+    if (outcome.attributes) {
+      NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
+      for (id key in outcome.attributes) {
+        attributes[key] = outcome.attributes[key];
+      }
+      _attributes = [attributes copy];
+    }
     _error = outcome.error;
   }
   return self;
@@ -128,6 +149,65 @@ static void FBAXClientException(NSException *exception, NSError **error)
 
 @end
 
+// Detach runtime containers under the caller's exception guard. Geometry metadata must survive too.
+static id FBAXCopyAttributeContainers(id value)
+{
+  if ([value isKindOfClass:NSDictionary.class]) {
+    NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
+    for (id key in value) {
+      snapshot[key] = FBAXCopyAttributeContainers(value[key]);
+    }
+    return [snapshot copy];
+  }
+  if ([value isKindOfClass:NSArray.class]) {
+    NSMutableArray *snapshot = [NSMutableArray array];
+    for (id item in value) {
+      [snapshot addObject:FBAXCopyAttributeContainers(item)];
+    }
+    return [snapshot copy];
+  }
+  return value;
+}
+
+@interface FBAXQuiescenceMonitorClient ()
+- (instancetype)initWithMonitor:(id<FBAXQuiescenceMonitor>)monitor;
+@end
+
+@implementation FBAXQuiescenceMonitorClient
+{
+  id<FBAXQuiescenceMonitor> _monitor;
+}
+
+- (instancetype)initWithMonitor:(id<FBAXQuiescenceMonitor>)monitor
+{
+  self = [super init];
+  if (self) {
+    _monitor = monitor;
+  }
+  return self;
+}
+
+- (FBAXWriteOutcome *)requestSignal:(FBAXQuiescenceSignal)signal fromApplication:(FBAXElement *)element error:(NSError **)error
+{
+  @try {
+    return [_monitor requestSignal:signal fromApplication:element.value];
+  } @catch (NSException *exception) {
+    FBAXClientException(exception, error);
+    return nil;
+  }
+}
+
+- (void)invalidate
+{
+  @try {
+    [_monitor invalidate];
+  } @catch (NSException *exception) {
+    FBAXClientException(exception, NULL);
+  }
+}
+
+@end
+
 @implementation FBAXClient
 {
   id<FBAXRuntime> _runtime;
@@ -175,6 +255,26 @@ static void FBAXClientException(NSException *exception, NSError **error)
   }
 }
 
+- (FBAXElementHit *)hitTestAtPoint:(CGPoint)point processIdentifier:(pid_t)pid displayIdentifier:(uint32_t)displayID error:(NSError **)error
+{
+  @try {
+    return [[FBAXElementHit alloc] initWithOutcome:[_runtime hitTestAtPoint:point processIdentifier:pid displayIdentifier:displayID]];
+  } @catch (NSException *exception) {
+    FBAXClientException(exception, error);
+    return nil;
+  }
+}
+
+- (FBAXFrontmostOutcome *)windowServerFrontmostOnDisplay:(uint32_t)displayID error:(NSError **)error
+{
+  @try {
+    return [_runtime windowServerFrontmostOnDisplay:displayID];
+  } @catch (NSException *exception) {
+    FBAXClientException(exception, error);
+    return nil;
+  }
+}
+
 - (FBAXWriteOutcome *)performAction:(FBAXAction)action onElement:(FBAXElement *)element error:(NSError **)error
 {
   @try {
@@ -215,6 +315,24 @@ static void FBAXClientException(NSException *exception, NSError **error)
   }
 }
 
+- (FBAXQuiescenceMonitorClient *)quiescenceMonitorWithHandler:(FBAXQuiescenceHandler)handler error:(NSError **)error
+{
+  @try {
+    NSString *failure = nil;
+    id<FBAXQuiescenceMonitor> monitor = [_runtime quiescenceMonitorWithHandler:handler error:&failure];
+    if (!monitor) {
+      if (error) {
+        *error = [NSError errorWithDomain:@"FBAXQuiescence" code:1 userInfo:@{NSLocalizedDescriptionKey : failure ?: @"the runtime could not start a quiescence monitor"}];
+      }
+      return nil;
+    }
+    return [[FBAXQuiescenceMonitorClient alloc] initWithMonitor:monitor];
+  } @catch (NSException *exception) {
+    FBAXClientException(exception, error);
+    return nil;
+  }
+}
+
 - (NSNumber *)automationModeEnabledWithError:(NSError **)error
 {
   @try {
@@ -232,6 +350,15 @@ static void FBAXClientException(NSException *exception, NSError **error)
   } @catch (NSException *exception) {
     FBAXClientException(exception, error);
     return nil;
+  }
+}
+
+- (FBAXDisplayInventoryOutcome *)displayInventory
+{
+  @try {
+    return [_runtime displayInventory];
+  } @catch (NSException *exception) {
+    return [FBAXDisplayInventoryOutcome failed:[NSString stringWithFormat:@"the reader raised while answering: %@", exception.reason ?: exception.name]];
   }
 }
 
@@ -290,22 +417,26 @@ static void FBAXClientException(NSException *exception, NSError **error)
   }
 }
 
-- (NSNumber *)isValidRectangleDictionary:(id)value error:(NSError **)error
+- (FBAXOptionalValue<NSDictionary<NSString *, id> *> *)snapshotRectangleDictionary:(id)value error:(NSError **)error
 {
   @try {
     CGRect geometry = CGRectZero;
-    return @(CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)value, &geometry));
+    NSDictionary *snapshot = FBAXCopyAttributeContainers(value);
+    BOOL valid = CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)snapshot, &geometry);
+    return [[FBAXOptionalValue alloc] initWithValue:valid ? snapshot : nil];
   } @catch (NSException *exception) {
     FBAXClientException(exception, error);
     return nil;
   }
 }
 
-- (NSNumber *)isValidPointDictionary:(id)value error:(NSError **)error
+- (FBAXOptionalValue<NSDictionary<NSString *, id> *> *)snapshotPointDictionary:(id)value error:(NSError **)error
 {
   @try {
     CGPoint geometry = CGPointZero;
-    return @(CGPointMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)value, &geometry));
+    NSDictionary *snapshot = FBAXCopyAttributeContainers(value);
+    BOOL valid = CGPointMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)snapshot, &geometry);
+    return [[FBAXOptionalValue alloc] initWithValue:valid ? snapshot : nil];
   } @catch (NSException *exception) {
     FBAXClientException(exception, error);
     return nil;

@@ -175,6 +175,13 @@ final class CompanionServiceProvider: Idb_CompanionService.SimpleServiceProtocol
     }
   }
 
+  func accessibility_quiescence(request: Idb_AccessibilityQuiescenceRequest, response: RPCWriter<Idb_AccessibilityQuiescenceResponse>, context: ServerContext) async throws {
+    try await trackedServerStreaming(context, request: request) {
+      try await AccessibilityQuiescenceMethodHandler(commandExecutor: commandExecutor)
+        .handle(request: request, responseStream: response, context: context)
+    }
+  }
+
   func accessibility_action(request: Idb_AccessibilityActionRequest, context: ServerContext) async throws -> Idb_AccessibilityActionResponse {
     return try await trackedUnaryCall(context, request: request) {
       try await AccessibilityActionMethodHandler(commandExecutor: commandExecutor)
@@ -240,6 +247,13 @@ final class CompanionServiceProvider: Idb_CompanionService.SimpleServiceProtocol
   func delivered_notifications(request: Idb_DeliveredNotificationsRequest, context: ServerContext) async throws -> Idb_DeliveredNotificationsResponse {
     return try await trackedUnaryCall(context, request: request) {
       try await DeliveredNotificationsMethodHandler(commandExecutor: commandExecutor)
+        .handle(request: request, context: context)
+    }
+  }
+
+  func clear_delivered_notifications(request: Idb_ClearDeliveredNotificationsRequest, context: ServerContext) async throws -> Idb_ClearDeliveredNotificationsResponse {
+    return try await trackedUnaryCall(context, request: request) {
+      try await ClearDeliveredNotificationsMethodHandler(commandExecutor: commandExecutor)
         .handle(request: request, context: context)
     }
   }

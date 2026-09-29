@@ -6,7 +6,8 @@
  */
 
 import Foundation
-@_implementationOnly import SimulatorFrameworkBridgeLib
+@_implementationOnly import SimulatorFrameworkBridgeSupport
+import UserNotifications
 import XCTest
 
 // The other half of the guest's `notifications` service. It has no test file of its own, and
@@ -14,6 +15,7 @@ import XCTest
 final class DeliveredNotificationsServiceTests: XCTestCase {
   private var notificationsDirectory = ""
   private var storeDirectory = ""
+  private var timeout: TimeInterval = 0
 
   /// The mapping from bundle identifier to store directory, as BulletinBoard writes it.
   private var libraryPath: String {
@@ -34,14 +36,24 @@ final class DeliveredNotificationsServiceTests: XCTestCase {
         withIntermediateDirectories: true
       )
     )
-    FBDeliveredNotificationsSetDirectoryForTesting(notificationsDirectory)
   }
 
   override func tearDown() {
-    FBDeliveredNotificationsSetDirectoryForTesting(nil)
-    FBDeliveredNotificationsSetTimeoutForTesting(0)
     try? FileManager.default.removeItem(atPath: notificationsDirectory)
     super.tearDown()
+  }
+
+  private func handleDeliveredNotificationsAction(_ action: String?, _ bundleID: String?) -> Int32 {
+    FBDeliveredNotificationsService.handleAction(action, bundleID: bundleID, directory: notificationsDirectory, timeout: timeout)
+  }
+
+  private func handleDeliveredNotificationsActionWithCenter(_ action: String?, _ bundleID: String?, _ center: Any?) -> Int32 {
+    FBDeliveredNotificationsService.handleActionWithCenter(
+      action, bundleID: bundleID, center: center, directory: notificationsDirectory, timeout: timeout)
+  }
+
+  private func clearDeliveredNotificationsWithRemover(_ bundleID: String?, _ remover: Any?) -> Int32 {
+    FBDeliveredNotificationsService.clear(bundleID: bundleID, remover: remover, directory: notificationsDirectory, timeout: timeout)
   }
 
   private func writeArchive(of root: Any, toPath path: String) {
@@ -62,6 +74,117 @@ final class DeliveredNotificationsServiceTests: XCTestCase {
       of: records,
       toPath: (directory as NSString).appendingPathComponent("DeliveredNotifications.plist")
     )
+  }
+
+  func testNilActionIsRefusedWithoutOutputOrAskingTheCenter() {
+    let center = FBFakeDeliveredNotificationsCenter()
+    let output = FBStdoutWhileRunning {
+      XCTAssertEqual(handleDeliveredNotificationsAction(nil, "com.example.test"), 1)
+      XCTAssertEqual(handleDeliveredNotificationsAction("unknown", "com.example.test"), 1)
+      XCTAssertEqual(handleDeliveredNotificationsActionWithCenter(nil, "com.example.test", center), 1)
+    }
+    XCTAssertEqual(output, "")
+    XCTAssertFalse(center.wasAsked)
+  }
+
+  func testNonemptyCenterPreservesFieldsOrderAndDuplicatesWithoutReadingStore() throws {
+    try "unreadable store".write(toFile: libraryPath, atomically: true, encoding: .utf8)
+    let content = UNMutableNotificationContent()
+    content.title = "Title"
+    content.subtitle = "Subtitle"
+    content.body = "Body"
+    content.threadIdentifier = "thread"
+    let request = UNNotificationRequest(identifier: "duplicate", content: content, trigger: nil)
+    let first = DeliveredNotificationFixture(request: request, date: Date(timeIntervalSince1970: 1_700_000_000))
+    let second = FBFakeDeliveredNotification()
+    second.identifier = "duplicate"
+    let center = FBFakeDeliveredNotificationsCenter()
+    center.notifications = [first, second]
+    var result: Int32 = -1
+
+    let output = FBStdoutWhileRunning {
+      result = handleDeliveredNotificationsActionWithCenter("delivered", "com.example.test", center)
+    }
+
+    XCTAssertEqual(result, 0)
+    XCTAssertTrue(center.wasAsked)
+    let lines = output.split(separator: "\n").map(String.init)
+    XCTAssertEqual(lines.count, 2)
+    guard lines.count == 2 else { return }
+    let firstObject = try XCTUnwrap(FBParsedJSONLine(lines[0]))
+    XCTAssertEqual(
+      firstObject as NSDictionary,
+      [
+        "bundleID": "com.example.test", "identifier": "duplicate", "title": "Title",
+        "subtitle": "Subtitle", "body": "Body", "threadIdentifier": "thread", "date": 1_700_000_000,
+      ] as NSDictionary)
+    let secondObject = try XCTUnwrap(FBParsedJSONLine(lines[1]))
+    XCTAssertEqual(
+      secondObject as NSDictionary,
+      [
+        "bundleID": "com.example.test", "identifier": "duplicate", "title": "",
+        "subtitle": "", "body": "", "threadIdentifier": "",
+      ] as NSDictionary)
+  }
+
+  func testRecordExceptionPreservesOtherRecordsWithoutFallingBackToStore() {
+    let bundleID = "com.example.test.recordexception"
+    writeStore(forBundleID: bundleID, records: [["AppNotificationIdentifier": "fallback"]])
+    let first = FBFakeDeliveredNotification()
+    first.identifier = "first"
+    let last = FBFakeDeliveredNotification()
+    last.identifier = "last"
+    let center = FBFakeDeliveredNotificationsCenter()
+    center.notifications = [first, FBRaisingDeliveredNotification(), last]
+    var result: Int32 = -1
+    let output = FBStdoutWhileRunning {
+      result = handleDeliveredNotificationsActionWithCenter("delivered", bundleID, center)
+    }
+    XCTAssertEqual(result, 1)
+    XCTAssertTrue(center.wasAsked)
+    XCTAssertEqual(output.split(separator: "\n").compactMap { FBParsedJSONLine(String($0))?["identifier"] as? String }, ["first", "last"])
+  }
+
+  func testNilCenterFallsBackToStoreAfterTimeout() {
+    let bundleID = "com.example.test.nilcenter"
+    writeStore(forBundleID: bundleID, records: [["AppNotificationIdentifier": "stored"]])
+    timeout = 0.001
+    var result: Int32 = -1
+    let output = FBStdoutWhileRunning {
+      result = handleDeliveredNotificationsActionWithCenter("delivered", bundleID, nil)
+    }
+    XCTAssertEqual(result, 0)
+    XCTAssertEqual(FBParsedJSONLine(output)?["identifier"] as? String, "stored")
+  }
+
+  func testMalformedRecordDoesNotPreventReportingLaterRecords() {
+    let bundleID = "com.example.test.continue"
+    writeStore(forBundleID: bundleID, records: ["malformed", ["AppNotificationIdentifier": "later"]])
+    var result: Int32 = -1
+    let output = FBStdoutWhileRunning {
+      result = handleDeliveredNotificationsActionWithCenter("delivered", bundleID, FBFakeDeliveredNotificationsCenter())
+    }
+    XCTAssertEqual(result, 1)
+    XCTAssertEqual(FBParsedJSONLine(output)?["identifier"] as? String, "later")
+  }
+
+  func testMalformedArchiveStructureFailsWithoutOutput() throws {
+    let malformed: [[String: Any]] = [
+      [:],
+      ["$objects": "not an array", "$top": [:]],
+      ["$objects": [], "$top": "not a dictionary"],
+      ["$objects": [], "$top": ["root": 0]],
+    ]
+    for plist in malformed {
+      let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+      try data.write(to: URL(fileURLWithPath: libraryPath))
+      var result: Int32 = -1
+      let output = FBStdoutWhileRunning {
+        result = handleDeliveredNotificationsActionWithCenter("delivered", "com.example.test", FBFakeDeliveredNotificationsCenter())
+      }
+      XCTAssertEqual(result, 1, "\(plist)")
+      XCTAssertEqual(output, "")
+    }
   }
 
   func testAnUnknownActionIsRefusedWithoutAskingTheCenter() {
@@ -181,7 +304,7 @@ final class DeliveredNotificationsServiceTests: XCTestCase {
   func testClearDeliveredClearsTheStoreWhenTheDaemonDoesNotAnswer() {
     let bundleID = "com.example.test.clear.silent"
     writeStore(forBundleID: bundleID, records: [["AppNotificationIdentifier": "identifier-1"]])
-    FBDeliveredNotificationsSetTimeoutForTesting(0.1)
+    timeout = 0.1
 
     XCTAssertEqual(clearDeliveredNotificationsWithRemover(bundleID, FBSilentDeliveredNotificationsRemover()), 0)
 
@@ -593,7 +716,7 @@ final class DeliveredNotificationsServiceTests: XCTestCase {
     // the others here already answer from disk for rather than failing on.
     let bundleID = "com.example.test.silent"
     writeStore(forBundleID: bundleID, records: [["AppNotificationIdentifier": "identifier-silent"]])
-    FBDeliveredNotificationsSetTimeoutForTesting(0.05)
+    timeout = 0.05
     var result: Int32 = -1
 
     let output = FBStdoutWhileRunning {
@@ -648,5 +771,16 @@ final class DeliveredNotificationsServiceTests: XCTestCase {
       ),
       0
     )
+  }
+}
+
+private final class DeliveredNotificationFixture: NSObject {
+  @objc let request: UNNotificationRequest
+  @objc let date: Date?
+
+  init(request: UNNotificationRequest, date: Date?) {
+    self.request = request
+    self.date = date
+    super.init()
   }
 }

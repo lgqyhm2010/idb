@@ -11,74 +11,31 @@ import Foundation
 @_implementationOnly import SimulatorFrameworkBridgeRuntime
 #endif
 
-@objc public final class DnsServiceStaticFuncs: NSObject {
+public enum FBDnsService {
 
-  @objc(buildDnsDict:)
   public static func buildDnsDict(servers: [String]) -> [String: Any] {
     ["ServerAddresses": servers]
   }
 
-  @objc(buildEmptyDnsDict)
-  public static func buildEmptyDnsDict() -> [String: Any] {
-    [:]
+  public static func handleDnsAction(action: String, arguments: [String]) -> Int {
+    handleDnsAction(action: action, arguments: arguments, output: nil)
   }
 
-  @objc(handleDnsAction:arguments:)
-  public static func handleDnsAction(action: String, arguments: [String]) -> Int {
-    let store = FBNetworkConfigurationStore.dns()
-    guard let store else {
-      return 1
-    }
-
-    let selectedAction = NetworkConfigurationAction(rawValue: action)
-    if selectedAction == .list {
-      let read = store.readConfiguration()
-      guard let read else {
-        return 1
-      }
-      if let dict = read.configuration {
-        if let json = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted),
-          let str = String(data: json, encoding: .utf8)
-        {
-          // patternlint-disable-next-line avoid-print-to-prevent-production-overhead
-          print(str)
-        }
-      } else {
-        // patternlint-disable-next-line avoid-print-to-prevent-production-overhead
-        print("{}")
-      }
-      return 0
-    }
-
-    guard store.prepareToWrite() else {
-      return 1
-    }
-
-    let dnsDict: [String: Any]
-    if selectedAction == .set {
-      if arguments.isEmpty {
+  static func handleDnsAction(action: String, arguments: [String], output: BridgeOutput?) -> Int {
+    NetworkConfigurationService(
+      name: "DNS",
+      logTag: "[DnsService]",
+      store: FBNetworkConfigurationStore.dns(),
+      clearedConfiguration: [:],
+      clearingMessage: "Clearing DNS configuration",
+      updatedMessage: "DNS configuration updated successfully"
+    ) { servers in
+      guard !servers.isEmpty else {
         NSLog("[DnsService] set requires at least one DNS server address")
-        return 1
+        return nil
       }
-      dnsDict = DnsServiceStaticFuncs.buildDnsDict(servers: arguments)
-      NSLog("[DnsService] Setting DNS servers to %@", arguments.joined(separator: ", "))
-    } else if selectedAction == .clear {
-      dnsDict = DnsServiceStaticFuncs.buildEmptyDnsDict()
-      NSLog("[DnsService] Clearing DNS configuration")
-    } else {
-      NSLog("[DnsService] Unknown action: %@. Use 'set', 'clear', or 'list'.", action)
-      return 1
-    }
-
-    let success = store.writeConfiguration(dnsDict)
-
-    guard success else {
-      return 1
-    }
-
-    store.notifyChange()
-
-    NSLog("[DnsService] DNS configuration updated successfully")
-    return 0
+      NSLog("[DnsService] Setting DNS servers to %@", servers.joined(separator: ", "))
+      return buildDnsDict(servers: servers)
+    }.handle(action: action, arguments: arguments, output: output)
   }
 }

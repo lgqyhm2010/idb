@@ -11,7 +11,7 @@ import Foundation
 import GRPCCore
 import IDBGRPCSwift
 
-/// Seam over the three `IDBCommandExecutor` reads this handler drives, so the request-to-options wiring
+/// Seam over the four `IDBCommandExecutor` reads this handler drives, so the request-to-options wiring
 /// can be tested against a double.
 protocol AccessibilityDescribing {
   func accessibility_describe(
@@ -28,6 +28,13 @@ protocol AccessibilityDescribing {
 
   func accessibility_info_for_application(
     bundleID: String,
+    options: AccessibilityRequestOptions,
+    backend: UIAutomationBackend
+  ) async throws -> AccessibilityElementsResponse
+
+  func accessibility_info_at_point(
+    _ point: CGPoint,
+    onDisplay displayUniqueID: String?,
     options: AccessibilityRequestOptions,
     backend: UIAutomationBackend
   ) async throws -> AccessibilityElementsResponse
@@ -64,7 +71,15 @@ struct AccessibilityInfoMethodHandler {
     }
     // A bundle id reads that application's whole tree; validate() has already refused it beside a point.
     let response: AccessibilityElementsResponse
-    if let bundleID = AccessibilityInfoRequestTranslation.bundleID(from: request) {
+    if request.hasDisplay {
+      // validate() has already required a point beside a display. A display error gets the status it
+      // gets on the HID stream, rather than reaching the client as an internal error.
+      response = try await DisplayErrorTranslation.translatingErrors {
+        try await commandExecutor.accessibility_info_at_point(
+          CGPoint(x: request.point.x, y: request.point.y),
+          onDisplay: HidMethodHandler.displayUniqueID(from: request.display), options: options, backend: backend)
+      }
+    } else if let bundleID = AccessibilityInfoRequestTranslation.bundleID(from: request) {
       response = try await commandExecutor.accessibility_info_for_application(
         bundleID: bundleID, options: options,
         backend: try AccessibilityInfoRequestTranslation.applicationBackend(from: request.backend))

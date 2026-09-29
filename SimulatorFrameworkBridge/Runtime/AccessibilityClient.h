@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#import "../AccessibilityRuntime.h"
+#import "AccessibilityRuntime.h"
 #import "AccessibilitySnapshotClient.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -60,6 +60,14 @@ NS_ASSUME_NONNULL_BEGIN
 + (instancetype)new NS_UNAVAILABLE;
 @end
 
+/** An `FBAXQuiescenceMonitor` whose requests take wrapped elements and contain private exceptions. */
+@interface FBAXQuiescenceMonitorClient : NSObject
+- (nullable FBAXWriteOutcome *)requestSignal:(FBAXQuiescenceSignal)signal fromApplication:(FBAXElement *)element error:(NSError **)error;
+- (void)invalidate;
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+@end
+
 /** Each interaction contains private exceptions before returning to Swift orchestration. */
 @interface FBAXClient : NSObject
 @property (nonatomic, readonly) FBAXSnapshotClient *snapshots;
@@ -67,12 +75,16 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 
+- (FBAXDisplayInventoryOutcome *)displayInventory;
+
 - (nullable FBAXOptionalValue<FBAXElement *> *)applicationElementForProcessIdentifier:(pid_t)pid error:(NSError **)error;
 - (nullable FBAXElementRead *)readAttributes:(NSArray<NSString *> *)attributes ofElement:(FBAXElement *)element error:(NSError **)error;
 - (nullable FBAXElementHit *)hitTestAtPoint:(CGPoint)point processIdentifier:(pid_t)pid error:(NSError **)error;
+- (nullable FBAXElementHit *)hitTestAtPoint:(CGPoint)point processIdentifier:(pid_t)pid displayIdentifier:(uint32_t)displayID error:(NSError **)error;
 - (nullable FBAXWriteOutcome *)performAction:(FBAXAction)action onElement:(FBAXElement *)element error:(NSError **)error;
 - (nullable FBAXWriteOutcome *)setValue:(id)value onElement:(FBAXElement *)element error:(NSError **)error;
 - (nullable FBAXFrontmostOutcome *)windowServerFrontmostWithError:(NSError **)error;
+- (nullable FBAXFrontmostOutcome *)windowServerFrontmostOnDisplay:(uint32_t)displayID error:(NSError **)error;
 - (nullable FBAXFrontmostOutcome *)runningBoardFrontmostWithError:(NSError **)error;
 - (nullable NSNumber *)automationModeEnabledWithError:(NSError **)error;
 - (nullable NSNumber *)setAutomationModeEnabled:(BOOL)enabled error:(NSError **)error;
@@ -80,10 +92,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable FBAXDeviceSettingOutcome *)setEnabled:(BOOL)enabled forDeviceSetting:(FBAXDeviceSetting)setting error:(NSError **)error;
 - (nullable FBAXTranslatorRead *)translatorAttributesOfElement:(FBAXElement *)element error:(NSError **)error;
 - (nullable NSArray<FBAXElement *> *)translatorChildrenOfElement:(FBAXElement *)element error:(NSError **)error;
+/** Nil when the runtime cannot observe or raised, with `*error` saying which. */
+- (nullable FBAXQuiescenceMonitorClient *)quiescenceMonitorWithHandler:(FBAXQuiescenceHandler)handler error:(NSError **)error;
 
 /** Opaque inputs prevent Swift from enumerating a dictionary before entering the exception guard. */
-- (nullable NSNumber *)isValidRectangleDictionary:(id)value error:(NSError **)error NS_SWIFT_NAME(isValidRectangle(_:));
-- (nullable NSNumber *)isValidPointDictionary:(id)value error:(NSError **)error NS_SWIFT_NAME(isValidPoint(_:));
+- (nullable FBAXOptionalValue<NSDictionary<NSString *, id> *> *)snapshotRectangleDictionary:(id)value error:(NSError **)error NS_SWIFT_NAME(snapshotRectangle(_:));
+- (nullable FBAXOptionalValue<NSDictionary<NSString *, id> *> *)snapshotPointDictionary:(id)value error:(NSError **)error NS_SWIFT_NAME(snapshotPoint(_:));
 - (nullable NSNumber *)matchesValue:(nullable id)value expected:(NSString *)expected error:(NSError **)error NS_SWIFT_NAME(matches(_:expected:));
 /** Only a value of the requested geometry type is returned. Unsupported values are ordinary absence. */
 - (nullable FBAXOptionalValue<NSValue *> *)rectangleFromValue:(id)value error:(NSError **)error;

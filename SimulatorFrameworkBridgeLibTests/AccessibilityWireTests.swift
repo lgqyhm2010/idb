@@ -6,30 +6,10 @@
  */
 
 import Foundation
-@_implementationOnly import SimulatorFrameworkBridgeLib
+@_implementationOnly import SimulatorFrameworkBridgeSupport
 import XCTest
 
 final class AccessibilityWireTests: XCTestCase {
-  func testNonObjectFramesAreRejectedAndClearShutdown() {
-    for input in ["", "not json", "[]", "[{}]", "null", "true", "42", "\"shutdown\""] {
-      var shutdown = ObjCBool(true)
-      let response = FBAXBridgeHandleRequestData(Data(input.utf8), &shutdown)
-      XCTAssertEqual(
-        response as NSDictionary,
-        [
-          "ok": false, "error": "malformed request frame", "error_kind": "bad_request",
-        ] as NSDictionary, input)
-      XCTAssertFalse(shutdown.boolValue, input)
-    }
-  }
-
-  func testShutdownObjectSurvivesDecoding() {
-    var shutdown = ObjCBool(false)
-    let response = FBAXBridgeHandleRequestData(Data(#"{"verb":"shutdown","pid":0}"#.utf8), &shutdown)
-    XCTAssertEqual(response as NSDictionary, ["ok": true, "shutdown": true] as NSDictionary)
-    XCTAssertTrue(shutdown.boolValue)
-  }
-
   func testNestedNonFiniteNumbersBecomeNullWithoutChangingOtherScalars() throws {
     let response: [String: Any] = [
       "ok": true,
@@ -40,7 +20,7 @@ final class AccessibilityWireTests: XCTestCase {
       "string": "infinity",
       "null": NSNull(),
     ]
-    let encoded = FBAXBridgeSerializeResponse(response)
+    let encoded = FBAccessibilityService.serializeResponse(response)
     let decoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
     XCTAssertEqual(
       decoded as NSDictionary,
@@ -60,6 +40,6 @@ final class AccessibilityWireTests: XCTestCase {
 
   func testUnsupportedNestedValuesKeepTheSerializationFallback() {
     let response: [String: Any] = ["ok": true, "values": [["date": Date()]]]
-    XCTAssertEqual(FBAXBridgeSerializeResponse(response), Data(#"{"ok":false,"error":"response serialization failed"}"#.utf8))
+    XCTAssertEqual(FBAccessibilityService.serializeResponse(response), Data(#"{"ok":false,"error":"response serialization failed"}"#.utf8))
   }
 }

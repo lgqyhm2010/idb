@@ -83,7 +83,11 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
     try validateAccessibility()
     switch query {
     case let .point(point):
-      let request = AXTranslationRequest(kind: .point(point))
+      let request = AXTranslationRequest(kind: .point(point, displayId: 0))
+      return try await accessibilityElement(request: request, remediationPermitted: false)
+    case let .pointOnDisplay(_, panelPoint, displayId):
+      // The translator hit-tests another display in its unrotated panel points, not the caller's.
+      let request = AXTranslationRequest(kind: .point(panelPoint, displayId: displayId))
       return try await accessibilityElement(request: request, remediationPermitted: false)
     case .frontmost:
       let request = AXTranslationRequest(kind: .frontmostApplication)
