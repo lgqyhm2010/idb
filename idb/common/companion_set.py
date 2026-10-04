@@ -9,9 +9,10 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -30,21 +31,23 @@ from idb.common.types import (
 async def _open_lockfile(filename: str) -> AsyncGenerator[None, None]:
     timeout = 3
     retry_time = 0.05
-    deadline = datetime.now() + timedelta(seconds=timeout)
+    deadline = time.monotonic() + timeout
     lock_path = filename + ".lock"
-    lock = None
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            lock = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise IdbException(f"Failed to open the lockfile {lock_path}")
+            await asyncio.sleep(retry_time)
+    # Only the successful owner may release the lock. Exceptions from the body
+    # (including FileExistsError) must not be mistaken for acquisition failure.
     try:
-        while lock is None:
-            try:
-                lock = os.open(lock_path, os.O_CREAT | os.O_EXCL)
-                yield None
-            except FileExistsError:
-                if datetime.now() >= deadline:
-                    raise IdbException(f"Failed to open the lockfile {lock_path}")
-                await asyncio.sleep(retry_time)
+        yield None
     finally:
-        if lock is not None:
-            os.close(lock)
+        os.close(lock)
         os.unlink(lock_path)
 
 
@@ -58,18 +61,23 @@ class CompanionSet:
     @asynccontextmanager
     async def _use_stored_companions(self) -> AsyncGenerator[list[CompanionInfo], None]:
         async with _open_lockfile(filename=self.state_file_path):
-            # Create the state file
-            Path(self.state_file_path).touch(exist_ok=True)
-            fresh_state = False
-            with open(self.state_file_path) as f:
+            path = Path(self.state_file_path)
+            try:
+                contents = path.read_text()
+            except FileNotFoundError:
+                contents = ""
+            fresh_state = not contents
+            if fresh_state:
+                companion_info_in = []
+            else:
                 try:
-                    companion_info_in = json_to_companion_info(json.load(f))
-                except json.JSONDecodeError:
-                    fresh_state = True
-                    self.logger.info(
-                        "State file is invalid or empty, creating empty companion info"
-                    )
-                    companion_info_in = []
+                    companion_info_in = json_to_companion_info(json.loads(contents))
+                except json.JSONDecodeError as error:
+                    # Leave the original bytes intact for diagnosis/recovery.
+                    raise IdbException(
+                        f"Invalid companion state file {self.state_file_path}; "
+                        "preserving it instead of overwriting the registry"
+                    ) from error
             companion_info_in = sorted(
                 companion_info_in, key=lambda companion: companion.udid
             )
@@ -88,8 +96,19 @@ class CompanionSet:
                 )
             else:
                 return
-            with open(self.state_file_path, "w") as f:
-                json.dump(json_data_companions(companion_info_out), f)
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", dir=path.parent, prefix=path.name + ".", delete=False
+                ) as f:
+                    temporary_path = f.name
+                    json.dump(json_data_companions(companion_info_out), f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary_path, self.state_file_path)
+            finally:
+                if temporary_path is not None and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
 
     async def get_companions(self) -> list[CompanionInfo]:
         async with self._use_stored_companions() as companions:

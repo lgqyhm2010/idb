@@ -95,15 +95,14 @@ public final class CompanionRegistry {
   }
 
   private func readLocked() throws -> [CompanionInfo] {
-    guard let data = FileManager.default.contents(atPath: stateFilePath), !data.isEmpty else {
+    guard FileManager.default.fileExists(atPath: stateFilePath) else {
       return []
     }
-    do {
-      return try JSONDecoder().decode([CompanionInfo].self, from: data).sorted { $0.udid < $1.udid }
-    } catch {
-      // An invalid or partially-written state file is treated as empty.
-      return []
-    }
+    let data = try Data(contentsOf: URL(fileURLWithPath: stateFilePath))
+    guard !data.isEmpty else { return [] }
+    // Propagate read/decoding failures: a damaged registry must not be silently
+    // overwritten with an empty one on the next mutation.
+    return try JSONDecoder().decode([CompanionInfo].self, from: data).sorted { $0.udid < $1.udid }
   }
 
   private func writeLocked(_ companions: [CompanionInfo]) throws {
@@ -111,7 +110,7 @@ public final class CompanionRegistry {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let data = try encoder.encode(companions.sorted { $0.udid < $1.udid })
-    try data.write(to: URL(fileURLWithPath: stateFilePath))
+    try data.write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
   }
 
   // MARK: - Lockfile

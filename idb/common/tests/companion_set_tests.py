@@ -26,12 +26,6 @@ class CompanionSetTests(TestCase):
             yield CompanionSet(
                 logger=mock.MagicMock(), state_file_path=str(Path(dir) / "state_file")
             )
-        # Covers a garbage tempfile
-        with tempfile.TemporaryDirectory() as dir:
-            path = str(Path(dir) / "state_file")
-            with open(path, "w") as f:
-                f.write("GARBAGEASDASDASD")
-            yield CompanionSet(logger=mock.MagicMock(), state_file_path=path)
 
     async def test_add_multiple(self) -> None:
         async for manager in self._managers():
