@@ -115,12 +115,14 @@ struct CompanionRegistryTests {
   }
 
   @Test
-  func treatsInvalidStateFileAsEmpty() throws {
+  func preservesInvalidStateFileAndReportsFailure() throws {
     try withTemporaryStateFile { statePath in
       try "this is not json".write(toFile: statePath, atomically: true, encoding: .utf8)
       let registry = CompanionRegistry(stateFilePath: statePath)
-      let companions = try registry.companions()
-      #expect(companions.isEmpty)
+      #expect(throws: (any Error).self) { try registry.companions() }
+      #expect(throws: (any Error).self) { try registry.clear() }
+      let preserved = try String(contentsOfFile: statePath, encoding: .utf8)
+      #expect(preserved == "this is not json")
     }
   }
 
