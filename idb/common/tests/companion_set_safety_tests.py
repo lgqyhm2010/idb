@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import os
+import stat
 import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, mock
@@ -10,6 +12,33 @@ from idb.common.types import CompanionInfo, IdbException, TCPAddress
 
 
 class CompanionSetSafetyTests(IsolatedAsyncioTestCase):
+    async def test_atomic_replace_preserves_existing_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state"
+            companion = CompanionInfo(udid="a", address=TCPAddress("localhost", 1), is_local=True, pid=None)
+            previous_umask = os.umask(0o077)
+            try:
+                for mode in (0o600, 0o640, 0o664, 0o666):
+                    with self.subTest(mode=oct(mode)):
+                        path.write_text("[]")
+                        path.chmod(mode)
+                        await CompanionSet(mock.Mock(), str(path)).add_companion(companion)
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            finally:
+                os.umask(previous_umask)
+
+    async def test_new_registry_permissions_respect_caller_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for mask, expected in ((0o000, 0o666), (0o022, 0o644), (0o077, 0o600)):
+                with self.subTest(umask=oct(mask)):
+                    path = Path(directory) / str(mask)
+                    previous_umask = os.umask(mask)
+                    try:
+                        await CompanionSet(mock.Mock(), str(path)).clear()
+                    finally:
+                        os.umask(previous_umask)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected)
+
     async def test_timeout_does_not_release_owner_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state")

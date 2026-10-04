@@ -9,8 +9,9 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
+import stat
 import time
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -96,14 +97,26 @@ class CompanionSet:
                 )
             else:
                 return
+            try:
+                existing_mode = stat.S_IMODE(path.stat().st_mode)
+            except FileNotFoundError:
+                existing_mode = None
             temporary_path = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", dir=path.parent, prefix=path.name + ".", delete=False
-                ) as f:
-                    temporary_path = f.name
+                candidate = path.with_name(path.name + "." + uuid.uuid4().hex)
+                # New registries keep normal open() permissions, including the
+                # caller's umask (the CLI explicitly uses umask 0). Replacements
+                # stay private while being written, then inherit the old mode.
+                fd = os.open(
+                    candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o666 if existing_mode is None else 0o600,
+                )
+                temporary_path = candidate
+                with os.fdopen(fd, "w") as f:
                     json.dump(json_data_companions(companion_info_out), f)
                     f.flush()
+                    if existing_mode is not None:
+                        os.fchmod(f.fileno(), existing_mode)
                     os.fsync(f.fileno())
                 os.replace(temporary_path, self.state_file_path)
             finally:
