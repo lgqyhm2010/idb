@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,6 +188,102 @@ class ProvisionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(lines, ["DEVICE_SET_PATH=/tmp/set", f"DEVICE_UDID={UDID}"])
+
+    def test_opt_in_isolates_created_target_before_boot_and_snapshots_after(
+        self,
+    ) -> None:
+        recorder = Recorder([runtime("26.0", device_types=["iPhone 17"])])
+        events = []
+
+        def run(argv):
+            events.append(list(argv))
+            return recorder(argv)
+
+        with (
+            mock.patch.object(
+                provision_simulator.simulator_isolation, "require_hosted_ci"
+            ),
+            mock.patch.object(provision_simulator.simulator_isolation, "save_target"),
+            mock.patch.object(
+                provision_simulator.simulator_isolation,
+                "isolate",
+                side_effect=lambda *args: events.append("isolate"),
+            ) as isolation,
+            mock.patch.object(
+                provision_simulator.simulator_isolation,
+                "safe_snapshot",
+                side_effect=lambda *args: events.append("snapshot"),
+            ),
+        ):
+            provision(
+                run,
+                name="e2e",
+                device_set=Path("/tmp/set"),
+                isolation_directory=Path("/tmp/evidence"),
+            )
+        isolation.assert_called_once_with(Path("/tmp/set"), UDID, Path("/tmp/evidence"))
+        self.assertEqual(events[2], "isolate")
+        self.assertEqual(events[3][-2:], ["boot", UDID])
+        self.assertEqual(events[4][-2:], ["bootstatus", UDID])
+        self.assertEqual(events[5], "snapshot")
+
+    def test_boot_failures_persist_target_and_capture_without_masking_error(
+        self,
+    ) -> None:
+        for command in ("boot", "bootstatus"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                recorder = Recorder([runtime("26.0", device_types=["iPhone 17"])])
+                failure = subprocess.CalledProcessError(1, command)
+
+                def run(argv):
+                    if command in argv:
+                        raise failure
+                    return recorder(argv)
+
+                with (
+                    mock.patch.object(
+                        provision_simulator.simulator_isolation, "require_hosted_ci"
+                    ),
+                    mock.patch.object(
+                        provision_simulator.simulator_isolation, "isolate"
+                    ),
+                    mock.patch.object(
+                        provision_simulator.simulator_isolation,
+                        "snapshot",
+                        side_effect=OSError("disk unavailable"),
+                    ) as snapshot,
+                ):
+                    with self.assertRaises(subprocess.CalledProcessError) as raised:
+                        provision(
+                            run,
+                            name="e2e",
+                            device_set=root / "set",
+                            isolation_directory=root / "evidence",
+                        )
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(snapshot.call_args.args[1], "boot-failed")
+                self.assertEqual(
+                    json.loads((root / "evidence/target.json").read_text()),
+                    {"udid": UDID, "device_set": str((root / "set").resolve())},
+                )
+
+    def test_opt_in_on_local_machine_fails_before_simctl(self) -> None:
+        recorder = Recorder([runtime("26.0", device_types=["iPhone 17"])])
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(
+                provision_simulator.simulator_isolation.IsolationError
+            ):
+                provision(
+                    recorder,
+                    name="e2e",
+                    device_set=Path("/tmp/set"),
+                    isolation_directory=Path("/tmp/evidence"),
+                )
+        self.assertEqual(recorder.commands, [])
 
     def test_creates_in_the_default_set_when_given_none(self) -> None:
         recorder = Recorder([runtime("26.0", device_types=["iPhone 17"])])

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from . import simulator_isolation
 from .provision_simulator import simctl_argv
 
 # Limit simulator log output to the most recent ten minutes.
@@ -144,17 +145,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--udid")
     parser.add_argument("--companion-root", type=Path, default=Path("/tmp"))
     parser.add_argument("--artifacts-dir", type=Path)
+    parser.add_argument("--hosted-ci-snapshot", action="store_true")
     arguments = parser.parse_args(argv)
 
     device_set = arguments.device_set or _optional_path(
         os.environ.get("DEVICE_SET_PATH")
     )
     udid = arguments.udid or os.environ.get("DEVICE_UDID")
+    if arguments.hosted_ci_snapshot and device_set is not None and not udid:
+        simulator_isolation.require_hosted_ci(device_set, os.environ)
+        udid = simulator_isolation.recover_target(
+            arguments.output / "isolation", device_set
+        )
     if device_set is None or not udid:
         print(
             "No simulator named by --device-set/--udid or DEVICE_SET_PATH/"
             "DEVICE_UDID; collecting host-side diagnostics only",
             file=sys.stderr,
+        )
+
+    if arguments.hosted_ci_snapshot and device_set is not None:
+        simulator_isolation.require_hosted_ci(device_set, os.environ)
+        simulator_isolation.safe_snapshot(
+            arguments.output / "isolation", "after-suite", device_set
+        )
+        simulator_isolation.crash_report_metadata(
+            arguments.output / "isolation",
+            home=Path.home(),
+            device_set=device_set,
+            target=udid,
         )
 
     plan = diagnostic_plan(

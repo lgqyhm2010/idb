@@ -942,6 +942,34 @@ def sample_top() -> bytes:
     return last_top_sample(completed.stdout)
 
 
+def sample_host_load() -> bytes:
+    output = sample_top()
+    if not (
+        os.environ.get("IDB_E2E_PROCESS_SNAPSHOTS") == "1"
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        and os.environ.get("RUNNER_OS") == "macOS"
+    ):
+        return output
+    # One inexpensive global process listing per existing sample, never argv
+    # or environments. No simulator inventory queries while tests are running.
+    try:
+        completed = subprocess.run(
+            ["ps", "-A", "-o", "pid,ppid,pcpu,pmem,rss,state,comm"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+        )
+        processes = (
+            completed.stdout
+            if completed.returncode == 0
+            else f"ps failed (rc={completed.returncode})\n".encode()
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        processes = f"ps capture failed: {type(error).__name__}\n".encode()
+    return output + b"\nGlobal processes (executable names only):\n" + processes
+
+
 class HostLoad:
     """Record the host's CPU, memory and busiest processes throughout the run.
 
@@ -953,7 +981,7 @@ class HostLoad:
     def __init__(
         self,
         path: Path,
-        sample: Callable[[], bytes] = sample_top,
+        sample: Callable[[], bytes] = sample_host_load,
         interval: float = HOST_LOAD_INTERVAL_SECONDS,
     ) -> None:
         _prepare_artifact_file(path)

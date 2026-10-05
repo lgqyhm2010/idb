@@ -341,9 +341,12 @@ jobs:
       - name: Turn off Spotlight indexing
         run: sudo mdutil -a -i off || true
       # Export DEVICE_UDID and DEVICE_SET_PATH for a dedicated simulator.
+      # On disposable hosted CI only, inventory both sets and shut down exact
+      # extra booted default-set devices. Evidence reports verified isolation
+      # or an explicit no-op; no waits or assertions in the tests are changed.
       - name: Provision a simulator
         if: matrix.shard != 'install'
-        run: python3 -m CI.provision_simulator --name end-to-end-provided --device-set "$RUNNER_TEMP/end-to-end-device-set.noindex" >> "$GITHUB_ENV"
+        run: python3 -m CI.provision_simulator --name end-to-end-provided --device-set "$RUNNER_TEMP/end-to-end-device-set.noindex" --isolate-hosted-ci --diagnostics-dir "$RUNNER_TEMP/end-to-end-diagnostics/isolation" >> "$GITHUB_ENV"
       # Fail if a required simulator host service is unavailable. Record H.264
       # rather than the default HEVC: this run's video is what the website
       # publishes, and it is the encoding every browser decodes.
@@ -356,6 +359,7 @@ jobs:
           IDB_E2E_ARTIFACTS_DIR="$RUNNER_TEMP/end-to-end-diagnostics" \
           IDB_E2E_RECORDER_ENCODING=h264 \
           IDB_E2E_STRICT=1 \
+          IDB_E2E_PROCESS_SNAPSHOTS=1 \
           python -m unittest -v --durations 0 $(python3 -m CI.end_to_end_shard ${{ matrix.shard }})
       # Only a run in which every documented demo passed produces this, so the
       # artifact's existence is what lets the site publish them. The recorder
@@ -372,7 +376,14 @@ jobs:
           path: ${{ runner.temp }}/documentation
       - name: Collect diagnostics
         if: always()
-        run: python3 -m CI.collect_diagnostics --artifacts-dir "$RUNNER_TEMP/end-to-end-diagnostics" --output "$RUNNER_TEMP/end-to-end-diagnostics"
+        env:
+          IDB_E2E_SHARD: ${{ matrix.shard }}
+        run: |
+          extra=()
+          if [[ "$IDB_E2E_SHARD" != install ]]; then
+            extra=(--hosted-ci-snapshot --device-set "$RUNNER_TEMP/end-to-end-device-set.noindex")
+          fi
+          python3 -m CI.collect_diagnostics "${extra[@]}" --artifacts-dir "$RUNNER_TEMP/end-to-end-diagnostics" --output "$RUNNER_TEMP/end-to-end-diagnostics"
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v5

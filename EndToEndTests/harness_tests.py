@@ -2889,6 +2889,70 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HostLoadTests(unittest.TestCase):
+    def test_process_snapshots_are_opt_in_and_hosted_ci_only(self) -> None:
+        environment = {
+            "IDB_E2E_PROCESS_SNAPSHOTS": "1",
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": "macOS",
+        }
+        for missing in environment:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        key: value
+                        for key, value in environment.items()
+                        if key != missing
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(harness, "sample_top", return_value=b"top\n"),
+                mock.patch.object(harness.subprocess, "run") as run,
+            ):
+                self.assertEqual(harness.sample_host_load(), b"top\n")
+                run.assert_not_called()
+
+    def test_process_snapshot_fields_and_failures(self) -> None:
+        environment = {
+            "IDB_E2E_PROCESS_SNAPSHOTS": "1",
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": "macOS",
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(harness, "sample_top", return_value=b"top\n"),
+            mock.patch.object(
+                harness.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=b"PID PPID COMM\n"
+                ),
+            ) as run,
+        ):
+            self.assertIn(b"PID PPID COMM", harness.sample_host_load())
+            run.assert_called_once_with(
+                ["ps", "-A", "-o", "pid,ppid,pcpu,pmem,rss,state,comm"],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
+            )
+            for error in (
+                OSError("private detail"),
+                subprocess.TimeoutExpired("ps", 5),
+            ):
+                run.side_effect = error
+                output = harness.sample_host_load()
+                self.assertIn(type(error).__name__.encode(), output)
+                self.assertNotIn(b"private detail", output)
+            run.side_effect = None
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout=b"", stderr=b"private detail"
+            )
+            self.assertIn(b"ps failed (rc=1)", harness.sample_host_load())
+            self.assertNotIn(b"private detail", harness.sample_host_load())
+
     def test_keeps_the_second_of_tops_two_samples(self) -> None:
         output = b"Processes: 1 total\nfirst\nProcesses: 2 total\nsecond\n"
 

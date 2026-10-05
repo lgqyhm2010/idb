@@ -298,6 +298,74 @@ class CollectTests(unittest.TestCase):
             [["xcrun", "simctl", "--set", str(device_set)]] * 2,
         )
 
+    def test_hosted_snapshot_is_opt_in_and_uses_selected_device_set(self) -> None:
+        with (
+            mock.patch.object(
+                collect_diagnostics.simulator_isolation, "require_hosted_ci"
+            ) as guard,
+            mock.patch.object(
+                collect_diagnostics.simulator_isolation, "snapshot"
+            ) as snapshot,
+        ):
+            status, _ = self.run_command_line(
+                {"DEVICE_SET_PATH": str(self.root / "devices"), "DEVICE_UDID": UDID},
+                "--hosted-ci-snapshot",
+            )
+        self.assertEqual(status, 0)
+        guard.assert_called_once()
+        snapshot.assert_called_once_with(
+            self.output / "isolation",
+            "after-suite",
+            self.root / "devices",
+            collect_diagnostics.simulator_isolation.run_command,
+        )
+
+    def test_failed_provisioning_recovers_target_from_exact_selected_set(self) -> None:
+        device_set = self.root / "devices"
+        collect_diagnostics.simulator_isolation.save_target(
+            self.output / "isolation", device_set, UDID
+        )
+        with (
+            mock.patch.object(
+                collect_diagnostics.simulator_isolation, "require_hosted_ci"
+            ),
+            mock.patch.object(collect_diagnostics.simulator_isolation, "snapshot"),
+            mock.patch.object(
+                collect_diagnostics.simulator_isolation, "crash_report_metadata"
+            ) as metadata,
+        ):
+            status, _ = self.run_command_line(
+                {}, "--hosted-ci-snapshot", "--device-set", str(device_set)
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(metadata.call_args.kwargs["target"], UDID)
+        self.assertIn(
+            [
+                "xcrun",
+                "simctl",
+                "--set",
+                str(device_set),
+                "spawn",
+                UDID,
+                "log",
+                "show",
+                "--last",
+                SIMULATOR_LOG_WINDOW,
+                "--style",
+                "compact",
+            ],
+            self.run.commands,
+        )
+
+    def test_no_new_global_snapshot_without_opt_in(self) -> None:
+        with mock.patch.object(
+            collect_diagnostics.simulator_isolation, "snapshot"
+        ) as snapshot:
+            self.run_command_line(
+                {"DEVICE_SET_PATH": str(self.root / "devices"), "DEVICE_UDID": UDID}
+            )
+        snapshot.assert_not_called()
+
     def test_an_empty_device_set_path_names_no_simulator(self) -> None:
         # `Path("")` is the working directory, so an exported-but-unset
         # variable has to read as absent rather than as a device set here.
