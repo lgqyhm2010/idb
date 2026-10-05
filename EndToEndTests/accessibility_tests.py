@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+from . import test_accessibility as accessibility_module
 from .harness import _describe_matches, _elements, NotReady
 from .test_accessibility import (
     _row_positions,
@@ -416,4 +418,78 @@ class RowTests(unittest.TestCase):
         self.assertEqual(
             _rows_on_screen(fixture_list()),
             [ACCOUNT_ROW_ID, GENERAL_ROW_ID, ACCESSIBILITY_ROW_ID],
+        )
+
+
+class SafariAddressBarTests(unittest.IsolatedAsyncioTestCase):
+    async def assert_read(
+        self, elements: list[dict[str, Any]], *, should_fail: bool = False
+    ) -> None:
+        case = accessibility_module.SafariTestCase()
+        with patch.object(
+            case,
+            "idb_json",
+            new_callable=AsyncMock,
+            return_value={"elements": elements},
+        ) as read:
+            if should_fail:
+                with self.assertRaises(AssertionError):
+                    await case.assert_address_bar_value("https://example.com/second")
+            else:
+                await case.assert_address_bar_value("https://example.com/second")
+            read.assert_awaited_once_with(
+                "ui",
+                "describe-all",
+                "--match",
+                "URL",
+                "--match-key",
+                "AXUniqueId",
+                "--api",
+                "axbridge",
+                "--format",
+                "complete",
+                step="Read the address bar's value back",
+            )
+
+    async def test_suggestion_before_exact_url_field_does_not_hide_it(self) -> None:
+        await self.assert_read(
+            [
+                element(
+                    identifier="SearchSuggestion?destination=URL", type="Cell", value=""
+                ),
+                element(
+                    identifier="URL",
+                    type="TextField",
+                    value="https://example.com/second",
+                ),
+            ]
+        )
+
+    async def test_suggestion_without_exact_url_field_still_fails(self) -> None:
+        await self.assert_read(
+            [
+                element(
+                    identifier="SearchSuggestion?destination=URL",
+                    type="Cell",
+                    value="https://example.com/second",
+                ),
+            ],
+            should_fail=True,
+        )
+
+    async def test_wrong_exact_url_field_value_still_fails(self) -> None:
+        await self.assert_read(
+            [
+                element(
+                    identifier="SearchSuggestion?destination=URL",
+                    type="Cell",
+                    value="https://example.com/second",
+                ),
+                element(
+                    identifier="URL",
+                    type="TextField",
+                    value="https://example.com/first",
+                ),
+            ],
+            should_fail=True,
         )

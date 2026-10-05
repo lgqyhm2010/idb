@@ -59,7 +59,6 @@ from .test_accessibility import (
     RETURN_KEY_CODE,
     SAFARI_ADDRESS_BAR_ID,
     SAFARI_BUNDLE_ID,
-    SAFARI_URL_FIELD_ID,
     SafariTestCase,
     SECOND_PAGE_LABEL,
     SECOND_PAGE_PATH,
@@ -658,24 +657,7 @@ class WebContentDemos(SafariTestCase):
             "--timeout",
             str(UI_UPDATE_TIMEOUT_SECONDS),
         )
-        typed = await self.idb_json(
-            "ui",
-            "describe",
-            SAFARI_URL_FIELD_ID,
-            "--match-key",
-            "AXUniqueId",
-            "--api",
-            "axbridge",
-            "--format",
-            "complete",
-            step="Read the address bar's value back",
-        )
-        fields = [
-            element
-            for element in _elements(typed["elements"])
-            if element.get("identifier") == SAFARI_URL_FIELD_ID
-        ]
-        self.assertEqual([field.get("value") for field in fields], [second_page])
+        await self.assert_address_bar_value(second_page)
         self.note(
             f"The address bar reads {second_page!r}, exactly what was typed.",
             second_page,

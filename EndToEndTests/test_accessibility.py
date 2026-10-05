@@ -699,6 +699,30 @@ class SafariTestCase(IdbEndToEndTestCase):
         )
         return arrived.returncode == 0
 
+    async def assert_address_bar_value(self, expected: str) -> None:
+        # A marker read returns only the first substring match. Safari can put
+        # SearchSuggestion?destination=URL before the actual URL field, so keep
+        # every candidate until the exact identifier is checked below.
+        typed = await self.idb_json(
+            "ui",
+            "describe-all",
+            "--match",
+            SAFARI_URL_FIELD_ID,
+            "--match-key",
+            "AXUniqueId",
+            "--api",
+            "axbridge",
+            "--format",
+            "complete",
+            step="Read the address bar's value back",
+        )
+        fields = [
+            element
+            for element in _elements(typed["elements"])
+            if element.get("identifier") == SAFARI_URL_FIELD_ID
+        ]
+        self.assertEqual([field.get("value") for field in fields], [expected])
+
     async def wait_for_web_label(self, label: str) -> None:
         await self.setup_idb(
             "ui",
