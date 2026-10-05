@@ -84,6 +84,41 @@ enum AccessibilityInfoRequestTranslation {
     guard request.marker.isEmpty || request.match.isEmpty else {
       throw RPCError(code: .invalidArgument, message: "set either marker or match, not both")
     }
+    // A point and a marker each name something inside whatever is frontmost; letting a bundle id
+    // quietly win or lose against them would describe an app the caller did not name.
+    guard request.bundleID.isEmpty || (!request.hasPoint && request.marker.isEmpty) else {
+      throw RPCError(code: .invalidArgument, message: "bundle_id cannot be combined with point or marker")
+    }
+    // A display says where a point is; without a point there is nothing on it to hit-test, and silently
+    // reading the frontmost app instead would answer a question the caller did not ask.
+    guard !request.hasDisplay || request.hasPoint else {
+      throw RPCError(code: .invalidArgument, message: "display applies to a point read only")
+    }
+    // A marker selects its element wherever it is, so a display beside one would be silently ignored.
+    guard !request.hasDisplay || request.marker.isEmpty else {
+      throw RPCError(code: .invalidArgument, message: "display cannot be combined with marker")
+    }
+  }
+
+  /// The application a request names, or nil to describe the frontmost one.
+  static func bundleID(from request: Idb_AccessibilityInfoRequest) -> String? {
+    request.bundleID.isEmpty ? nil : request.bundleID
+  }
+
+  /// The backend for a read of a named application. Although CoreSimulator exposes a pid query,
+  /// runtimes have answered it with no translation object. Keep bundle-id reads on the bridge rather
+  /// than returning an error about a point the caller never supplied.
+  static func applicationBackend(from wire: Idb_AccessibilityInfoRequest.Backend) throws -> UIAutomationBackend {
+    switch wire {
+    case .unspecified, .UNRECOGNIZED:
+      return backend(from: .axbridge)
+    case .ax:
+      throw RPCError(
+        code: .invalidArgument,
+        message: "the ax backend cannot read an application by bundle id; use axbridge or leave the backend unset")
+    case .axbridge, .axbridgePersistent:
+      return backend(from: wire)
+    }
   }
 
   /// `UNSPECIFIED` and an unrecognized value both fall back to the CoreSimulator backend.

@@ -198,6 +198,77 @@ struct AccessibilityInfoRequestTranslationTests {
     try AccessibilityInfoRequestTranslation.validate(.init())
   }
 
+  @Test
+  func bundleTargetsRejectMarkersButAllowListNarrowing() throws {
+    var request = Idb_AccessibilityInfoRequest()
+    request.bundleID = "com.example.app"
+    request.marker = "OK"
+    do {
+      try AccessibilityInfoRequestTranslation.validate(request)
+      Issue.record("expected an invalidArgument RPCError")
+    } catch let error as RPCError {
+      #expect(error.code == .invalidArgument)
+    }
+    request.marker = ""
+    request.match = "OK"
+    try AccessibilityInfoRequestTranslation.validate(request)
+    #expect(AccessibilityInfoRequestTranslation.bundleID(from: request) == "com.example.app")
+  }
+
+  @Test
+  func applicationBackendUsesBridgeForUnsetAndUnknownValues() throws {
+    let expected = AccessibilityInfoRequestTranslation.backend(from: .axbridge)
+    #expect(try AccessibilityInfoRequestTranslation.applicationBackend(from: .unspecified) == expected)
+    #expect(try AccessibilityInfoRequestTranslation.applicationBackend(from: .UNRECOGNIZED(42)) == expected)
+    #expect(try AccessibilityInfoRequestTranslation.applicationBackend(from: .axbridgePersistent) == expected)
+  }
+
+  @Test
+  func aDisplayWithoutAPointIsRejected() {
+    var request = Idb_AccessibilityInfoRequest()
+    request.display = .with { $0.uniqueID = "inner" }
+    do {
+      try AccessibilityInfoRequestTranslation.validate(request)
+      Issue.record("expected an invalidArgument RPCError")
+    } catch let status as RPCError {
+      #expect(status.code == .invalidArgument, "a display says where a point is, so without one there is nothing to hit-test")
+    } catch {
+      Issue.record("expected RPCError, got \(error)")
+    }
+  }
+
+  @Test
+  func aDisplayBesideAMarkerIsRejected() {
+    var request = Idb_AccessibilityInfoRequest()
+    request.marker = "OK"
+    request.point = .with {
+      $0.x = 12
+      $0.y = 34
+    }
+    request.display = .with { $0.uniqueID = "inner" }
+    do {
+      try AccessibilityInfoRequestTranslation.validate(request)
+      Issue.record("expected an invalidArgument RPCError")
+    } catch let status as RPCError {
+      #expect(status.code == .invalidArgument, "a marker finds its element wherever it is, so the display would be silently ignored")
+    } catch {
+      Issue.record("expected RPCError, got \(error)")
+    }
+  }
+
+  @Test
+  func aDisplayBesideAPointIsAccepted() throws {
+    var request = Idb_AccessibilityInfoRequest()
+    request.point = .with {
+      $0.x = 12
+      $0.y = 34
+    }
+    request.display = .with { $0.uniqueID = "inner" }
+    try AccessibilityInfoRequestTranslation.validate(request)
+    request.display = .with { $0.uniqueID = "" }
+    try AccessibilityInfoRequestTranslation.validate(request)
+  }
+
   // MARK: - Point
 
   @Test

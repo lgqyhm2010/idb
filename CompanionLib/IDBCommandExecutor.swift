@@ -272,6 +272,20 @@ public final class IDBCommandExecutor {
     return try await simulator.uiAutomation(backend: backend).describe(query, options: options)
   }
 
+  /// Resolves the application explicitly, never substituting the frontmost app on failure.
+  public func accessibility_info_for_application(bundleID: String, options: AccessibilityRequestOptions, backend: UIAutomationBackend) async throws -> AccessibilityElementsResponse {
+    let simulator = try simulatorTarget()
+    let pid = try await target.application.processID(forBundleID: bundleID)
+    return try await simulator.uiAutomation(backend: backend).describe(.application(pid: pid), options: options)
+  }
+
+  /// An explicit display query uses the current framework's UUID-to-accessibility identity mapping.
+  public func accessibility_info_at_point(_ point: CGPoint, onDisplay displayUniqueID: String?, options: AccessibilityRequestOptions, backend: UIAutomationBackend) async throws -> AccessibilityElementsResponse {
+    let simulator = try simulatorTarget()
+    let query = try await simulator.displays.accessibilityPointQuery(at: point, displayUniqueID: displayUniqueID)
+    return try await simulator.uiAutomation(backend: backend).describe(query, options: options)
+  }
+
   // MARK: - REPL screenshot & recording
 
   /// The companion-host directory the target uses for per-target files. REPL
@@ -555,6 +569,28 @@ public final class IDBCommandExecutor {
   public func hid<S: AsyncSequence>(events: S) async throws where S.Element == SimulatorHIDEvent {
     let hid = try await connectToHID()
     try await hid.send(events: events, logger: logger)
+  }
+
+  public func hid<S: AsyncSequence>(stream: S) async throws where S.Element == SimulatorHIDStreamEvent {
+    let hid = try await connectToHID()
+    try await hid.send(stream: stream, logger: logger)
+  }
+
+  /// Read display geometry from the current upstream configuration snapshot.
+  public func list_displays() async throws -> (displays: [SimulatorDisplay], touchscreenDisplayIDs: Set<String>) {
+    let commands = try simulatorTarget().displays
+    let configuration = try await commands.configuration()
+    guard configuration.phase == .settled else { throw SimulatorDisplayError.transitioning }
+    guard !configuration.displays.isEmpty else {
+      throw SimulatorDisplayInteractionError.unsupportedCapability("display inventory")
+    }
+    let touchscreens: [SimulatorTouchscreen]
+    do {
+      touchscreens = try await commands.touchscreens()
+    } catch where unsupportedSimulatorCapability(in: error) != nil {
+      touchscreens = []
+    }
+    return (configuration.displays, Set(touchscreens.map(\.displayUniqueID)))
   }
 
   public func set_hardware_keyboard_enabled(_ enabled: Bool) async throws {

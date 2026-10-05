@@ -81,20 +81,22 @@ final class SimulatorDisplayInteractionTests: XCTestCase {
   }
 
   func testHIDGeometryRotatesPointsAndEdgesTogether() throws {
-    let cases: [(SimulatorDisplayRotation, CGPoint, SimulatorHIDEdge)] = [
-      (.upright, CGPoint(x: 0.2, y: 0.3), .top),
-      (.clockwise, CGPoint(x: 0.3, y: 0.8), .left),
-      (.upsideDown, CGPoint(x: 0.8, y: 0.7), .bottom),
-      (.counterclockwise, CGPoint(x: 0.7, y: 0.2), .right),
+    let cases: [(SimulatorDisplayRotation, CGPoint, [SimulatorHIDEdge])] = [
+      (.upright, CGPoint(x: 0.2, y: 0.3), [.top, .right, .bottom, .left]),
+      (.clockwise, CGPoint(x: 0.3, y: 0.8), [.left, .top, .right, .bottom]),
+      (.upsideDown, CGPoint(x: 0.8, y: 0.7), [.bottom, .left, .top, .right]),
+      (.counterclockwise, CGPoint(x: 0.7, y: 0.2), [.right, .bottom, .left, .top]),
     ]
-    for (rotation, expected, edge) in cases {
+    for (rotation, expected, expectedEdges) in cases {
       let selected = display(rotation: rotation, scale: 3)
       for binding in [SimulatorHIDDisplay.selected(selected, target: 82), .sole(.legacy(selected.geometry))] {
         let size = binding.geometry.pointSize
         let point = try binding.normalizedPoint(CGPoint(x: size.width * 0.2, y: size.height * 0.3))
         XCTAssertEqual(point.x, expected.x, accuracy: 0.000001)
         XCTAssertEqual(point.y, expected.y, accuracy: 0.000001)
-        XCTAssertEqual(binding.unrotatedEdge(.top), edge)
+        for (edge, expectedEdge) in zip([SimulatorHIDEdge.top, .right, .bottom, .left], expectedEdges) {
+          XCTAssertEqual(binding.unrotatedEdge(edge), expectedEdge)
+        }
         XCTAssertEqual(binding.unrotatedEdge(.none), .none)
         XCTAssertThrowsError(try binding.normalizedPoint(CGPoint(x: size.width + 1, y: 0)))
       }

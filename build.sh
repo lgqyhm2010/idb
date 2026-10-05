@@ -499,18 +499,18 @@ function generate_companion_project() {
   # declares have to agree with Package.swift. Every build and test path reaches
   # here via regenerate_projects; the codegen path checks separately, because it
   # can run without generating a project.
-  check_package_pins
+  check_package_pins || return
 
   echo "Generating idb_companion project..."
-  generate_xcodeproj "Companion" "idb_companion"
+  generate_xcodeproj "Companion" "idb_companion" || return
 
   # xcodegen ignores `embed: false` for a tool target dependency, so strip the
   # leftover entry here.
   sed -i '' '/IDBGRPCSwift.framework in Embed Frameworks/d' \
-    Companion/idb_companion.xcodeproj/project.pbxproj
+    Companion/idb_companion.xcodeproj/project.pbxproj || return
 
   local resolved_dir="Companion/idb_companion.xcodeproj/project.xcworkspace/xcshareddata/swiftpm"
-  mkdir -p "$resolved_dir"
+  mkdir -p "$resolved_dir" || return
   cp Package.resolved "$resolved_dir/Package.resolved"
 }
 
@@ -792,7 +792,7 @@ function build_companion_archives() {
     name="${product%.framework}"
     name="${name#lib}"
     name="${name%.a}"
-    build_target "$name" Release
+    build_target "$name" Release || return
   done < <(sed -n 's|^ *- framework: \.\./Build/Products/Release/||p' Companion/project-deps.yml | sort -u)
 }
 
@@ -1021,11 +1021,35 @@ function test_target() {
     test
 }
 
+# The focused handler/value-transformer suite lives beside CompanionLib, not in
+# the generated framework project. Codegen must precede project source globs.
+function test_companion_routing() {
+  check_protobuf || return
+  build_idb_deps || return
+  generate_proto || return
+  generate_companion_project || return
+  build_companion_archives || return
+  invoke_xcodebuild \
+    SWIFT_ENABLE_EXPLICIT_MODULES=NO \
+    ENABLE_TESTABILITY=YES \
+    -project Companion/idb_companion.xcodeproj \
+    -scheme CompanionRoutingTests \
+    -sdk macosx \
+    -destination 'platform=macOS' \
+    -derivedDataPath "$BUILD_DIRECTORY" \
+    -configuration Release \
+    -test-timeouts-enabled YES \
+    -default-test-execution-time-allowance 60 \
+    -maximum-test-execution-time-allowance 600 \
+    test
+}
+
 function test_all() {
   test_target FBControlCore
   test_target XCTestBootstrap
   test_target FBSimulatorControl
   test_target FBDeviceControl
+  test_companion_routing
 }
 
 function run_tests() {
@@ -1038,6 +1062,8 @@ function run_tests() {
     case $target in
       all)
         test_all;;
+      CompanionRoutingTests)
+        test_companion_routing;;
       FBControlCore|XCTestBootstrap|FBSimulatorControl|FBDeviceControl)
         test_target "$target";;
       FBSimulatorControlUnitTests|FBSimulatorControlBootTests|FBSimulatorControlSmokeTests)
@@ -1046,7 +1072,7 @@ function run_tests() {
         echo "Unknown test target: $target"
         echo "Valid targets: all, FBControlCore, XCTestBootstrap, FBSimulatorControl,"
         echo "  FBSimulatorControlUnitTests, FBSimulatorControlBootTests,"
-        echo "  FBSimulatorControlSmokeTests, FBDeviceControl"
+        echo "  FBSimulatorControlSmokeTests, FBDeviceControl, CompanionRoutingTests"
         exit 1;;
     esac
   fi
@@ -1111,6 +1137,7 @@ Commands:
       FBSimulatorControlSmokeTests  Test the Smoke suite: takes a booted one
                                     from the environment
       FBDeviceControl Test FBDeviceControl
+      CompanionRoutingTests Test companion display/HID/accessibility RPC routing
 
 Examples:
   ./build.sh generate                 # Regenerate Xcode projects
@@ -1123,6 +1150,7 @@ Examples:
   ./build.sh test                     # Run all tests
   ./build.sh test FBSimulatorControl  # Test specific framework
   ./build.sh test FBSimulatorControlSmokeTests  # Test one suite of it
+  ./build.sh test CompanionRoutingTests       # Test companion RPC routing
 
 Prerequisites:
   - Xcode 26.0+

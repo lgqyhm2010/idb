@@ -60,6 +60,7 @@ from idb.cli.commands.debugserver import (
     DebugServerStatusCommand,
     DebugServerStopCommand,
 )
+from idb.cli.commands.displays import ListDisplaysCommand
 from idb.cli.commands.dsym import DsymInstallCommand
 from idb.cli.commands.dylib import DylibInstallCommand
 from idb.cli.commands.file import (
@@ -78,6 +79,7 @@ from idb.cli.commands.framework import FrameworkInstallCommand
 from idb.cli.commands.help import HelpCommand
 from idb.cli.commands.hid import (
     ButtonCommand,
+    DragCommand,
     KeyCommand,
     KeySequenceCommand,
     MultiTapCommand,
@@ -309,6 +311,7 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
         ScreenshotCommand(),
         RotationCommand(),
         HingeCommand(),
+        ListDisplaysCommand(),
         CommandGroup(
             name="ui",
             description="UI interactions on target",
@@ -330,6 +333,7 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
                 KeyCommand(),
                 KeySequenceCommand(),
                 SwipeCommand(),
+                DragCommand(),
                 RotateCommand(),
                 ShakeCommand(),
             ],

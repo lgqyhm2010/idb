@@ -81,10 +81,16 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
   }
 
   /// Nil when reads fall back to the main display, which accessibility reaches without naming it.
-  private func readDisplay() async throws -> AXTranslationDisplay? {
+  private func readDisplay(uniqueID: String? = nil) async throws -> AXTranslationDisplay? {
     guard let simulator else { throw WeakTargetError.simulator }
     let displays = displays ?? simulator.displays
-    switch try await displays.resolveDisplay() {
+    let resolution: SimulatorDisplayResolution
+    if let uniqueID {
+      resolution = try await displays.resolveDisplay(uniqueID: uniqueID)
+    } else {
+      resolution = try await displays.resolveDisplay()
+    }
+    switch resolution {
     case .transitioning:
       throw SimulatorDisplayError.transitioning
     case .fallback:
@@ -92,7 +98,9 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
     case let .target(.sole(display)):
       return .sole(display)
     case let .target(.selected(display)):
-      let accessibilityID = try await displays.accessibilityID(for: display, transport: simulator.frameworkBridgeTransport(scope: .exclusive))
+      let accessibilityID = try await displays.accessibilityID(
+        for: display, transport: simulator.frameworkBridgeTransport(scope: .exclusive),
+        validatesActiveDisplay: uniqueID == nil)
       return .selected(display, accessibilityID: accessibilityID)
     }
   }
@@ -101,9 +109,11 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
 
   func resolveElement(for query: AccessibilityElementQuery) async throws -> AccessibilityElement {
     try validateAccessibility()
-    let display = try await readDisplay()
+    let uniqueID: String?
+    if case let .pointOnDisplay(_, id) = query { uniqueID = id } else { uniqueID = nil }
+    let display = try await readDisplay(uniqueID: uniqueID)
     switch query {
-    case let .point(point):
+    case let .point(point), let .pointOnDisplay(point, _):
       let request = AXTranslationRequest(kind: .point(point), display: display)
       return try await accessibilityElement(request: request, remediationPermitted: false)
     case .frontmost:

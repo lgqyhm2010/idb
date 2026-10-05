@@ -20,6 +20,8 @@ from idb.common.types import (
     ACCESSIBILITY_FILTER_BY_NAME,
     ACCESSIBILITY_FORMAT_BY_NAME,
     ACCESSIBILITY_KEY_BY_NAME,
+    ACTIVE_DISPLAY,
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -312,6 +314,17 @@ class AccessibilityInfoAllCommand(ClientCommand):
             action="store_true",
             default=False,
         )
+        parser.add_argument(
+            "--bundle-id",
+            help=(
+                "Describe this running app's whole tree instead of the frontmost "
+                "app's. With two apps on screen (iPad windows, a split foldable) "
+                "the frontmost read describes only one of them. An older "
+                "companion ignores it and describes the frontmost app; check "
+                "the root element's pid"
+            ),
+            default=None,
+        )
         _add_match_args(parser)
         _add_filter_arg(parser)
         _add_enricher_args(parser)
@@ -321,7 +334,11 @@ class AccessibilityInfoAllCommand(ClientCommand):
     async def run_with_client(self, args: Namespace, client: Client) -> None:
         requested_format = _format(args)
         info = await client.accessibility_info(
-            target=None,
+            target=(
+                AccessibilityApplication(bundle_id=args.bundle_id)
+                if args.bundle_id
+                else None
+            ),
             options=AccessibilityInfoOptions(
                 nested=args.nested,
                 keys=args.keys,
@@ -358,6 +375,18 @@ class AccessibilityInfoAtPointCommand(ClientCommand):
         )
         parser.add_argument("x", help="The x-coordinate", type=int)
         parser.add_argument("y", help="The y-coordinate", type=int)
+        parser.add_argument(
+            "--display",
+            help="Hit-test the point on this display: the "
+            "unique id of any lit display from `idb list-displays`, or "
+            f"'{ACTIVE_DISPLAY}' for the lit integrated display. The point is in "
+            "that display's interface orientation, as `idb ui tap --display` "
+            "takes it. Without it the companion selects the active display. "
+            "A device's only integrated display reads as its default "
+            "screen; any other display needs the ax backend (--api axbridge is "
+            "refused). An older companion may ignore this option and use its "
+            "default display instead.",
+        )
         _add_enricher_args(parser)
         _add_backend_arg(parser)
         _add_format_arg(parser)
@@ -373,6 +402,7 @@ class AccessibilityInfoAtPointCommand(ClientCommand):
                 format=requested_format,
                 profile=args.profile,
                 collect_frame_coverage=args.collect_frame_coverage,
+                display=args.display,
             ),
         )
         _warn_if_complete_downgraded(requested_format, info.json)

@@ -61,6 +61,8 @@ extension AXBridgeTreeReader {
       }
     case .frontmost, .application:
       throw UIAutomationError.pointOrMarkerRequired(backend: backend, operation: operation)
+    case .pointOnDisplay:
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "\(operation) on another display")
     }
   }
 

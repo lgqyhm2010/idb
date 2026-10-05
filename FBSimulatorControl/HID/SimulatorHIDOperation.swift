@@ -120,10 +120,10 @@ protocol SimulatorHIDOperationSink: Sendable {
 /// Operation-local state; no caller can send another event through this binding concurrently.
 struct SimulatorHIDOperation {
   let displays: (any DisplayCommands)?
-  let binding: SimulatorHIDDisplayBinding
+  private(set) var binding: SimulatorHIDDisplayBinding
   let sink: any SimulatorHIDOperationSink
 
-  private let observation: SimulatorHIDDisplayObservation
+  private var observation: SimulatorHIDDisplayObservation
   private var observationTask: Task<Void, Never>?
   private var resolvedDisplay = false
   private var display: SimulatorHIDDisplay?
@@ -142,6 +142,26 @@ struct SimulatorHIDOperation {
     self.displays = displays
     self.binding = binding
     self.sink = sink
+  }
+
+  /// Starts a fresh display binding between gestures without releasing the stream's operation lease.
+  /// Contacts are always released on their original display, including when a bad selection aborts a stream.
+  mutating func select(_ binding: SimulatorHIDDisplayBinding) async throws {
+    guard singleRelease == nil, twoFingerRelease == nil else {
+      throw SimulatorHIDStreamError.displaySelectionDuringTouch
+    }
+    try Task.checkCancellation()
+    await stopObserving()
+    if needsFlush {
+      try await sink.flush()
+      needsFlush = false
+    }
+    self.binding = binding
+    observation = SimulatorHIDDisplayObservation()
+    observationTask = nil
+    resolvedDisplay = false
+    display = nil
+    generation = nil
   }
 
   /// One delivery per primitive in `event`, in order; composites contribute their children's.
@@ -218,7 +238,7 @@ struct SimulatorHIDOperation {
         case let .sole(.identified(identified)): pinnedDisplay = identified
         case .sole(.legacy), nil: pinnedDisplay = nil
         }
-        guard pinnedDisplay?.uniqueID == uniqueID else {
+        guard pinnedDisplay?.uniqueID == uniqueID, pinnedDisplay?.isActive == true else {
           throw SimulatorDisplayInteractionError.inactiveDisplay(uniqueID)
         }
       case let .configuration(configuration):

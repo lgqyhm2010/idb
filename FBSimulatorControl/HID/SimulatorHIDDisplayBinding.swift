@@ -18,3 +18,17 @@ public enum SimulatorHIDDisplayBinding: Equatable, Sendable {
   /// cannot reach a display that has since changed.
   case configuration(SimulatorDisplayConfiguration)
 }
+
+/// An input stream may change its display only between complete gestures.
+public enum SimulatorHIDStreamEvent: Sendable {
+  case input(SimulatorHIDEvent)
+  case display(SimulatorHIDDisplayBinding)
+}
+
+public enum SimulatorHIDStreamError: Error, LocalizedError {
+  case displaySelectionDuringTouch
+
+  public var errorDescription: String? {
+    "A display cannot be selected while a touch is down: lift it first, so it ends where it started"
+  }
+}

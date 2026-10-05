@@ -24,6 +24,7 @@ from idb.cli.main import gen_main as cli_main, get_default_companion_path
 from idb.common import plugin
 from idb.common.command import Command, CommandGroup
 from idb.common.types import (
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -40,11 +41,13 @@ from idb.common.types import (
     CrashLogQuery,
     DeliveredNotification,
     DeviceOrientation,
+    DisplayInfo,
     DomainSocketAddress,
     FileContainerType,
     HIDButtonType,
     HIDDelay,
     HIDDirection,
+    HIDEdgeType,
     HIDOrientationType,
     IdbException,
     InstalledArtifact,
@@ -2275,6 +2278,88 @@ class TestParser(TestCase):
                 self.assertEqual(exit_code, 2)
         self.client_mock.set_hinge_angle.assert_not_called()
 
+    async def test_list_displays(self) -> None:
+        self.client_mock.list_displays = AsyncMock(
+            return_value=[
+                DisplayInfo(
+                    unique_id="inner",
+                    name="Inner",
+                    active=True,
+                    primary=False,
+                    integrated=True,
+                    width=2007,
+                    height=2853,
+                    scale=3,
+                    rotation="rot0",
+                    touchscreen=True,
+                )
+            ]
+        )
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(await cli_main(cmd_input=["list-displays", "--json"]), 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            [
+                {
+                    "unique_id": "inner",
+                    "name": "Inner",
+                    "active": True,
+                    "primary": False,
+                    "integrated": True,
+                    "width": 2007,
+                    "height": 2853,
+                    "scale": 3,
+                    "rotation": "rot0",
+                    "touchscreen": True,
+                }
+            ],
+        )
+        self.client_mock.list_displays.assert_called_once_with()
+
+    async def test_touches_route_to_the_chosen_display(self) -> None:
+        for method, cmd_input, expected in [
+            ("tap", ["ui", "tap", "10", "20"], {"x": 10, "y": 20, "duration": None}),
+            (
+                "swipe",
+                ["ui", "swipe", "1", "2", "3", "4"],
+                {"p_start": (1, 2), "p_end": (3, 4), "duration": None, "delta": None},
+            ),
+            (
+                "multi_tap",
+                ["ui", "multi-tap", "10", "20"],
+                {"x": 10, "y": 20, "count": 2, "duration": None, "pause": 0.1},
+            ),
+            (
+                "pinch",
+                ["ui", "pinch", "200", "400", "2.0"],
+                {
+                    "center_x": 200.0,
+                    "center_y": 400.0,
+                    "scale": 2.0,
+                    "duration": 0.5,
+                    "radius": 100.0,
+                },
+            ),
+        ]:
+            for display in ["inner", "active"]:
+                with self.subTest(method=method, display=display):
+                    mock = AsyncMock(return_value=[])
+                    setattr(self.client_mock, method, mock)
+                    await cli_main(cmd_input=[*cmd_input, "--display", display])
+                    mock.assert_called_once_with(**expected, display=display)
+
+    async def test_display_is_refused_for_accessibility_taps(self) -> None:
+        self.client_mock.tap = AsyncMock()
+        self.client_mock.accessibility_tap = AsyncMock()
+        for cmd_input in [
+            ["ui", "tap", "Play", "--display", "inner"],
+            ["ui", "tap", "10", "20", "--api", "ax", "--display", "inner"],
+        ]:
+            with self.subTest(cmd_input=cmd_input):
+                self.assertNotEqual(await cli_main(cmd_input=cmd_input), 0)
+        self.client_mock.tap.assert_not_called()
+        self.client_mock.accessibility_tap.assert_not_called()
+
     async def test_shake(self) -> None:
         self.client_mock.shake = AsyncMock(return_value=[])
         await cli_main(cmd_input=["ui", "shake"])
@@ -2427,6 +2512,55 @@ class TestParser(TestCase):
         self.client_mock.swipe.assert_called_once_with(
             p_start=(1, 2), p_end=(3, 4), duration=None, delta=None
         )
+
+    async def test_swipe_from_an_edge(self) -> None:
+        self.client_mock.swipe = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=["ui", "swipe", "1", "2", "3", "4", "--edge", "bottom"]
+        )
+        self.client_mock.swipe.assert_called_once_with(
+            p_start=(1, 2),
+            p_end=(3, 4),
+            duration=None,
+            delta=None,
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_passes_its_path_display_and_edge(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=[
+                "ui",
+                "drag",
+                "236",
+                "668",
+                "236",
+                "600",
+                "700",
+                "330",
+                "--duration",
+                "2",
+                "--display",
+                "active",
+                "--edge",
+                "bottom",
+            ]
+        )
+        self.client_mock.drag.assert_called_once_with(
+            points=[(236.0, 668.0), (236.0, 600.0), (700.0, 330.0)],
+            duration=2.0,
+            delta=None,
+            display="active",
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_needs_whole_pairs_of_at_least_two_points(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        for coordinates in [["1", "2"], ["1", "2", "3"]]:
+            with self.subTest(coordinates=coordinates):
+                exit_code = await cli_main(cmd_input=["ui", "drag", *coordinates])
+                self.assertEqual(exit_code, 1)
+        self.client_mock.drag.assert_not_called()
 
     async def test_contacts_update(self) -> None:
         self.client_mock.contacts_update = AsyncMock(return_value=[])
@@ -2628,6 +2762,14 @@ class TestParser(TestCase):
             options=AccessibilityInfoOptions(nested=False),
         )
 
+    async def test_accessibility_info_all_of_a_named_app(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(cmd_input=["ui", "describe-all", "--bundle-id", "com.a.b"])
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityApplication(bundle_id="com.a.b"),
+            options=AccessibilityInfoOptions(nested=False),
+        )
+
     async def test_accessibility_info_all_nested(self) -> None:
         self.client_mock.accessibility_info = AsyncMock()
         await cli_main(cmd_input=["ui", "describe-all", "--nested"])
@@ -2642,6 +2784,16 @@ class TestParser(TestCase):
         self.client_mock.accessibility_info.assert_called_once_with(
             target=AccessibilityPoint(x=10, y=20),
             options=AccessibilityInfoOptions(nested=False),
+        )
+
+    async def test_accessibility_info_at_point_on_a_display(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(
+            cmd_input=["ui", "describe-point", "--display", "active", "10", "20"]
+        )
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityPoint(x=10, y=20),
+            options=AccessibilityInfoOptions(nested=False, display="active"),
         )
 
     async def test_accessibility_info_at_point_nested(self) -> None:

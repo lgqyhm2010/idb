@@ -48,7 +48,7 @@ The three read commands differ only in what they are asked about — they share 
 
 ### `idb ui describe-all`
 
-Describes every element of the frontmost application.
+Describes every element of the frontmost application. Pass `--bundle-id com.example.app` to read a specific running application instead, including another app sharing the screen in a split view. This does not launch or foreground it. An older companion may ignore the option; check the root element's pid before relying on the result.
 
 ```
 idb ui describe-all
@@ -121,6 +121,7 @@ idb ui describe com.apple.settings.general --match-key AXUniqueId
 | `--collect-frame-coverage` | all three | Collect screen-coverage ratios for the read's element frames, reported in the `complete` format |
 | `--match-key KEY` | `describe` | Attribute the marker is matched against, default `AXLabel` |
 | `--depth N` | `describe` | Maximum tree depth searched for the marker, default `10` |
+| `--display ID` | `describe-point` | Hit-test the point on this display, in its interface orientation. See [Simulator displays](commands.mdx#simulator-displays) |
 
 ## Waiting for an element
 
@@ -266,6 +267,20 @@ idb ui swipe 100 500 100 100
 ```
 
 The touch is moved in steps; `--delta` sets the distance in points between successive touch points along the line, and `--duration` sets how long the whole gesture takes.
+
+### `idb ui drag X1 Y1 X2 Y2 [X3 Y3 ...]`
+
+Holds one contact down along a path of at least two points, including its corners, then lifts at the last point. `--duration` is the total gesture time in seconds (default `1.0`); `--delta` is the maximum distance between samples in points (default `10.0`). Coordinates and durations must be finite; duration can be zero and delta must be positive.
+
+```
+idb ui drag 100 600 100 300 400 300 --duration 2
+```
+
+Both `swipe` and `drag` accept `--edge top|left|bottom|right` to identify a system gesture starting at that screen edge, such as the home indicator or Notification Centre. Put the first coordinate on the selected edge. An older companion rejects an unsupported edge selector rather than silently delivering an ordinary gesture.
+
+```
+idb ui drag 236 668 236 600 700 330 --edge bottom --display active
+```
 
 ### `idb ui pinch X Y SCALE`
 

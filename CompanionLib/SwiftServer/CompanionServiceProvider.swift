@@ -132,6 +132,12 @@ final class CompanionServiceProvider: Idb_CompanionService.SimpleServiceProtocol
     }
   }
 
+  func listDisplays(request: Idb_ListDisplaysRequest, context: ServerContext) async throws -> Idb_ListDisplaysResponse {
+    try await trackedUnaryCall(context, request: request) {
+      try await ListDisplaysMethodHandler(commandExecutor: commandExecutor).handle(request: request, context: context)
+    }
+  }
+
   func describe(request: Idb_TargetDescriptionRequest, context: ServerContext) async throws -> Idb_TargetDescriptionResponse {
     return try await trackedUnaryCall(context, request: request) {
       try await DescribeMethodHandler(reporter: reporter, logger: logger, target: target, streamCapabilities: streamCapabilities)

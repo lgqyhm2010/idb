@@ -68,6 +68,7 @@ extension SimulatorDisplayError: SimulatorFailureClassifying {
   var failureKind: SimulatorFailureKind {
     switch self {
     case .changed, .transitioning, .noActiveIntegratedDisplay, .ambiguousActiveDisplays, .screensNotReported: .notReady
+    case .unknownDisplay: .failed
     }
   }
 }

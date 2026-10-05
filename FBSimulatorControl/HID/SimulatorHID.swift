@@ -106,15 +106,31 @@ public final class SimulatorHID: CustomStringConvertible, Sendable {
   private func send<S: AsyncSequence>(
     events: S, logger: ControlCoreLogger, flushing: Bool, binding: SimulatorHIDDisplayBinding
   ) async throws where S.Element == SimulatorHIDEvent {
+    try await send(stream: events.map { SimulatorHIDStreamEvent.input($0) }, logger: logger, flushing: flushing, binding: binding)
+  }
+
+  /// Display selections are operation-local and may only occur after all contacts have lifted.
+  public func send<S: AsyncSequence>(stream: S, logger: ControlCoreLogger) async throws where S.Element == SimulatorHIDStreamEvent {
+    try await send(stream: stream, logger: logger, flushing: true, binding: .active)
+  }
+
+  private func send<S: AsyncSequence>(
+    stream: S, logger: ControlCoreLogger, flushing: Bool, binding: SimulatorHIDDisplayBinding
+  ) async throws where S.Element == SimulatorHIDStreamEvent {
     try await operationLease.withLease {
       var operation = SimulatorHIDOperation(
         displays: displays,
         binding: binding,
         sink: LoggingSink(hid: self, logger: logger, logging: logging))
       do {
-        for try await event in events {
-          for delivery in try await operation.send(event) {
-            if case .clamped = delivery { logger.log(delivery.logDescription(logging)) }
+        for try await request in stream {
+          switch request {
+          case let .display(binding):
+            try await operation.select(binding)
+          case let .input(event):
+            for delivery in try await operation.send(event) {
+              if case .clamped = delivery { logger.log(delivery.logDescription(logging)) }
+            }
           }
         }
         try await operation.finish(flushing: flushing)

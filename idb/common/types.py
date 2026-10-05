@@ -451,6 +451,22 @@ AccessibilityTarget = Union[AccessibilityPoint, AccessibilityMarker]
 
 
 @dataclass(frozen=True)
+class AccessibilityApplication:
+    """A running application's whole tree, frontmost or not. When two apps
+    share the screen, "frontmost" names only one of them."""
+
+    bundle_id: str
+
+
+# What a read can target: an element to act on, or a whole named application.
+# Actions take AccessibilityTarget, since a whole application is not something
+# to tap.
+AccessibilityReadTarget = Union[
+    AccessibilityPoint, AccessibilityMarker, AccessibilityApplication
+]
+
+
+@dataclass(frozen=True)
 class AccessibilityDragOptions:
     """The three drag phase durations, in seconds, and the distance between
     interpolated touch points, in screen points. None sends the wire's zero,
@@ -546,6 +562,11 @@ class AccessibilityInfoOptions:
     # Compare `match` — and a marker, on a read — case-insensitively.
     ignore_case: bool = False
     filter: AccessibilityElementFilter | None = None
+    # Hit-test a point read on this display instead of the default active one: the unique
+    # id of any lit display from `idb list-displays`, or ACTIVE_DISPLAY for the
+    # lit integrated display. The point is in the display's interface
+    # orientation, as a touch aimed at it is. Only meaningful with a point target.
+    display: str | None = None
 
 
 class AccessibilityScrollDirection(Enum):
@@ -733,9 +754,63 @@ class HIDHinge:
             raise ValueError("Hinge angle must be finite and between 0 and 180 degrees")
 
 
+# Selects the active integrated display, in place of a display's unique id.
+ACTIVE_DISPLAY = "active"
+
+
+@dataclass(frozen=True)
+class HIDDisplay:
+    """Routes the touches after it in the same HID stream to one display's
+    touchscreen. A named display must be the active integrated display; an
+    empty unique_id selects it."""
+
+    unique_id: str
+
+
+class HIDEdgeType(Enum):
+    NONE = 0
+    TOP = 1
+    LEFT = 2
+    BOTTOM = 3
+    RIGHT = 4
+
+
+@dataclass(frozen=True)
+class HIDEdge:
+    """Tags the touches after it in the same HID stream, swipes included, as
+    starting at a screen edge, which is what hands a drag to a system gesture
+    such as the home indicator. NONE clears it."""
+
+    edge: HIDEdgeType
+
+
 HIDEvent = Union[
-    HIDPress, HIDSwipe, HIDDelay, HIDPinch, HIDOrientation, HIDShake, HIDHinge
+    HIDPress,
+    HIDSwipe,
+    HIDDelay,
+    HIDPinch,
+    HIDOrientation,
+    HIDShake,
+    HIDHinge,
+    HIDDisplay,
+    HIDEdge,
 ]
+
+
+@dataclass(frozen=True)
+class DisplayInfo:
+    unique_id: str
+    name: str
+    active: bool
+    primary: bool
+    integrated: bool
+    # Size in the display's unrotated pixel space.
+    width: float
+    height: float
+    scale: float
+    rotation: str
+    # Whether touches can be routed to it.
+    touchscreen: bool
 
 
 @dataclass(frozen=True)
@@ -1061,7 +1136,13 @@ class Client(ABC):
         pass
 
     @abstractmethod
-    async def tap(self, x: float, y: float, duration: float | None = None) -> None:
+    async def tap(
+        self,
+        x: float,
+        y: float,
+        duration: float | None = None,
+        display: str | None = None,
+    ) -> None:
         pass
 
     @abstractmethod
@@ -1072,6 +1153,7 @@ class Client(ABC):
         count: int = 2,
         duration: float | None = None,
         pause: float = 0.1,
+        display: str | None = None,
     ) -> None:
         pass
 
@@ -1102,6 +1184,10 @@ class Client(ABC):
         pass
 
     @abstractmethod
+    async def list_displays(self) -> list[DisplayInfo]:
+        pass
+
+    @abstractmethod
     async def shake(self) -> None:
         pass
 
@@ -1120,6 +1206,19 @@ class Client(ABC):
         p_end: tuple[int, int],
         duration: float | None = None,
         delta: int | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def drag(
+        self,
+        points: list[tuple[float, float]],
+        duration: float = 1.0,
+        delta: float | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
     ) -> None:
         pass
 
@@ -1146,7 +1245,7 @@ class Client(ABC):
     @abstractmethod
     async def accessibility_info(
         self,
-        target: AccessibilityTarget | None,
+        target: AccessibilityReadTarget | None,
         options: AccessibilityInfoOptions,
     ) -> AccessibilityInfo:
         pass
@@ -1325,6 +1424,7 @@ class Client(ABC):
         scale: float,
         duration: float = 0.5,
         radius: float = 100.0,
+        display: str | None = None,
     ) -> None: ...
 
     @abstractmethod

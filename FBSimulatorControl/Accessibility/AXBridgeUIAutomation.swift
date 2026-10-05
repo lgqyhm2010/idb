@@ -110,13 +110,43 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
     try await displays.validate(display.interactionDisplay)
   }
 
+  private func refusingPointOnDisplay(_ query: AccessibilityElementQuery, operation: String) throws {
+    guard case .pointOnDisplay = query else { return }
+    throw UIAutomationError.operationUnsupported(backend: backend, operation: "\(operation) on another display")
+  }
+
   // MARK: - Reads
 
   func describe(
     _ query: AccessibilityElementQuery,
     options: AccessibilityRequestOptions
   ) async throws -> AccessibilityElementsResponse {
-    try await withDisplay { try await $0.describeTree(query, options: options) }
+    if case let .pointOnDisplay(point, uniqueID) = query {
+      return try await describePointOnSoleDisplay(point, uniqueID: uniqueID, options: options)
+    }
+    return try await withDisplay { try await $0.describeTree(query, options: options) }
+  }
+
+  /// The bridge supports an explicit sole-display read, but never substitutes ACTIVE for its UUID.
+  /// Bind the hit-test to the named snapshot and reject a changed topology before returning it.
+  private func describePointOnSoleDisplay(
+    _ point: CGPoint, uniqueID: String, options: AccessibilityRequestOptions
+  ) async throws -> AccessibilityElementsResponse {
+    let displays: any DisplayCommands
+    switch routing {
+    case let .unresolved(commands), let .resolved(_, commands): displays = commands
+    case .unrouted:
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Describing a point on another display")
+    }
+    guard case let .target(.sole(display)) = try await displays.resolveDisplay(uniqueID: uniqueID) else {
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Describing a point on another display")
+    }
+    let scoped = AXBridgeUIAutomation(scoping: self, routing: .resolved(.sole(display), displays))
+    let response = try await scoped.describeTree(.point(point), options: options)
+    guard case let .target(.sole(current)) = try await displays.resolveDisplay(uniqueID: uniqueID),
+      current.hasSameConfiguration(as: display)
+    else { throw SimulatorDisplayError.changed }
+    return response
   }
 
   nonisolated var backend: UIAutomationBackend {
@@ -295,7 +325,7 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
       pid = requested
     case .frontmost:
       pid = nil
-    case .point, .marker:
+    case .point, .pointOnDisplay, .marker:
       throw UIAutomationError.operationUnsupported(backend: backend, operation: "Quiescence of a point or marker")
     }
     guard transport is any AXBridgeStreamingTransport else {
@@ -445,6 +475,7 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
     _ query: AccessibilityElementQuery,
     options: TapOptions
   ) async throws {
+    try refusingPointOnDisplay(query, operation: "A tap")
     if needsDisplay {
       return try await withDisplay { try await $0.tap(query, options: options) }
     }
@@ -457,6 +488,7 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
   }
 
   func setValue(_ value: String, for query: AccessibilityElementQuery) async throws {
+    try refusingPointOnDisplay(query, operation: "Setting a value")
     if needsDisplay {
       return try await withDisplay { try await $0.setValue(value, for: query) }
     }
@@ -464,6 +496,7 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
   }
 
   func scroll(_ query: AccessibilityElementQuery, direction: AccessibilityScrollDirection) async throws {
+    try refusingPointOnDisplay(query, operation: "Scroll")
     if needsDisplay {
       return try await withDisplay { try await $0.scroll(query, direction: direction) }
     }
@@ -478,6 +511,8 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
     to destination: AccessibilityElementQuery,
     options: DragOptions
   ) async throws {
+    try refusingPointOnDisplay(source, operation: DragEndpoint.operation)
+    try refusingPointOnDisplay(destination, operation: DragEndpoint.operation)
     if needsDisplay {
       return try await withDisplay { try await $0.drag(from: source, to: destination, options: options) }
     }
@@ -604,7 +639,8 @@ final class AXBridgeUIAutomation: AXBridgeTreeReader, @unchecked Sendable {
   }
 
   func frame(_ query: AccessibilityElementQuery) async throws -> CGRect {
-    try await withDisplay { try await $0.frameFromTree(query) }
+    try refusingPointOnDisplay(query, operation: "Reading a frame")
+    return try await withDisplay { try await $0.frameFromTree(query) }
   }
 
   // MARK: - Frontmost anchor

@@ -166,7 +166,9 @@ jobs:
   # shards and formulae wait on it.
   mac-companion:
     name: Build companion + distribution (macOS)
-    runs-on: macos-26-xlarge
+    # Larger runners are configured by upstream; forks use standard hosted
+    # macOS runners without requiring paid runner access.
+    runs-on: ${{ github.repository == 'facebook/idb' && 'macos-26-xlarge' || 'macos-26' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -187,6 +189,8 @@ jobs:
           key: protoc-plugins-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ runner.os }}
       - name: Build everything and assemble the distribution
         run: ./build.sh build all
+      - name: Test companion display routing and request translation
+        run: ./build.sh test CompanionRoutingTests
       # The raw xcodebuild output build.sh keeps for every invocation; the
       # formatted job log shows only what the formatter recognised.
       - name: Upload xcodebuild logs on failure
@@ -299,7 +303,9 @@ jobs:
   # VM the simulator stalls for tens of seconds at a time and outlasts test waits.
   mac-end-to-end:
     name: End-to-end ${{ matrix.shard }} (idb through idb_companion, macOS)
-    runs-on: macos-26-xlarge
+    # Larger runners are configured by upstream; forks use standard hosted
+    # macOS runners without requiring paid runner access.
+    runs-on: ${{ github.repository == 'facebook/idb' && 'macos-26-xlarge' || 'macos-26' }}
     needs: mac-companion
     timeout-minutes: 45
     strategy:

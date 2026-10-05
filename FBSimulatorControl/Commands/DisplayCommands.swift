@@ -197,6 +197,31 @@ extension DisplayCommands {
     SimulatorDisplayResolution(try await settledReport())
   }
 
+  /// Resolves an explicit read UUID without falling back to another screen. Any lit display can be
+  /// hit-tested, including an external display with no touchscreen.
+  func resolveDisplay(uniqueID: String) async throws -> SimulatorDisplayResolution {
+    let report = try await settledReport()
+    switch report {
+    case .transitioning:
+      throw SimulatorDisplayError.transitioning
+    case let .failed(error):
+      throw error
+    case .legacy:
+      throw SimulatorDisplayInteractionError.unsupportedCapability("display identities")
+    case let .displays(displays):
+      guard let display = displays.first(where: { $0.uniqueID == uniqueID }) else {
+        throw SimulatorDisplayError.unknownDisplay(uniqueID, known: displays.map(\.uniqueID))
+      }
+      guard display.isActive else {
+        throw SimulatorDisplayInteractionError.inactiveDisplay(uniqueID)
+      }
+      if display.isIntegrated, displays.filter(\.isIntegrated).count == 1 {
+        return .target(.sole(.identified(display)))
+      }
+      return .target(.selected(display))
+    }
+  }
+
   /// Every identified display once any display transition has settled. A runtime that reports no display activity
   /// does not identify its displays, so none are listed.
   func describedDisplays() async throws -> TargetDetail<[TargetDisplayDescription]> {
@@ -252,7 +277,8 @@ extension DisplayCommands {
   /// The accessibility identity of a display that has to be named. The guest is asked only for a display it
   /// has not seen, and only then are `capabilities` required of it.
   func accessibilityID(
-    for display: SimulatorDisplay, transport: any AXBridgeTransport, requiring capabilities: AXBridgeDisplayCapabilities = []
+    for display: SimulatorDisplay, transport: any AXBridgeTransport, requiring capabilities: AXBridgeDisplayCapabilities = [],
+    validatesActiveDisplay: Bool = true
   ) async throws -> UInt32 {
     if let accessibilityID = identities.accessibilityID(for: display.uniqueID, requiring: capabilities) {
       return accessibilityID
@@ -262,7 +288,14 @@ extension DisplayCommands {
     guard matches.count == 1, let match = matches.first else {
       throw SimulatorDisplayInteractionError.missingMapping(display.uniqueID)
     }
-    try await validate(.identified(display))
+    if validatesActiveDisplay {
+      try await validate(.identified(display))
+    } else {
+      let current = try await resolveDisplay(uniqueID: display.uniqueID)
+      guard case let .target(target) = current,
+        target.display.hasSameConfiguration(as: .identified(display))
+      else { throw SimulatorDisplayError.changed }
+    }
     identities.remember(inventory, verified: capabilities)
     return match.displayID
   }

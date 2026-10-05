@@ -154,6 +154,8 @@ enum DragEndpoint: Equatable {
       self = .marker(value: value, key: key, depth: depth)
     case .frontmost, .application:
       throw UIAutomationError.pointOrMarkerRequired(backend: backend, operation: Self.operation)
+    case .pointOnDisplay:
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "\(Self.operation) on another display")
     }
   }
 }

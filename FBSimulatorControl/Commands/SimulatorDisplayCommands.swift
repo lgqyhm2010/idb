@@ -137,6 +137,7 @@ extension TargetDisplayDescription {
 
 public enum SimulatorDisplayError: Error, LocalizedError {
   case changed
+  case unknownDisplay(String, known: [String])
   /// Layout has moved to another display whose backlight has not caught up, as after a hinge change.
   case transitioning
   /// The current snapshot reports no active integrated display. A later snapshot may recover.
@@ -148,6 +149,7 @@ public enum SimulatorDisplayError: Error, LocalizedError {
   public var errorDescription: String? {
     switch self {
     case let .screensNotReported(seconds): "Simulator did not report its displays within \(seconds) seconds"
+    case let .unknownDisplay(id, known): "Unknown display \(id); known displays: \(known.joined(separator: ", "))"
     case .changed: "Simulator display changed during the operation"
     case .transitioning: "Simulator display is still changing: layout has moved to a display that is not lit yet"
     case .noActiveIntegratedDisplay: "Simulator currently reports no active integrated display"
@@ -277,6 +279,19 @@ public final class SimulatorDisplayCommands: DisplayCommands, @unchecked Sendabl
       input: SimulatorDisplayUpdatesProtocol.StreamInput(channel: channel)
     ) { event in
       try SimulatorDisplayUpdatesProtocol.report(event, channel: channel)
+    }
+  }
+}
+
+public extension SimulatorDisplayCommands {
+  /// A point query for an explicit display selector. An omitted UUID preserves normal active-display
+  /// routing. Keep the UUID even for a sole display so a later read cannot silently switch screens.
+  func accessibilityPointQuery(at point: CGPoint, displayUniqueID: String?) async throws -> AccessibilityElementQuery {
+    guard let displayUniqueID else { return .point(point) }
+    switch try await resolveDisplay(uniqueID: displayUniqueID) {
+    case .target: return .pointOnDisplay(point, uniqueID: displayUniqueID)
+    case .transitioning: throw SimulatorDisplayError.transitioning
+    case .fallback: throw SimulatorDisplayInteractionError.unsupportedCapability("display identities")
     }
   }
 }

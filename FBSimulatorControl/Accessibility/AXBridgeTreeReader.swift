@@ -143,6 +143,10 @@ extension AXBridgeTreeReader {
           screen: read.screen ?? AXTreeWalk.screenInfo(fromTree: read.tree),
           truncated: read.truncated
         )
+    case .pointOnDisplay:
+      // The guest can scope a hit-test to a display, but this host does not send it a display id yet, so
+      // the hit-test would land on the main screen instead of the display the caller named.
+      throw UIAutomationError.operationUnsupported(backend: backend, operation: "Describing a point on another display")
     case .frontmost, .application:
       let plan = Self.readPlan(
         for: options,

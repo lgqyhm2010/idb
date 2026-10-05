@@ -14,6 +14,9 @@ import Foundation
 /// specific application by process identifier.
 public enum AccessibilityElementQuery: Equatable, Sendable {
   case point(CGPoint)
+  /// A read-only hit-test on an explicitly named lit display. The UUID is resolved to the
+  /// current accessibility identity and geometry at read time; it is never a numeric report ID.
+  case pointOnDisplay(CGPoint, uniqueID: String)
   /// An element whose `key` value *contains* `value` — a substring match, not an equality test, so
   /// `"General"` finds an element labelled `"General Settings"`. Every backend matches the same way;
   /// the first element found in tree order wins.
@@ -37,7 +40,7 @@ public extension AccessibilityElementQuery {
   /// document shape, so this is what tells a consumer which verb produced the one it is holding.
   var targetDescriptor: AccessibilityTargetDescriptor {
     switch self {
-    case let .point(point):
+    case let .point(point), let .pointOnDisplay(point, _):
       return .point(point)
     case let .marker(value, key, _, _):
       return .marker(value: value, matchKey: key.rawValue)
@@ -56,6 +59,8 @@ extension AccessibilityElementQuery: CustomStringConvertible {
     switch self {
     case let .point(point):
       return "the element at (\(Double(point.x)), \(Double(point.y)))"
+    case let .pointOnDisplay(point, uniqueID):
+      return "the element at (\(Double(point.x)), \(Double(point.y))) on display \(uniqueID)"
     case let .marker(value, key, _, ignoresCase):
       // Naming the case-insensitivity matters most in the failure: "no element whose AXLabel contains
       // "ok"" reads as a claim about the screen, when the caller wants to know whether "OK" was

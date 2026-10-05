@@ -407,6 +407,126 @@ final class SimulatorHIDOperationTests: XCTestCase {
     XCTAssertEqual(events.compactMap(\.1), [display(), display()])
   }
 
+  func testSelectionDuringContactFailsAndCleanupUsesOriginalTarget() async throws {
+    let recorder = Recorder()
+    var operation = makeOperation(recorder)
+    _ = try await operation.send(.touch(direction: .down, x: 20, y: 30))
+    do {
+      try await operation.select(.display(uniqueID: "cover"))
+      XCTFail("Expected selection during contact to fail")
+    } catch {
+      guard case SimulatorHIDStreamError.displaySelectionDuringTouch = error else {
+        return XCTFail("Unexpected error: \(error)")
+      }
+    }
+    await assertCleanup(operation)
+    let events = await recorder.events
+    XCTAssertEqual(events.compactMap(\.1), [display(), display()])
+    XCTAssertEqual(events.last?.0, .touch(direction: .up, x: 20, y: 30))
+  }
+
+  func testSelectionDuringTwoFingerContactIsRejected() async throws {
+    let recorder = Recorder()
+    var operation = makeOperation(recorder)
+    _ = try await operation.send(.twoFingerTouch(direction: .down, finger1: CGPoint(x: 20, y: 30), finger2: CGPoint(x: 40, y: 50)))
+    do {
+      try await operation.select(.active)
+      XCTFail("Expected selection during two-finger contact to fail")
+    } catch {
+      XCTAssertTrue(error is SimulatorHIDStreamError)
+    }
+    await assertCleanup(operation)
+    let events = await recorder.events
+    XCTAssertEqual(events.count, 2)
+    XCTAssertEqual(events.compactMap(\.1), [display(), display()])
+  }
+
+  func testExplicitUUIDRejectsInactiveSoleDisplayButActiveDefaultStillWorks() async throws {
+    let inactive = SimulatorDisplay(
+      uniqueID: "inner", name: "inner", activity: .inactive, isPrimary: true, isIntegrated: true,
+      bounds: CGRect(x: 0, y: 0, width: 600, height: 900), scale: 3, rotation: .upright)
+    let recorder = Recorder()
+    let displays = DisplayCommandsDouble(.sole(.identified(inactive)))
+    var pinned = SimulatorHIDOperation(displays: displays, binding: .display(uniqueID: "inner"), sink: recorder)
+    do {
+      _ = try await pinned.send(.tapAt(x: 20, y: 30))
+      XCTFail("Expected explicit inactive UUID rejection")
+    } catch {
+      guard case SimulatorDisplayInteractionError.inactiveDisplay("inner") = error else {
+        return XCTFail("Unexpected error: \(error)")
+      }
+    }
+    await assertCleanup(pinned)
+    var active = SimulatorHIDOperation(displays: displays, sink: recorder)
+    _ = try await active.send(.tapAt(x: 20, y: 30))
+    try await active.finish(flushing: true)
+    let events = await recorder.events
+    XCTAssertEqual(events.count, 2)
+  }
+
+  func testFreshSelectionAfterRotationUsesNewGeometry() async throws {
+    let recorder = Recorder()
+    var operation = makeOperation(recorder)
+    _ = try await operation.send(.tapAt(x: 20, y: 30))
+    // Explicitly begin another gesture after a caller-requested rotation, retaining the lease.
+    await recorder.setDisplay(screen(rotation: .clockwise))
+    try await operation.select(.active)
+    _ = try await operation.send(.tapAt(x: 250, y: 150))
+    try await operation.finish(flushing: true)
+    let events = await recorder.events
+    XCTAssertEqual(events.compactMap(\.1), [display(), display(), display(rotation: .clockwise), display(rotation: .clockwise)])
+    XCTAssertEqual(events.last?.0, .touch(direction: .up, x: 250, y: 150))
+  }
+
+  func testBetweenGestureSelectionCanChooseTheNewActiveUUID() async throws {
+    let recorder = Recorder()
+    var operation = makeOperation(recorder, binding: .display(uniqueID: "inner"))
+    _ = try await operation.send(.tapAt(x: 20, y: 30))
+    await recorder.setDisplay(screen("cover"))
+    try await operation.select(.display(uniqueID: "cover"))
+    _ = try await operation.send(.tapAt(x: 40, y: 50))
+    try await operation.finish(flushing: true)
+    let events = await recorder.events
+    XCTAssertEqual(events.compactMap(\.1), [display(), display(), display("cover"), display("cover")])
+  }
+
+  func testFreshSelectionStillRejectsAnInactiveUUID() async throws {
+    let recorder = Recorder()
+    var operation = makeOperation(recorder)
+    _ = try await operation.send(.tapAt(x: 20, y: 30))
+    await recorder.setDisplay(screen("cover"))
+    try await operation.select(.display(uniqueID: "inner"))
+    do {
+      _ = try await operation.send(.tapAt(x: 20, y: 30))
+      XCTFail("Expected an inactive display")
+    } catch {
+      guard case SimulatorDisplayInteractionError.inactiveDisplay("inner") = error else {
+        return XCTFail("Unexpected error: \(error)")
+      }
+    }
+    await assertCleanup(operation)
+    let events = await recorder.events
+    XCTAssertEqual(events.count, 2)
+  }
+
+  /// A restarted session can assign different numeric identities to the same display UUID. This tests
+  /// independent session inventories, not an assertion about upstream cache lifecycle invalidation.
+  func testIndependentSessionsDoNotShareDigitizerIdentity() async throws {
+    let first = Recorder()
+    let second = Recorder()
+    await second.setDigitizerTarget(19)
+    var beforeRestart = makeOperation(first)
+    var afterRestart = makeOperation(second)
+    _ = try await beforeRestart.send(.tapAt(x: 20, y: 30))
+    try await beforeRestart.finish(flushing: true)
+    _ = try await afterRestart.send(.tapAt(x: 20, y: 30))
+    try await afterRestart.finish(flushing: true)
+    let original = await first.events
+    let restarted = await second.events
+    XCTAssertEqual(original.compactMap(\.1), [display(target: 7), display(target: 7)])
+    XCTAssertEqual(restarted.compactMap(\.1), [display(target: 19), display(target: 19)])
+  }
+
   private func makeOperation(
     _ recorder: Recorder,
     observation: SimulatorHIDDisplayObservation = SimulatorHIDDisplayObservation(),
@@ -443,6 +563,7 @@ final class SimulatorHIDOperationTests: XCTestCase {
     nonisolated let identities = DisplayIdentityCache()
     nonisolated let configurationTracker = DisplayConfigurationTracker()
     var currentDisplay: SimulatorDisplay = SimulatorHIDOperationTests.makeScreen()
+    var digitizerTarget: UInt32 = 7
     var events: [(SimulatorHIDEvent, SimulatorHIDDisplay?)] = []
     var flushes = 0
     var cancelledDeliveries = 0
@@ -463,10 +584,11 @@ final class SimulatorHIDOperationTests: XCTestCase {
     }
 
     func touchscreens() -> [SimulatorTouchscreen] {
-      [SimulatorTouchscreen(displayUniqueID: currentDisplay.uniqueID, digitizerTarget: 7)]
+      [SimulatorTouchscreen(displayUniqueID: currentDisplay.uniqueID, digitizerTarget: digitizerTarget)]
     }
 
     func setDisplay(_ display: SimulatorDisplay) { currentDisplay = display }
+    func setDigitizerTarget(_ value: UInt32) { digitizerTarget = value }
     func deliver(_ event: SimulatorHIDEvent, display: SimulatorHIDDisplay?) {
       events.append((event, display))
       if Task.isCancelled { cancelledDeliveries += 1 }

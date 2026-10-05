@@ -34,6 +34,15 @@ class BuildPyCommand(setuptools.command.build_py.build_py):
         gen_protoc_complier()
 
         root = Path(os.path.realpath(__file__)).parent
+        # The language-neutral REPL test reads the shared wire fixture as
+        # package data, so installed-wheel tests need a copy beside the suite.
+        test_output = Path(self.build_lib) / "idb" / "grpc" / "tests"
+        test_output.mkdir(parents=True, exist_ok=True)
+        self.copy_file(
+            str(root / "proto" / "fixtures" / "repl_transcript.v1.json"),
+            str(test_output / "repl_transcript.v1.json"),
+        )
+
         proto_file = root / "proto" / "idb.proto"
         output_dir = root / "build" / "lib" / "idb" / "grpc"
         grpclib_output = output_dir / "idb_grpc.py"
@@ -90,7 +99,11 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/facebook/idb",
     packages=setuptools.find_packages(exclude=("idb.fb", "idb.fb.*")),
-    data_files=[("proto", ["proto/idb.proto"]), ("", ["protoc_compiler_template.py"])],
+    data_files=[
+        ("proto", ["proto/idb.proto"]),
+        ("proto/fixtures", ["proto/fixtures/repl_transcript.v1.json"]),
+        ("", ["protoc_compiler_template.py"]),
+    ],
     license="MIT",
     classifiers=[
         "Programming Language :: Python :: 3.10",

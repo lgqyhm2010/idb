@@ -41,7 +41,7 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
       // match rather than the application root, so the bounds it reports describe the match — they have
       // to be discarded, and replaced where the read does know better.
       switch query {
-      case .point:
+      case .point, .pointOnDisplay:
         return response.replacingScreen(nil)
       case .marker:
         return response.replacingScreen(element.rootBounds.flatMap(AXTranslationRequest.screenInfo(fromBounds:)))
@@ -65,6 +65,16 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
       guard case let .elementNotFound(key, value, _) = error else { throw error }
       throw UIAutomationError.elementNotFound(backend: .accessibility, key: key, value: value)
     }
+  }
+
+  /// Refuses a point on another display for every verb but `describe`, the only one that takes it (see
+  /// `AccessibilityElementQuery.pointOnDisplay`). The translator would resolve that point and let the verb
+  /// act on what it found there, so the refusal has to be explicit.
+  private static func refusingPointOnDisplay(_ query: AccessibilityElementQuery, operation: String) throws {
+    guard case .pointOnDisplay = query else {
+      return
+    }
+    throw UIAutomationError.operationUnsupported(backend: .accessibility, operation: "\(operation) on another display")
   }
 
   func hitTest(
@@ -92,6 +102,7 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
     guard options.duration == nil else {
       throw UIAutomationError.operationUnsupported(backend: .accessibility, operation: "A tap with a hold duration")
     }
+    try Self.refusingPointOnDisplay(query, operation: "A tap")
     try await Self.translatingBackendErrors(query) {
       let element = try await operations.resolveElement(for: query)
       defer { element.close() }
@@ -108,6 +119,7 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
   }
 
   func setValue(_ value: String, for query: AccessibilityElementQuery) async throws {
+    try Self.refusingPointOnDisplay(query, operation: "Setting a value")
     try await Self.translatingBackendErrors(query) {
       let element = try await operations.resolveElement(for: query)
       defer { element.close() }
@@ -132,6 +144,7 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
   }
 
   func scroll(_ query: AccessibilityElementQuery, direction: AccessibilityScrollDirection) async throws {
+    try Self.refusingPointOnDisplay(query, operation: "Scroll")
     let query = try await scrollTarget(for: query, backend: .accessibility)
     try await Self.translatingBackendErrors(query) {
       let element = try await operations.resolveElement(for: query)
@@ -141,7 +154,8 @@ final class AccessibilityUIAutomation: UIAutomation, @unchecked Sendable {
   }
 
   func frame(_ query: AccessibilityElementQuery) async throws -> CGRect {
-    try await Self.translatingBackendErrors(query) {
+    try Self.refusingPointOnDisplay(query, operation: "Reading a frame")
+    return try await Self.translatingBackendErrors(query) {
       let element = try await operations.resolveElement(for: query)
       defer { element.close() }
       return try await element.frame()

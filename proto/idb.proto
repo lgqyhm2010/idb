@@ -34,6 +34,7 @@ service CompanionService {
   rpc get_orientation(GetOrientationRequest) returns (GetOrientationResponse) {}
   rpc set_orientation(SetOrientationRequest) returns (SetOrientationResponse) {}
   rpc hinge_angle(HingeAngleRequest) returns (HingeAngleResponse) {}
+  rpc list_displays(ListDisplaysRequest) returns (ListDisplaysResponse) {}
   rpc hid(stream HIDEvent) returns (HIDResponse) {}
   rpc open_url(OpenUrlRequest) returns (OpenUrlRequest) {}
   rpc set_location(SetLocationRequest) returns (SetLocationResponse) {}
@@ -118,6 +119,28 @@ message HingeAngleRequest {}
 message HingeAngleResponse {
   // A fresh measured hinge angle in degrees, from 0 (closed) to 180 (flat).
   double angle = 1;
+}
+
+message ListDisplaysRequest {}
+
+message ListDisplaysResponse {
+  message Display {
+    // Stable display identity; the value `HIDEvent.HIDDisplay.unique_id` takes.
+    string unique_id = 1;
+    string name = 2;
+    bool active = 3;
+    bool primary = 4;
+    bool integrated = 5;
+    // Size in the display's unrotated pixel space.
+    double width = 6;
+    double height = 7;
+    double scale = 8;
+    // The current interface rotation: "rot0", "rot90", "rot180" or "rot270".
+    string rotation = 9;
+    // Whether a touchscreen covers the display, so touches can be routed to it.
+    bool touchscreen = 10;
+  }
+  repeated Display displays = 1;
 }
 
 message Payload {
@@ -408,6 +431,21 @@ message AccessibilityInfoRequest {
   // Compare match — and, on a marker read, marker — case-insensitively.
   bool ignore_case = 12;
   Filter filter = 13;
+  // Describe this running application's whole tree instead of the frontmost
+  // one's. When two apps share the screen, as on iPadOS windows or a split
+  // foldable, "frontmost" names only one of them. Cannot be combined with
+  // point or marker. An older server ignores this field and describes the
+  // frontmost application, so a caller must check the root element's pid.
+  string bundle_id = 14;
+  // Hit-test the point on this display instead of the default active one; the point is
+  // in the display's interface orientation, as a touch aimed at it is. Any lit
+  // display can be named, integrated or not; an empty unique_id selects the
+  // active integrated display. Naming a device's only integrated display reads
+  // the point exactly as without a display; any other display is read by the
+  // AX backend only, which an unset backend selects. Setting it without a
+  // point, or beside a marker, is INVALID_ARGUMENT. An older server may ignore
+  // this option and use its default display instead.
+  HIDEvent.HIDDisplay display = 15;
 }
 
 message AccessibilityInfoResponse {
@@ -757,6 +795,35 @@ message HIDEvent {
     double angle = 1;
   }
 
+  // Routes the touch events that follow it in the same `hid` stream to one
+  // display's touchscreen, until the stream ends or another HIDDisplay arrives.
+  // Buttons and keys are unaffected. Touches reach only the active integrated
+  // display: selecting a display that is unknown, is not that display or has
+  // no touchscreen fails the stream rather than falling back to the main
+  // screen.
+  message HIDDisplay {
+    // A `ListDisplaysResponse.Display.unique_id`. Empty selects the active
+    // integrated display.
+    string unique_id = 1;
+  }
+
+  enum HIDEdgeType {
+    EDGE_NONE = 0;
+    EDGE_TOP = 1;
+    EDGE_LEFT = 2;
+    EDGE_BOTTOM = 3;
+    EDGE_RIGHT = 4;
+  }
+
+  // Tags the touches that follow it in the same `hid` stream, swipes included,
+  // as starting at a screen edge, until the stream ends or another HIDEdge
+  // arrives. The edge flag is what the guest reads to hand a drag to a system
+  // gesture (the home indicator, Notification Centre) instead of to the app
+  // under it. Buttons and keys are unaffected. EDGE_NONE clears it.
+  message HIDEdge {
+    HIDEdgeType edge = 1;
+  }
+
   // Experimental display-selection clients used field 7.
   reserved 7;
 
@@ -768,6 +835,15 @@ message HIDEvent {
     HIDOrientation orientation = 5;
     HIDShake shake = 6;
     HIDHinge hinge = 8;
+    // Deliberately far from the sequential numbers above, so a companion that
+    // predates display routing rejects the selection as an unrecognized event
+    // instead of reading it as some later event, and touches never silently
+    // land on the main screen.
+    HIDDisplay display = 100;
+    // Numbered beside display for the same reason: a companion that predates
+    // it must reject the stream, not deliver the drag as an ordinary one that
+    // reports success and triggers no system gesture.
+    HIDEdge edge = 101;
   }
 }
 
