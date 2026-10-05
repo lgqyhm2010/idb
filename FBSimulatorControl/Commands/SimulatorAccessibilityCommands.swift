@@ -113,9 +113,15 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
     if case let .pointOnDisplay(_, id) = query { uniqueID = id } else { uniqueID = nil }
     let display = try await readDisplay(uniqueID: uniqueID)
     switch query {
-    case let .point(point), let .pointOnDisplay(point, _):
+    case let .point(point):
       let request = AXTranslationRequest(kind: .point(point), display: display)
       return try await accessibilityElement(request: request, remediationPermitted: false)
+    case let .pointOnDisplay(point, uniqueID):
+      guard let display else { throw SimulatorDisplayError.changed }
+      let request = AXTranslationRequest(kind: .point(point), display: display)
+      let validation = try explicitDisplayValidation(display, uniqueID: uniqueID)
+      return try await accessibilityElement(
+        request: request, remediationPermitted: false, validateAfterSerialization: validation)
     case .frontmost:
       let request = AXTranslationRequest(kind: .frontmostApplication, display: display)
       return try await accessibilityElement(request: request, remediationPermitted: true)
@@ -128,6 +134,35 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
       // remediation (that is only meaningful for the frontmost read).
       let request = AXTranslationRequest(kind: .applicationForPid(pid), display: display)
       return try await accessibilityElement(request: request, remediationPermitted: false)
+    }
+  }
+
+  /// Capture the UUID, geometry, routing kind and observed generation before the translator runs.
+  /// In particular, the sole-display alias (0) must not silently turn into a selected display read.
+  private func explicitDisplayValidation(_ display: AXTranslationDisplay, uniqueID: String) throws -> () async throws -> Void {
+    guard let simulator else { throw WeakTargetError.simulator }
+    let commands = displays ?? simulator.displays
+    let generation = commands.configurationTracker.latest?.generation
+    return {
+      let current: SimulatorDisplayResolution
+      do {
+        current = try await commands.resolveDisplay(uniqueID: uniqueID)
+      } catch SimulatorDisplayError.unknownDisplay {
+        throw SimulatorDisplayError.changed
+      } catch SimulatorDisplayInteractionError.inactiveDisplay {
+        throw SimulatorDisplayError.changed
+      }
+      switch (display, current) {
+      case let (.sole(expected), .target(.sole(actual))):
+        guard expected.hasSameConfiguration(as: actual) else { throw SimulatorDisplayError.changed }
+      case let (.selected(expected, accessibilityID), .target(.selected(actual))):
+        guard expected.hasSameConfiguration(as: actual),
+          commands.identities.accessibilityID(for: uniqueID) == accessibilityID
+        else { throw SimulatorDisplayError.changed }
+      default:
+        throw SimulatorDisplayError.changed
+      }
+      guard commands.configurationTracker.latest?.generation == generation else { throw SimulatorDisplayError.changed }
     }
   }
 
@@ -149,7 +184,10 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
   }
 
   // Remediation retries with `remediationPermitted: false`, bounding it to one attempt.
-  private func accessibilityElement(request: AXTranslationRequest, remediationPermitted: Bool) async throws -> AccessibilityElement {
+  private func accessibilityElement(
+    request: AXTranslationRequest, remediationPermitted: Bool,
+    validateAfterSerialization: (() async throws -> Void)? = nil
+  ) async throws -> AccessibilityElement {
     guard let simulator else {
       throw WeakTargetError.simulator
     }
@@ -171,18 +209,23 @@ final class SimulatorAccessibilityCommands: AccessibilityOperations {
       throw AccessibilityError.noTranslationObject
     }
     if !remediationPermitted {
-      return AccessibilityElement(element: element, request: request, dispatcher: dispatcher, simulator: simulator)
+      return AccessibilityElement(
+        element: element, request: request, dispatcher: dispatcher, simulator: simulator,
+        validateAfterSerialization: validateAfterSerialization)
     }
     let requiresRemediation = try await remediationRequired(forSimulator: simulator, element: element, dispatcher: dispatcher)
     if !requiresRemediation {
-      return AccessibilityElement(element: element, request: request, dispatcher: dispatcher, simulator: simulator)
+      return AccessibilityElement(
+        element: element, request: request, dispatcher: dispatcher, simulator: simulator,
+        validateAfterSerialization: validateAfterSerialization)
     }
     // The request's token was pushed by the dispatcher but is not yet wrapped in an
     // AccessibilityElement, so pop it manually before discarding the request.
     dispatcher.popRequest(request)
     let nextRequest = request.cloneWithNewToken()
     try await remediateSpringBoard(forSimulator: simulator)
-    return try await accessibilityElement(request: nextRequest, remediationPermitted: false)
+    return try await accessibilityElement(
+      request: nextRequest, remediationPermitted: false, validateAfterSerialization: validateAfterSerialization)
   }
 
   private func remediationRequired(forSimulator simulator: Simulator, element: AXPlatformElement, dispatcher: AXTranslationDispatcher) async throws -> Bool {

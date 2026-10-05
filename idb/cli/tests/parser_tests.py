@@ -2562,6 +2562,30 @@ class TestParser(TestCase):
                 self.assertEqual(exit_code, 1)
         self.client_mock.drag.assert_not_called()
 
+    async def test_invalid_drag_reports_clean_error_without_sending_events(self) -> None:
+        from idb.grpc.client import Client as GrpcClient
+
+        client = GrpcClient.__new__(GrpcClient)
+        client.logger = MagicMock()
+        client.send_events = AsyncMock()
+        self.client_mock.drag = client.drag
+        for coordinates, delta in [
+            (["0", "0", "1000", "0"], "1e-6"),
+            (["0", "0", "1", "0"], "1e-320"),
+            (["0", "0", "nan", "0"], "1"),
+        ]:
+            with self.subTest(coordinates=coordinates, delta=delta):
+                error = StringIO()
+                with redirect_stderr(error):
+                    exit_code = await cli_main(
+                        cmd_input=["ui", "drag", *coordinates, "--delta", delta]
+                    )
+                self.assertEqual(exit_code, 1)
+                self.assertIn("drag", error.getvalue().lower())
+                self.assertNotIn("Traceback", error.getvalue())
+                self.assertNotIn("Exception thrown in main", error.getvalue())
+        client.send_events.assert_not_called()
+
     async def test_contacts_update(self) -> None:
         self.client_mock.contacts_update = AsyncMock(return_value=[])
         await cli_main(cmd_input=["contacts", "update", "/dev/null"])

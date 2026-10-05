@@ -35,6 +35,18 @@ final class SimulatorHIDOperationTests: XCTestCase {
     XCTAssertEqual(events.compactMap(\.1), [])
   }
 
+  func testExplicitActiveSelectionKeepsTheUpstreamMainDisplayFallback() async throws {
+    let recorder = Recorder()
+    var operation = SimulatorHIDOperation(
+      displays: DisplayCommandsDouble([.success(.failed(.unsupported("displayinfo")))]), sink: recorder)
+    try await operation.select(.active)
+    _ = try await operation.send(.tapAt(x: 20, y: 30))
+    try await operation.finish(flushing: true)
+    let events = await recorder.events
+    XCTAssertEqual(events.map(\.0), [.touch(direction: .down, x: 20, y: 30), .touch(direction: .up, x: 20, y: 30)])
+    XCTAssertTrue(events.compactMap(\.1).isEmpty)
+  }
+
   func testNonFiniteTouchWithoutADisplay() async throws {
     let recorder = Recorder()
     var operation = SimulatorHIDOperation(

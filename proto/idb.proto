@@ -797,13 +797,13 @@ message HIDEvent {
 
   // Routes the touch events that follow it in the same `hid` stream to one
   // display's touchscreen, until the stream ends or another HIDDisplay arrives.
-  // Buttons and keys are unaffected. Touches reach only the active integrated
-  // display: selecting a display that is unknown, is not that display or has
-  // no touchscreen fails the stream rather than falling back to the main
-  // screen.
+  // Buttons and keys are unaffected. A nonempty UUID pins touches to the active
+  // integrated display and fails closed if it cannot be matched or routed.
+  // An empty UUID uses the same ACTIVE routing as an omitted selection,
+  // including upstream sole-display and legacy/main-display fallback behavior.
   message HIDDisplay {
-    // A `ListDisplaysResponse.Display.unique_id`. Empty selects the active
-    // integrated display.
+    // A `ListDisplaysResponse.Display.unique_id`, or empty for default ACTIVE
+    // routing. Empty does not require an identified display or force UUID routing.
     string unique_id = 1;
   }
 

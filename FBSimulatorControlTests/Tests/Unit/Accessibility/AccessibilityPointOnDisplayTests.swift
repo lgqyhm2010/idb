@@ -32,7 +32,7 @@ final class AccessibilityPointOnDisplayTests: XCTestCase {
 
   /// Builds a booted simulator whose accessibility commands run against the translator double, which
   /// answers every hit-test with one button.
-  private func setUpSimulator() throws {
+  private func setUpSimulator(displays suppliedDisplays: DisplayCommandsDouble? = nil) throws {
     let fixture = AccessibilityTestFixture.bootedSimulator()
     fixture.rootElement = AccessibilityTestElementBuilder.button(
       withLabel: "OK", identifier: "ok_button", frame: NSRect(x: 200, y: 250, width: 100, height: 100))
@@ -44,7 +44,7 @@ final class AccessibilityPointOnDisplayTests: XCTestCase {
     let display = SimulatorDisplay(
       uniqueID: "inner", name: "Inner", activity: .active, isPrimary: false, isIntegrated: true,
       bounds: CGRect(x: 0, y: 0, width: 2007, height: 2853), scale: 3, rotation: .clockwise)
-    let displays = DisplayCommandsDouble(.selected(display))
+    let displays = suppliedDisplays ?? DisplayCommandsDouble(.selected(display))
     displays.identities.remember([SimulatorAccessibilityDisplay(uniqueID: "inner", displayID: 42)])
     let commands = SimulatorAccessibilityCommands(simulator: sim, translationDispatcher: dispatcher, displays: displays)
     sim.commandCache.register(commands, as: SimulatorAccessibilityCommands.self)
@@ -89,6 +89,75 @@ final class AccessibilityPointOnDisplayTests: XCTestCase {
       .describe(Self.query, options: AccessibilityRequestOptions())
     XCTAssertEqual(response.target, AccessibilityTargetDescriptor.point(CGPoint(x: 251, y: 300)))
     XCTAssertEqual(hitTests, ["objectAtPoint:{300.0,700.0} displayId:42"])
+  }
+
+  func testAXSoleReadRejectsAChangedUUIDAfterSerialization() async throws {
+    try await assertAXReadRejectsDisplayChange(
+      from: .sole(.identified(axDisplay())), to: .sole(.identified(axDisplay(id: "cover"))))
+  }
+
+  func testAXSoleReadRejectsRotationAfterSerialization() async throws {
+    try await assertAXReadRejectsDisplayChange(
+      from: .sole(.identified(axDisplay())), to: .sole(.identified(axDisplay(rotation: .upright))))
+  }
+
+  func testAXCachedSelectedReadRejectsRotationAfterSerialization() async throws {
+    try await assertAXReadRejectsDisplayChange(
+      from: .selected(axDisplay()), to: .selected(axDisplay(rotation: .upright)))
+  }
+
+  func testAXCachedSelectedReadRejectsASwitchToTheSoleAliasAfterSerialization() async throws {
+    try await assertAXReadRejectsDisplayChange(
+      from: .selected(axDisplay()), to: .sole(.identified(axDisplay())))
+  }
+
+  func testAXSelectedReadRejectsAnObservedIdentityChangeBeforeSerializationCompletes() async throws {
+    let displays = DisplayCommandsDouble(.selected(axDisplay()))
+    try setUpSimulator(displays: displays)
+    let element = try await simulator.accessibility.resolveElement(for: Self.query)
+    defer { element.close() }
+    displays.identities.remember([SimulatorAccessibilityDisplay(uniqueID: "inner", displayID: 71)])
+    do {
+      _ = try await element.serialize(with: AccessibilityRequestOptions())
+      XCTFail("A refreshed mapping must invalidate the earlier hit-test")
+    } catch SimulatorDisplayError.changed {}
+    XCTAssertEqual(displays.reads, 2)
+    XCTAssertTrue(fixture?.rootElement?.accessedProperties.contains("accessibilityLabel") == true)
+  }
+
+  private func axDisplay(id: String = "inner", rotation: SimulatorDisplayRotation = .clockwise) -> SimulatorDisplay {
+    SimulatorDisplay(
+      uniqueID: id, name: id, activity: .active, isPrimary: true, isIntegrated: true,
+      bounds: CGRect(x: 0, y: 0, width: 2007, height: 2853), scale: 3, rotation: rotation)
+  }
+
+  private func assertAXReadRejectsDisplayChange(
+    from initial: SimulatorDisplayTarget, to changed: SimulatorDisplayTarget,
+    file: StaticString = #filePath, line: UInt = #line
+  ) async throws {
+    // The first read resolves the query. The next report is only consumed by post-serialization
+    // validation: cached selected identities and the sole alias both avoid inventory round trips.
+    let displays = DisplayCommandsDouble(initial, changed)
+    try setUpSimulator(displays: displays)
+    XCTAssertEqual(displays.identities.accessibilityID(for: "inner"), 42)
+    do {
+      _ = try await simulator.uiAutomation(backend: .accessibility)
+        .describe(Self.query, options: AccessibilityRequestOptions())
+      XCTFail("A display change must not return the earlier snapshot's result", file: file, line: line)
+    } catch SimulatorDisplayError.changed {}
+    XCTAssertEqual(displays.reads, 2, file: file, line: line)
+    XCTAssertEqual(hitTests.count, 1, file: file, line: line)
+    XCTAssertTrue(
+      fixture?.rootElement?.accessedProperties.contains("accessibilityLabel") == true,
+      "Validation runs after attribute serialization, not merely after the initial hit-test", file: file, line: line)
+  }
+
+  func testImplicitAXPointKeepsUpstreamReadBehavior() async throws {
+    let displays = DisplayCommandsDouble(.sole(.identified(axDisplay())), .sole(.identified(axDisplay(id: "cover"))))
+    try setUpSimulator(displays: displays)
+    _ = try await simulator.uiAutomation(backend: .accessibility)
+      .describe(.point(CGPoint(x: 251, y: 300)), options: AccessibilityRequestOptions())
+    XCTAssertEqual(displays.reads, 1, "Post-serialization validation is restricted to explicit UUID queries")
   }
 
   func testAnExternalDisplayUsesItsAccessibilityIdentityWithoutATouchscreen() async throws {

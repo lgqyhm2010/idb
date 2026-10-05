@@ -22,6 +22,7 @@ final class AccessibilityElement {
   private let dispatcher: AXTranslationDispatcher
   private weak var simulator: Simulator?
   private var closed: Bool = false
+  private let validateAfterSerialization: (() async throws -> Void)?
 
   /// The frame of the root this element was found under; `nil` for an element read directly. The
   /// serializer takes screen bounds from the element it is handed, so a descendant needs its root's
@@ -33,13 +34,15 @@ final class AccessibilityElement {
     request: AXTranslationRequest,
     dispatcher: AXTranslationDispatcher,
     simulator: Simulator,
-    rootBounds: CGRect? = nil
+    rootBounds: CGRect? = nil,
+    validateAfterSerialization: (() async throws -> Void)? = nil
   ) {
     self.element = element
     self.request = request
     self.dispatcher = dispatcher
     self.simulator = simulator
     self.rootBounds = rootBounds
+    self.validateAfterSerialization = validateAfterSerialization
   }
 
   deinit {
@@ -67,9 +70,13 @@ final class AccessibilityElement {
     let request = self.request
     let element = self.element
     let isMarkerMatch = self.isMarkerMatch
-    return try await dispatcher.performSerialized {
+    let response = try await dispatcher.performSerialized {
       try request.run(element, options: options, isMarkerMatch: isMarkerMatch)
     }
+    // Explicit display reads must cover the entire attribute traversal, not just the initial hit-test.
+    // Unscoped upstream reads have no validator and retain their existing behavior.
+    try await validateAfterSerialization?()
+    return response
   }
 
   /// Whether this handle names the one element the caller asked for, rather than the tree its request
@@ -196,7 +203,8 @@ final class AccessibilityElement {
       throw WeakTargetError.simulator
     }
     let newHandle = AccessibilityElement(
-      element: match.found, request: request, dispatcher: dispatcher, simulator: simulator, rootBounds: match.rootBounds
+      element: match.found, request: request, dispatcher: dispatcher, simulator: simulator, rootBounds: match.rootBounds,
+      validateAfterSerialization: validateAfterSerialization
     )
     closed = true
     return AccessibilitySearchResult(match: newHandle, diagnostics: result.diagnostics)

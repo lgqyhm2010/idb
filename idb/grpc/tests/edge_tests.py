@@ -6,7 +6,7 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
-from idb.common.hid import drag_to_events, from_edge, swipe_to_events
+from idb.common.hid import MAX_DRAG_SAMPLES, drag_to_events, from_edge, swipe_to_events
 from idb.common.types import (
     HIDDelay,
     HIDDirection,
@@ -117,6 +117,27 @@ class DragTests(TestCase):
         for coordinate in [float("nan"), float("inf")]:
             with self.subTest(coordinate=coordinate), self.assertRaises(ValueError):
                 drag_to_events([(0, 0), (coordinate, 20)])
+
+    def test_excessive_sample_counts_are_rejected_before_allocating(self) -> None:
+        for points, delta in [
+            ([(0, 0), (1000, 0)], 1e-6),
+            ([(0, 0), (60_000, 0), (0, 0)], 1),
+            ([(0, 0), (1, 0)], 1e-320),
+            ([(-1e308, 0), (1e308, 0)], 1),
+            ([(0, 0), (MAX_DRAG_SAMPLES, 0)], 1),
+        ]:
+            with self.subTest(points=points, delta=delta):
+                with self.assertRaises(ValueError):
+                    drag_to_events(points, delta=delta)
+
+    def test_maximum_allowed_sample_count(self) -> None:
+        events = drag_to_events([(0, 0), (MAX_DRAG_SAMPLES - 1, 0)], delta=1)
+        self.assertEqual(len(events), MAX_DRAG_SAMPLES * 2 + 1)
+        self.assertEqual(events[-1].action.point, Point(MAX_DRAG_SAMPLES - 1, 0))
+
+    def test_large_finite_coordinates_do_not_overflow_interpolation(self) -> None:
+        events = drag_to_events([(0, 0), (1e308, 0)], delta=1e307)
+        self.assertEqual(self._points(events)[-1], (1e308, 0))
 
     async def test_the_client_tags_a_drag_with_its_edge(self) -> None:
         client = Client.__new__(Client)

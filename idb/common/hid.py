@@ -115,6 +115,8 @@ def swipe_to_events(
 
 # Points between drag samples when the caller does not say.
 DEFAULT_DRAG_DELTA = 10.0
+# Bound both event-list memory and the size of a single HID stream.
+MAX_DRAG_SAMPLES = 100_000
 
 
 def drag_to_events(
@@ -125,7 +127,8 @@ def drag_to_events(
     """One contact held down along a polyline through `points`, lifted at the
     last. A swipe only goes in a straight line; system gestures such as
     dragging an app by its home indicator to one side of the screen turn a
-    corner. Samples are `delta` points apart and share `duration` evenly."""
+    corner. Samples are `delta` points apart and share `duration` evenly.
+    At most MAX_DRAG_SAMPLES samples (including the first point) are allowed."""
     if len(points) < 2:
         raise ValueError("A drag needs at least two points")
     if not math.isfinite(duration) or duration < 0:
@@ -135,11 +138,25 @@ def drag_to_events(
     if delta is not None and (not math.isfinite(delta) or delta <= 0):
         raise ValueError("A drag delta must be finite and positive")
     step = DEFAULT_DRAG_DELTA if delta is None else delta
-    samples = [points[0]]
+    # Validate the entire path before allocating any interpolated samples.
+    # Finite inputs can still overflow during subtraction or division.
+    counts: list[int] = []
+    sample_count = 1
     for (x0, y0), (x1, y1) in zip(points, points[1:]):
-        count = max(1, math.ceil(math.hypot(x1 - x0, y1 - y0) / step))
+        intervals = math.hypot(x1 - x0, y1 - y0) / step
+        if not math.isfinite(intervals):
+            raise ValueError("Drag sample count must be finite; increase delta")
+        count = max(1, math.ceil(intervals))
+        sample_count += count
+        if sample_count > MAX_DRAG_SAMPLES:
+            raise ValueError(
+                f"A drag allows at most {MAX_DRAG_SAMPLES} samples; increase delta"
+            )
+        counts.append(count)
+    samples = [points[0]]
+    for ((x0, y0), (x1, y1)), count in zip(zip(points, points[1:]), counts):
         samples.extend(
-            (x0 + (x1 - x0) * i / count, y0 + (y1 - y0) * i / count)
+            (x0 + (x1 - x0) * (i / count), y0 + (y1 - y0) * (i / count))
             for i in range(1, count + 1)
         )
     pause = duration / len(samples)

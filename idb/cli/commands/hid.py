@@ -10,6 +10,7 @@ from argparse import ArgumentParser, Namespace
 from idb.cli import ClientCommand
 from idb.cli.commands.displays import add_display_argument, display_kwargs
 from idb.common.hid import (
+    MAX_DRAG_SAMPLES,
     iterator_to_async_iterator,
     key_press_with_modifiers_to_events,
 )
@@ -336,7 +337,8 @@ class DragCommand(ClientCommand):
         )
         parser.add_argument(
             "--delta",
-            help="Points between touch samples along the path",
+            help="Points between touch samples along the path; at most "
+            f"{MAX_DRAG_SAMPLES} samples per drag",
             type=float,
             required=False,
         )
@@ -349,13 +351,16 @@ class DragCommand(ClientCommand):
         if len(coordinates) < 4 or len(coordinates) % 2:
             raise IdbException("drag needs x y pairs for at least two points")
         points = list(zip(coordinates[0::2], coordinates[1::2]))
-        await client.drag(
-            points=points,
-            duration=args.duration,
-            delta=args.delta,
-            **display_kwargs(args),
-            **edge_kwargs(args),
-        )
+        try:
+            await client.drag(
+                points=points,
+                duration=args.duration,
+                delta=args.delta,
+                **display_kwargs(args),
+                **edge_kwargs(args),
+            )
+        except ValueError as error:
+            raise IdbException(str(error)) from error
 
 
 class PinchCommand(ClientCommand):
