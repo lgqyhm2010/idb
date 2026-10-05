@@ -55,6 +55,29 @@ public enum SimulatorOrientationError: Error, LocalizedError, Equatable {
   }
 }
 
+/// The landscape numbering a `SimulatorHIDDeviceOrientation` is written in.
+public enum SimulatorOrientationConvention: Sendable {
+  /// The physical device convention, the one `current()` reads back.
+  case device
+  /// Interface-style landscape numbering, which `idb`'s HID stream has always carried. It differs from
+  /// `device` only on a runtime without device motion, where landscape left and right are swapped.
+  case interface
+}
+
+/// How one rotation is written, given the simulator's backend.
+enum OrientationWrite: Equatable {
+  case vendorHID(SimulatorHIDDeviceOrientation)
+  case purple(SimulatorHIDDeviceOrientation)
+
+  init(_ orientation: SimulatorHIDDeviceOrientation, convention: SimulatorOrientationConvention, backend: OrientationWriteBackend) {
+    switch (backend, convention) {
+    case (.vendorHID, _): self = .vendorHID(orientation)
+    case (.purple, .device): self = .purple(orientation.physicalPurpleOrientation)
+    case (.purple, .interface): self = .purple(orientation)
+    }
+  }
+}
+
 public struct SimulatorOrientationCommands {
   private let simulator: Simulator
 
@@ -63,21 +86,44 @@ public struct SimulatorOrientationCommands {
   }
 
   /// Sets physical device orientation using the same landscape convention as `current()`.
-  public func setOrientation(_ orientation: SimulatorDeviceOrientation) async throws {
-    let hidOrientation = try orientation.hidOrientation
-    try await simulator.hid.connect().sendOrientation(hidOrientation, legacyPurpleEncoding: false)
+  public func set(_ orientation: SimulatorDeviceOrientation) async throws {
+    try await set(orientation.hidOrientation, convention: .device)
+  }
+
+  /// Sets physical device orientation, then waits within `timeout` for `current()` to read it back and for the
+  /// displays to settle, returning a `.transitioning` configuration when they outlast the budget. The foreground
+  /// application may rotate its interface later, or not at all; follow `SimulatorDisplayCommands.configurations()`
+  /// to see it.
+  public func set(
+    _ orientation: SimulatorDeviceOrientation, confirmingWithin timeout: Duration
+  ) async throws
+    -> SimulatorDisplayConfiguration
+  {
+    try await set(orientation, confirmingWithin: timeout, interval: .milliseconds(100))
+  }
+
+  /// Rotates through the backend the simulator's motion capabilities select: vendor HID where the
+  /// runtime reports device motion, Purple otherwise.
+  public func set(_ orientation: SimulatorHIDDeviceOrientation, convention: SimulatorOrientationConvention) async throws {
+    let backend = try await MotionCapabilities.resolve(on: simulator).orientationWriteBackend
+    switch OrientationWrite(orientation, convention: convention, backend: backend) {
+    case let .vendorHID(orientation):
+      try await simulator.hid.vendorDefined.send(orientation.vendorEvent())
+    case let .purple(orientation):
+      try await simulator.purpleHID.sendOrientation(orientation)
+    }
   }
 
   public func current() async throws -> SimulatorDeviceOrientation {
-    do {
-      try await SimulatorMotionCapability.deviceMotionState.requireSupported(on: simulator)
-    } catch SimulatorCoreDeviceError.unsupported {
+    switch try await MotionCapabilities.resolve(on: simulator).orientationReadBackend {
+    case .legacyService:
       return try await SimulatorOrientationProtocol.read(on: simulator)
+    case .guestMotionState:
+      // A fresh guest client reads the motion provider's current state, including rotations made
+      // outside this process.
+      let output = try await simulator.runSimulatorFrameworkBridge(withService: "orientation", action: "get")
+      return try Self.decodeMotionState(output)
     }
-    // The CoreDevice motion stream may replay an old daemon snapshot. A fresh guest client reads
-    // the motion provider's current state, including rotations made outside this process.
-    let output = try await simulator.runSimulatorFrameworkBridge(withService: "orientation", action: "get")
-    return try Self.decodeMotionState(output)
   }
 
   static func decodeMotionState(_ output: String) throws -> SimulatorDeviceOrientation {
@@ -87,4 +133,12 @@ public struct SimulatorOrientationCommands {
     let state = try JSONDecoder().decode(State.self, from: Data(output.utf8))
     return try SimulatorDeviceOrientation.motionState(state.orientation)
   }
+}
+
+extension SimulatorOrientationCommands: PoseCommands {
+  var displays: any DisplayCommands { simulator.displays }
+
+  func reached(_ value: SimulatorDeviceOrientation, target: SimulatorDeviceOrientation) -> Bool { value == target }
+
+  func pose(_ value: SimulatorDeviceOrientation) -> SimulatorPose { .orientation(value) }
 }

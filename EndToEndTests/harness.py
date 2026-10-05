@@ -6,7 +6,8 @@
 """Run idb commands through one shared companion against a booted simulator.
 
 The caller supplies DEVICE_UDID, DEVICE_SET_PATH, IDB_BIN,
-IDB_E2E_COMPANION_PATH and IDB_E2E_RECORDER_PATH. The harness starts the companion
+IDB_E2E_COMPANION_PATH and IDB_E2E_RECORDER_PATH, and IDB_E2E_REPL_PATH for the
+tests that drive idb-repl. The harness starts the companion
 and applies the configured suite capability; it does not manage the simulator lifecycle.
 """
 
@@ -31,8 +32,9 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, BinaryIO, Callable, NoReturn, TypeVar
 
@@ -53,10 +55,12 @@ IDB_E2E_COMPANION_PATH_ENV = "IDB_E2E_COMPANION_PATH"
 IDB_SETUP_BIN_ENV = "IDB_SETUP_BIN"
 SUITE_CAPABILITY_ENV = "IDB_E2E_SUITE_CAPABILITY"
 IDB_E2E_RECORDER_PATH_ENV = "IDB_E2E_RECORDER_PATH"
+IDB_E2E_REPL_PATH_ENV = "IDB_E2E_REPL_PATH"
 STRICT_ENV = "IDB_E2E_STRICT"
 ARTIFACTS_ENV = "IDB_E2E_ARTIFACTS_DIR"
 ROUTE_ATTESTATION_ENV = "IDB_E2E_ROUTER_ATTESTATION"
 EXPECTED_IMPLEMENTATION_ENV = "IDB_E2E_EXPECTED_IMPLEMENTATION"
+CLAIM_KIND_ENV = "IDB_E2E_CLAIM_KIND"
 
 T = TypeVar("T")
 
@@ -75,7 +79,8 @@ HOST_SERVICE_UNAVAILABLE_MARKERS = (
 # Match the connection error emitted by idb/grpc/client.py.
 COMPANION_UNREACHABLE_MARKERS = ("Failed to connect to companion",)
 
-# This accessibility error is retryable while the simulator starts.
+# The simulator had no accessibility translation object: nothing was read or
+# written. Retryable while the simulator starts, and for a read at any time.
 ACCESSIBILITY_NOT_READY_MARKER = "No translation object returned"
 ACCESSIBILITY_PROBE_ARGS = ("ui", "describe-all", "--json")
 
@@ -86,16 +91,29 @@ UNANSWERED = re.compile(
     r"which did not answer in time"
 )
 NOTHING_WRITTEN_MARKER = "nothing was written. Read the tree again and retry"
-# The commands that can be repeated when idb cannot say whether they ran: reads,
-# and a write that sets a value rather than adding to one.
-REPEATABLE_COMMANDS = frozenset(
+ELEMENT_NOT_FOUND_MARKER = "found no element whose"
+# SpringBoard's permission prompts vary their buttons by service and by app --
+# Photos offers "Limit Access…" and "Allow Full Access" where camera offers a
+# plain "Allow" -- but every shape offers this one.
+PERMISSION_PROMPT_DENY_LABELS = frozenset({"Don’t Allow", "Don't Allow"})
+UI_UPDATE_TIMEOUT_SECONDS = 30.0
+# The least a wait gives one read, so one begun as the wait's time runs out can
+# still answer.
+MIN_READ_TIMEOUT_SECONDS = 10.0
+# Consecutive reads that must agree on an element's frame before it has
+# settled. Fewer than the three JestE2E asks for, since SpringBoard withdraws
+# a notification banner about eight seconds after it arrives.
+SETTLED_READS = 2
+READ_COMMANDS = frozenset(
     {
         ("ui", "describe"),
         ("ui", "describe-all"),
         ("ui", "describe-point"),
-        ("ui", "set-value"),
     }
 )
+# The commands that can be repeated when idb cannot say whether they ran: reads,
+# and a write that sets a value rather than adding to one.
+REPEATABLE_COMMANDS = READ_COMMANDS | {("ui", "set-value")}
 
 POLL_INTERVAL_SECONDS = 1.0
 TRANSIENT_ANSWER_TIMEOUT_SECONDS = 60.0
@@ -103,8 +121,15 @@ TRANSIENT_ANSWER_TIMEOUT_SECONDS = 60.0
 COMPANION_READY_TIMEOUT_SECONDS = 180.0
 ACCESSIBILITY_READY_TIMEOUT_SECONDS = 180.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
+# The first injection compiles a dylib with swiftc, which takes far longer
+# than any idb command.
+REPL_COMMAND_TIMEOUT_SECONDS = 300.0
 INSTALL_TIMEOUT_SECONDS = 300.0
 ROUTE_ATTESTATION_TIMEOUT_SECONDS = 10.0
+APP_STATE_TIMEOUT_SECONDS = 60.0
+# Well above what a healthy simctl read takes, and short enough to leave an
+# app-state wait time to try again after one that hangs.
+SIMCTL_POLL_TIMEOUT_SECONDS = 20.0
 PROCESS_GROUP_GRACE_SECONDS = 2.0
 
 
@@ -145,12 +170,20 @@ class HarnessError(Exception):
     """Test setup or a harness operation failed."""
 
 
+class CommandTimedOut(HarnessError):
+    """A command did not finish within its timeout and was killed."""
+
+
 class CompanionDied(HarnessError):
     """The shared companion exited; stop the remaining tests."""
 
 
 class NotReady(Exception):
     """Retry this poll because the expected condition is not met yet."""
+
+
+class NoExactMatch(NotReady):
+    """A read answered, but with no element exactly the one a query is for."""
 
 
 class Deadline:
@@ -242,12 +275,15 @@ def worth_repeating(args: Sequence[str], completed: Completed) -> bool:
 
     Nothing was written, so anything can be repeated. An application that did
     not answer leaves a write's outcome unknown, so only a command that does
-    the same thing when run twice can be.
+    the same thing when run twice can be. A tree that was not ready yet is
+    repeated only for a read, since a write's target may not be where it was.
     """
     if completed.returncode == 0:
         return False
     if NOTHING_WRITTEN_MARKER in completed.error_text:
         return True
+    if ACCESSIBILITY_NOT_READY_MARKER in completed.error_text:
+        return tuple(args[:2]) in READ_COMMANDS
     return (
         UNANSWERED.search(completed.error_text) is not None
         and tuple(args[:2]) in REPEATABLE_COMMANDS
@@ -258,14 +294,27 @@ def strict() -> bool:
     return os.environ.get(STRICT_ENV) == "1"
 
 
-def expected_implementation() -> str | None:
-    value = os.environ.get(EXPECTED_IMPLEMENTATION_ENV)
+def expected_implementation(
+    *, required: bool = False, override: str | None = None
+) -> str | None:
+    value = (
+        override
+        if override is not None
+        else os.environ.get(EXPECTED_IMPLEMENTATION_ENV)
+    )
     if value is None:
+        if required:
+            raise HarnessError(
+                f"{EXPECTED_IMPLEMENTATION_ENV} is not set; route attestation is mandatory"
+            )
         return None
     if value not in {"python", "rust"}:
-        raise HarnessError(
-            f"{EXPECTED_IMPLEMENTATION_ENV}={value!r} is not 'python' or 'rust'"
+        source = (
+            "expected implementation"
+            if override is not None
+            else EXPECTED_IMPLEMENTATION_ENV
         )
+        raise HarnessError(f"{source}={value!r} is not 'python' or 'rust'")
     return value
 
 
@@ -282,6 +331,16 @@ def verify_route_attestation(path: Path, expected: str) -> None:
         raise NotReady(f"the route attestation file is not complete at {path}")
     if actual != expected:
         raise HarnessError(f"the {expected} lane executed the {actual} sidecar")
+
+
+def require_route_attestation(path: Path, expected: str) -> None:
+    """Verify a final attestation where a pending value is a terminal failure."""
+    try:
+        verify_route_attestation(path, expected)
+    except NotReady as error:
+        raise HarnessError(
+            f"the {expected} lane did not complete route attestation at {path}: {error}"
+        ) from None
 
 
 def suite_capability() -> SuiteCapability:
@@ -413,12 +472,157 @@ async def run(
             await _terminate_run_process_reliably(process, communication, argv)
             raise
         if timed_out:
-            raise HarnessError(
+            raise CommandTimedOut(
                 f"{' '.join(argv)} did not finish within {timeout:.0f}s"
             ) from None
         stdout.seek(0)
         stderr.seek(0)
         return Completed(process.returncode or 0, stdout.read(), stderr.read())
+
+
+async def run_attested_client(
+    argv: Sequence[str],
+    timeout: float,
+    stdin: bytes | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    expected: str | None = None,
+    attestation_path: Path | None = None,
+    required: bool = False,
+) -> Completed:
+    """Run one command with a fresh route attestation when configured."""
+    implementation = expected_implementation(required=required, override=expected)
+    if implementation is None:
+        if env is None:
+            return await run(argv, timeout=timeout, stdin=stdin)
+        return await run(argv, timeout=timeout, stdin=stdin, env=env)
+
+    async def run_at(attestation: Path) -> Completed:
+        if attestation.exists():
+            raise HarnessError(
+                f"stale route attestation already existed at {attestation}"
+            )
+        child_environment = dict(os.environ) if env is None else dict(env)
+        child_environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+        completed = await run(
+            argv,
+            timeout=timeout,
+            stdin=stdin,
+            env=child_environment,
+        )
+        try:
+            verify_route_attestation(attestation, implementation)
+        except NotReady as error:
+            raise HarnessError(
+                f"the {implementation} lane exited before completing route attestation at "
+                f"{attestation}: {error}; client return code {completed.returncode}; "
+                f"stderr: {completed.error_text or '<empty>'}"
+            ) from None
+        return completed
+
+    if attestation_path is not None:
+        return await run_at(attestation_path)
+    with tempfile.TemporaryDirectory(prefix="idb-e2e-route-") as directory:
+        return await run_at(Path(directory) / "selected")
+
+
+async def wait_for_route_attestation(
+    path: Path,
+    expected: str,
+    process: IdbProcess,
+    timeout: float = ROUTE_ATTESTATION_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for a live process to atomically attest its selected route."""
+    deadline = Deadline(timeout)
+    while True:
+        try:
+            actual = path.read_text().strip()
+        except FileNotFoundError:
+            actual = None
+        except OSError as error:
+            raise HarnessError(
+                f"the {expected} lane route attestation at {path} could not be read: "
+                f"{error}"
+            ) from error
+        if actual:
+            if actual != expected:
+                raise HarnessError(f"the {expected} lane executed the {actual} sidecar")
+            if process.returncode is not None:
+                stderr = process.stderr_capture.tail.decode(errors="replace")
+                raise HarnessError(
+                    f"the {expected} lane exited with {process.returncode} immediately "
+                    f"after route attestation; stderr: {stderr or '<empty>'}"
+                )
+            return
+        if process.returncode is not None:
+            stderr = process.stderr_capture.tail.decode(errors="replace")
+            raise HarnessError(
+                f"the {expected} lane exited with {process.returncode} before route "
+                f"attestation; stderr: {stderr or '<empty>'}"
+            )
+        if deadline.passed:
+            detail = "only an empty" if actual == "" else "no"
+            raise HarnessError(
+                f"the {expected} lane produced {detail} route attestation at {path} "
+                f"within {timeout:.0f}s"
+            )
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def attested_process(
+    argv: Sequence[str],
+    what: str,
+    *,
+    display_argv: Sequence[str] | None = None,
+    failure: Callable[[str], NoReturn] | None = None,
+    recording: Recording | None = None,
+    config: IdbProcessConfig | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    required: bool = False,
+    attestation_timeout: float = ROUTE_ATTESTATION_TIMEOUT_SECONDS,
+) -> AsyncIterator[IdbProcess]:
+    """Construct and clean up one process with fresh route attestation."""
+    expected = expected_implementation(required=required)
+    if expected is None:
+        async with IdbProcess(
+            argv,
+            what,
+            display_argv=display_argv,
+            failure=failure,
+            recording=recording,
+            config=config,
+            env=env,
+            cwd=cwd,
+        ) as process:
+            yield process
+        return
+    with tempfile.TemporaryDirectory(prefix="idb-e2e-route-") as directory:
+        attestation = Path(directory) / "selected"
+        if attestation.exists():
+            raise HarnessError(
+                f"stale route attestation already existed at {attestation}"
+            )
+        child_environment = dict(os.environ) if env is None else dict(env)
+        child_environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+        async with IdbProcess(
+            argv,
+            what,
+            display_argv=display_argv,
+            failure=failure,
+            recording=recording,
+            config=config,
+            env=child_environment,
+            cwd=cwd,
+        ) as process:
+            await wait_for_route_attestation(
+                attestation,
+                expected,
+                process,
+                timeout=attestation_timeout,
+            )
+            yield process
 
 
 class Simctl:
@@ -440,18 +644,22 @@ class Simctl:
             return None
         return _device_states(json.loads(completed.stdout)).get(self.udid)
 
-    async def installed_bundle_ids(self) -> set[str]:
-        completed = await self.run("listapps", self.udid)
+    async def installed_bundle_ids(self, timeout: float = 60.0) -> set[str]:
+        completed = await self.run("listapps", self.udid, timeout=timeout)
         if completed.returncode != 0:
             raise HarnessError(
                 f"simctl listapps failed (rc={completed.returncode}): {completed.error_text}"
             )
         # listapps writes an old-style plist, which json cannot read.
-        converted = await run(
-            ["plutil", "-convert", "json", "-o", "-", "-"],
-            timeout=60.0,
-            stdin=completed.stdout,
-        )
+        try:
+            converted = await run(
+                ["plutil", "-convert", "json", "-o", "-", "-"],
+                timeout=60.0,
+                stdin=completed.stdout,
+            )
+        except CommandTimedOut as timed_out:
+            # Only a hung simctl is worth another poll, so a hung plutil must not read as one.
+            raise HarnessError(str(timed_out)) from None
         if converted.returncode != 0:
             raise HarnessError(
                 f"simctl listapps output could not be converted to JSON "
@@ -459,8 +667,10 @@ class Simctl:
             )
         return set(json.loads(converted.stdout).keys())
 
-    async def running_bundle_ids(self) -> set[str]:
-        completed = await self.run("spawn", self.udid, "launchctl", "list")
+    async def running_bundle_ids(self, timeout: float = 60.0) -> set[str]:
+        completed = await self.run(
+            "spawn", self.udid, "launchctl", "list", timeout=timeout
+        )
         if completed.returncode != 0:
             raise HarnessError(
                 f"simctl could not list the simulator's services "
@@ -479,6 +689,17 @@ class Simctl:
         if not path:
             raise HarnessError(f"simctl reported no {kind} container for {bundle_id}")
         return Path(path)
+
+
+class AppState(enum.Enum):
+    """What an app is, as simctl reports it independently of idb."""
+
+    # launchctl lists a live UIKitApplication job for it, or does not.
+    RUNNING = "running"
+    STOPPED = "stopped"
+    # simctl listapps includes it, or does not.
+    INSTALLED = "installed"
+    ABSENT = "absent"
 
 
 # A stopped launchd job remains in the listing with `-` instead of a PID. Only
@@ -511,6 +732,8 @@ class Environment:
         setup_idb_bin: Path,
         companion_path: Path,
         recorder_path: Path,
+        protected_package: tempfile.TemporaryDirectory[str] | None = None,
+        repl_path: Path | None = None,
     ) -> None:
         self.udid = udid
         self.device_set_path = device_set_path
@@ -519,6 +742,8 @@ class Environment:
         self.setup_idb_bin = setup_idb_bin
         self.companion_path = companion_path
         self.recorder_path = recorder_path
+        self.repl_path = repl_path
+        self._protected_package = protected_package
         self.simctl = Simctl(udid, device_set_path)
 
     @property
@@ -532,10 +757,15 @@ class Environment:
     @classmethod
     async def resolve(cls) -> "Environment":
         idb_bin = _binary_from_environment(IDB_BIN_ENV)
+        protected_package = None
+        if os.environ.get(CLAIM_KIND_ENV) == "synthetic_installed":
+            idb_bin, protected_package = _protect_synthetic_package(idb_bin)
         idb_args = shlex.split(os.environ.get(IDB_ARGS_ENV, ""))
         setup_idb_bin = _optional_binary_from_environment(IDB_SETUP_BIN_ENV, idb_bin)
         companion_path = _binary_from_environment(IDB_E2E_COMPANION_PATH_ENV)
         recorder_path = _binary_from_environment(IDB_E2E_RECORDER_PATH_ENV)
+        repl = os.environ.get(IDB_E2E_REPL_PATH_ENV)
+        repl_path = _executable(Path(repl), IDB_E2E_REPL_PATH_ENV) if repl else None
         udid = _required(DEVICE_UDID_ENV, "the booted simulator to test against")
         device_set_path = Path(
             _required(DEVICE_SET_PATH_ENV, f"the device set {DEVICE_UDID_ENV} lives in")
@@ -563,6 +793,8 @@ class Environment:
             setup_idb_bin,
             companion_path,
             recorder_path,
+            protected_package,
+            repl_path,
         )
 
 
@@ -580,6 +812,36 @@ def _optional_binary_from_environment(name: str, default: Path) -> Path:
 
 def _binary_from_environment(name: str) -> Path:
     return _executable(Path(_required(name, "a binary this suite drives")), name)
+
+
+def _protect_synthetic_package(
+    idb_bin: Path,
+) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
+    temporary = tempfile.TemporaryDirectory(
+        prefix="idb-e2e-package-", dir=Path("/tmp").resolve()
+    )
+    package = Path(temporary.name) / "bin"
+    package.mkdir()
+    try:
+        for source in idb_bin.parent.iterdir():
+            if source.is_file():
+                shutil.copy2(source, package / source.name)
+        for name in (
+            "idb",
+            "idb-python",
+            "idb-router-engine",
+            "idb-router-guard",
+            "idb-rust",
+        ):
+            child = package / name
+            if not child.is_file():
+                raise HarnessError(f"the synthetic package has no {name} executable")
+            child.chmod(0o555)
+        package.chmod(0o555)
+    except BaseException:
+        temporary.cleanup()
+        raise
+    return package / idb_bin.name, temporary
 
 
 def on_disk_path(path: Path) -> Path:
@@ -633,6 +895,125 @@ def _prepare_artifact_file(path: Path) -> None:
     # Older companions preserve an existing mode but create logs too narrowly
     # for the remote artifact uploader to read after the test exits.
     path.chmod(0o644)
+
+
+HOST_LOAD_FILE_NAME = "host-load.txt"
+HOST_LOAD_INTERVAL_SECONDS = 5.0
+HOST_LOAD_SAMPLE_TIMEOUT_SECONDS = 30.0
+# Two samples a second apart, because top's first sample has no per-process CPU.
+HOST_LOAD_ARGV = (
+    "top",
+    "-l",
+    "2",
+    "-s",
+    "1",
+    "-o",
+    "cpu",
+    "-n",
+    "15",
+    "-stats",
+    "pid,command,cpu,mem",
+)
+
+
+def last_top_sample(output: bytes) -> bytes:
+    start = output.rfind(b"Processes:")
+    return output if start < 0 else output[start:]
+
+
+def sample_top() -> bytes:
+    try:
+        completed = subprocess.run(
+            HOST_LOAD_ARGV,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=HOST_LOAD_SAMPLE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return f"top did not finish within {HOST_LOAD_SAMPLE_TIMEOUT_SECONDS:.0f}s\n".encode()
+    except OSError as error:
+        return f"top could not run: {error}\n".encode()
+    if completed.returncode != 0:
+        return (
+            f"top failed (rc={completed.returncode}): ".encode()
+            + completed.stderr
+            + b"\n"
+        )
+    return last_top_sample(completed.stdout)
+
+
+class HostLoad:
+    """Record the host's CPU, memory and busiest processes throughout the run.
+
+    A simulator that stalls otherwise looks the same as a host that has run out
+    of CPU or memory. Sampled from a thread, because each test replaces the
+    event loop.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        sample: Callable[[], bytes] = sample_top,
+        interval: float = HOST_LOAD_INTERVAL_SECONDS,
+    ) -> None:
+        _prepare_artifact_file(path)
+        self.path = path
+        self._sample = sample
+        self._interval = interval
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="host-load", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        warned = False
+        while True:
+            taken = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            sample = self._sample()
+            try:
+                with self.path.open("ab") as log:
+                    log.write(f"=== {taken}\n".encode() + sample)
+            except OSError as error:
+                # A write can fail transiently, e.g. on a full disk; keep sampling.
+                if not warned:
+                    _LOGGER.warning(
+                        "Could not record host load to %s: %s", self.path, error
+                    )
+                    warned = True
+            if self._stopping.wait(self._interval):
+                return
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._thread.join(timeout=HOST_LOAD_SAMPLE_TIMEOUT_SECONDS)
+
+
+# Without a push certificate, as on a CI host, apsd reconnects to Apple's push
+# service without backing off: a third of the simulator's log and a steady share
+# of a core for the whole run. Pushes sent through simctl do not go through it.
+PUSH_SERVICE_TARGET = "system/com.apple.apsd"
+PUSH_SERVICE_STOP_TIMEOUT_SECONDS = 30.0
+
+
+async def stop_push_service(simctl: Simctl) -> None:
+    """Stop apsd in the simulator, carrying on with a warning if it can't be."""
+    try:
+        completed = await simctl.run(
+            "spawn",
+            simctl.udid,
+            "launchctl",
+            "bootout",
+            PUSH_SERVICE_TARGET,
+            timeout=PUSH_SERVICE_STOP_TIMEOUT_SECONDS,
+        )
+    except HarnessError as error:
+        _LOGGER.warning("Could not stop apsd in the simulator: %s", error)
+        return
+    if completed.returncode != 0:
+        _LOGGER.warning(
+            "Could not stop apsd in the simulator (rc=%d): %s",
+            completed.returncode,
+            completed.error_text,
+        )
 
 
 class Companion:
@@ -822,6 +1203,7 @@ async def wait_for_accessibility(
 _environment: Environment | None = None
 _companion: Companion | None = None
 _recording: Recording | None = None
+_host_load: HostLoad | None = None
 _acquisition_failure: BaseException | None = None
 
 
@@ -836,7 +1218,18 @@ async def shared_environment() -> Environment:
         except BaseException as error:
             _acquisition_failure = error
             raise
+        _start_host_load()
+        await stop_push_service(_environment.simctl)
     return _environment
+
+
+def _start_host_load() -> None:
+    global _host_load
+    artifacts = artifact_directory()
+    if _host_load is not None or artifacts is None:
+        return
+    _host_load = HostLoad(artifacts / HOST_LOAD_FILE_NAME)
+    atexit.register(_host_load.stop)
 
 
 async def shared_companion() -> Companion:
@@ -874,7 +1267,7 @@ async def shared_recording(environment: Environment, companion: Companion) -> Re
             companion.directory.name,
             os.environ.get(ENCODING_ENV) or "auto",
         )
-        atexit.register(_recording.trace.close)
+        atexit.register(_recording.close_logs)
         atexit.register(_recording.stop)
         await _recording.wait_until_ready()
     return _recording
@@ -940,12 +1333,364 @@ class LocalPages:
         self._thread = None
 
 
+def _elements(node: Any) -> list[dict[str, Any]]:
+    """Flatten flat, nested and complete accessibility output into its elements.
+
+    Only a document's `elements` and an element's `children` hold elements. Other
+    dictionaries can carry an identifier and a frame without being one, such as
+    the element that `interactable` says takes a touch aimed at this one.
+    """
+    if isinstance(node, list):
+        return [element for child in node for element in _elements(child)]
+    if not isinstance(node, dict):
+        return []
+    if "elements" in node:
+        return _elements(node["elements"])
+    return [node, *_elements(node.get("children"))]
+
+
+def _placed(
+    node: Any, ancestors: tuple[dict[str, Any], ...] = ()
+) -> list[tuple[dict[str, Any], tuple[dict[str, Any], ...]]]:
+    """Every element of accessibility output, with the elements it sits inside."""
+    if isinstance(node, list):
+        return [placed for child in node for placed in _placed(child, ancestors)]
+    if not isinstance(node, dict):
+        return []
+    if "elements" in node:
+        return _placed(node["elements"], ancestors)
+    return [(node, ancestors), *_placed(node.get("children"), (*ancestors, node))]
+
+
+def _describe_matches(document: Any, matches: Callable[[dict[str, Any]], bool]) -> str:
+    """Every element of `document` that `matches` accepts, and how they differ.
+
+    Elements that share an identifier can be a control and a container around
+    it, or one element the tree reports twice. Where each sits, and every field
+    the matches report differently, are what tell those apart.
+    """
+    found = [placed for placed in _placed(document) if matches(placed[0])]
+    lines = [f"{len(found)} matching element{'' if len(found) == 1 else 's'}:"]
+    for index, (element, ancestors) in enumerate(found, 1):
+        path = " > ".join(str(ancestor.get("type")) for ancestor in ancestors)
+        line = f"  [{index}] under {path or 'the root'}"
+        for other, (container, _) in enumerate(found, 1):
+            if ancestors and container is ancestors[-1]:
+                line += f", a child of [{other}]"
+            elif any(container is ancestor for ancestor in ancestors):
+                line += f", inside [{other}]"
+        lines.append(line)
+    fields = [
+        {key: value for key, value in element.items() if key != "children"}
+        for element, _ in found
+    ]
+    keys = list(dict.fromkeys(key for own in fields for key in own))
+    differing = [
+        key
+        for key in keys
+        if len({json.dumps(own.get(key), sort_keys=True) for own in fields}) > 1
+    ]
+    if len(found) == 1:
+        differing = keys
+    elif differing:
+        lines.append("They differ in:")
+    for key in differing:
+        values = " ".join(
+            f"[{index}] {json.dumps(own.get(key), sort_keys=True)}"
+            for index, own in enumerate(fields, 1)
+        )
+        lines.append(f"  {key}: {values}")
+    agreeing = [key for key in keys if key not in differing]
+    if agreeing:
+        lines.append(f"They agree on: {', '.join(agreeing)}")
+    return "\n".join(lines)
+
+
+def _label(element: dict[str, Any]) -> str:
+    """Read the label from legacy output (AXLabel) or complete output (label)."""
+    for key in ("AXLabel", "label"):
+        value = element.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _has_area(element: dict[str, Any]) -> bool:
+    frame = element.get("frame")
+    return (
+        isinstance(frame, dict)
+        and bool(frame.get("width"))
+        and bool(frame.get("height"))
+    )
+
+
+def _screen(document: Any) -> dict[str, float] | None:
+    """The bounds of the screen everything in a document sits on.
+
+    A complete document says which screen it was read from. One that does not
+    is measured by its largest frame, which is only the screen when the tree
+    holds nothing larger: a list's background can extend well above the
+    window, and the application's own frame can be reported in pixels.
+    """
+    reported = document.get("screen") if isinstance(document, dict) else None
+    if isinstance(reported, dict) and reported.get("width") and reported.get("height"):
+        return {
+            "x": 0.0,
+            "y": 0.0,
+            "width": float(reported["width"]),
+            "height": float(reported["height"]),
+        }
+    frames = [element["frame"] for element in _elements(document) if _has_area(element)]
+    if not frames:
+        return None
+    return max(frames, key=lambda frame: frame["width"] * frame["height"])
+
+
+def _on_screen(element: dict[str, Any], screen: dict[str, float] | None) -> bool:
+    """Something a viewer can see: it has area, is not hidden, and is on the screen.
+
+    The accessibility tree holds what an app has built, not what is in front of
+    the viewer: a row scrolled out of the window, a zero-sized placeholder and a
+    hidden element are all in it. A demo is a recording of a screen, so what it
+    claims to show has to be on that screen.
+    """
+    if screen is None or not _has_area(element) or element.get("hidden") is True:
+        return False
+    frame = element["frame"]
+    return (
+        frame["x"] < screen["x"] + screen["width"]
+        and frame["y"] < screen["y"] + screen["height"]
+        and frame["x"] + frame["width"] > screen["x"]
+        and frame["y"] + frame["height"] > screen["y"]
+    )
+
+
+def _wholly_on_screen(element: dict[str, Any], screen: dict[str, float] | None) -> bool:
+    """On the screen from edge to edge, so a touch at its centre lands on it.
+
+    A banner sliding in, or a row half scrolled away, overlaps the screen
+    while its centre is still off it.
+    """
+    if not _on_screen(element, screen):
+        return False
+    assert screen is not None
+    frame = element["frame"]
+    return (
+        frame["x"] >= screen["x"]
+        and frame["y"] >= screen["y"]
+        and frame["x"] + frame["width"] <= screen["x"] + screen["width"]
+        and frame["y"] + frame["height"] <= screen["y"] + screen["height"]
+    )
+
+
+def _center(element: dict[str, Any]) -> tuple[int, int]:
+    frame = element["frame"]
+    return (
+        int(frame["x"] + frame["width"] / 2),
+        int(frame["y"] + frame["height"] / 2),
+    )
+
+
+def _permission_prompt_deny_button(document: Any) -> dict[str, Any] | None:
+    for element in _elements(document):
+        if (
+            element.get("role") == "AXButton"
+            and _label(element) in PERMISSION_PROMPT_DENY_LABELS
+            and _has_area(element)
+        ):
+            return element
+    return None
+
+
+class MatchKey(enum.Enum):
+    """An accessibility key a query matches, and the field a complete read reports it in."""
+
+    IDENTIFIER = ("AXUniqueId", "identifier")
+    LABEL = ("AXLabel", "label")
+
+    def __init__(self, flag: str, field: str) -> None:
+        self.flag = flag
+        self.field = field
+
+
+class AccessibilityApi(enum.Enum):
+    AX = "ax"
+    AXBRIDGE = "axbridge"
+
+
+class Until(enum.Enum):
+    """What an element has to be before a wait for it is over."""
+
+    PRESENT = "reported"
+    ON_SCREEN = "wholly on screen"
+    # Wholly on screen, with the same frame on SETTLED_READS reads in a row.
+    SETTLED = "settled on screen"
+
+
+@dataclass(frozen=True)
+class Describe:
+    """Find an element by polling `ui describe`, every answer to which carries it."""
+
+
+@dataclass(frozen=True)
+class UiWait:
+    """Let `ui wait` find an element first, through `api` or else the query's own.
+
+    `ui wait` only answers whether the element is there, so `ui describe`
+    reads still decide everything else.
+    """
+
+    api: AccessibilityApi | None = None
+
+
+# How a wait finds an element before reading it.
+Lookup = Describe | UiWait
+DESCRIBE = Describe()
+
+
+@dataclass(frozen=True)
+class Query:
+    """One element, as a wait addresses it."""
+
+    value: str
+    match_key: MatchKey = MatchKey.IDENTIFIER
+    element_type: str | None = None
+    api: AccessibilityApi = AccessibilityApi.AXBRIDGE
+
+    @property
+    def marker_args(self) -> tuple[str, ...]:
+        return (
+            self.value,
+            "--match-key",
+            self.match_key.flag,
+            "--api",
+            self.api.value,
+        )
+
+    def matches(self, element: dict[str, Any]) -> bool:
+        """`ui describe` matches a substring; a query is for exactly this element."""
+        return element.get(self.match_key.field) == self.value and (
+            self.element_type is None or element.get("type") == self.element_type
+        )
+
+    def describe_keys(self, keys: Sequence[str]) -> tuple[str, ...]:
+        """`keys`, with what `matches` and a frame check read added.
+
+        `--key` drops every attribute not asked for, so a narrowed read has to
+        ask for these too or no element in it could match.
+        """
+        if not keys:
+            return ()
+        needed = (self.match_key.flag, "frame") + (
+            ("type",) if self.element_type is not None else ()
+        )
+        return tuple(dict.fromkeys((*keys, *needed)))
+
+    def __str__(self) -> str:
+        return (
+            f"the {self.element_type or 'element'} whose "
+            f"{self.match_key.flag} is {self.value!r}"
+        )
+
+
+@dataclass(frozen=True)
+class Found:
+    """An element, and the read of it that ended a wait."""
+
+    element: dict[str, Any]
+    document: dict[str, Any]
+
+
+class UnexpectedAnswer(Exception):
+    """A read failed for a reason waiting longer would not change."""
+
+    def __init__(self, completed: Completed) -> None:
+        super().__init__(completed.error_text)
+        self.completed = completed
+
+
+class ElementWait:
+    """What successive reads of one query have shown, against the condition a wait needs."""
+
+    def __init__(self, query: Query, until: Until) -> None:
+        self.query = query
+        self.until = until
+        self._frame: dict[str, Any] | None = None
+        self._agreeing = 0
+
+    def observe(self, completed: Completed) -> Found:
+        """The element and its read, once the reads so far satisfy the condition.
+
+        Raises NotReady while they do not, and UnexpectedAnswer for a failure
+        that is neither a missing element nor a transient answer.
+        """
+        if completed.returncode != 0:
+            if ELEMENT_NOT_FOUND_MARKER in completed.error_text:
+                self._agreeing = 0
+                raise NotReady(f"{self.query} is not reported")
+            if worth_repeating(("ui", "describe"), completed):
+                # Reads either side of it were not in a row, so it cannot
+                # settle anything.
+                self._agreeing = 0
+                raise NotReady(f"a transient answer: {completed.error_text.strip()}")
+            raise UnexpectedAnswer(completed)
+        document = json.loads(completed.text)
+        exact = [
+            element for element in _elements(document) if self.query.matches(element)
+        ]
+        if not exact:
+            self._agreeing = 0
+            raise NoExactMatch(f"{self.query} is not among the elements reported")
+        # Which of several matches the wait follows is what goes wrong when
+        # the query is ambiguous, so each message names them all.
+        described = (
+            f"; {_describe_matches(document, self.query.matches)}"
+            if len(exact) > 1
+            else ""
+        )
+        matches = [element for element in exact if _has_area(element)]
+        if not matches:
+            self._agreeing = 0
+            raise NotReady(f"{self.query} is not reported with a frame{described}")
+        if self.until is Until.PRESENT:
+            return Found(matches[0], document)
+        screen = _screen(document)
+        on_screen = [
+            element for element in matches if _wholly_on_screen(element, screen)
+        ]
+        if not on_screen:
+            self._agreeing = 0
+            raise NotReady(
+                f"{self.query} is at {matches[0]['frame']}, not wholly on the "
+                f"screen {screen}{described}"
+            )
+        element = on_screen[0]
+        if self.until is Until.ON_SCREEN:
+            return Found(element, document)
+        if element["frame"] == self._frame:
+            self._agreeing += 1
+        else:
+            self._frame = element["frame"]
+            self._agreeing = 1
+        if self._agreeing < SETTLED_READS:
+            raise NotReady(
+                f"{self.query} is still moving, now at {self._frame}{described}"
+            )
+        return Found(element, document)
+
+
 class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
     """Run CLI tests against the shared companion and simulator."""
 
     environment: Environment
     companion: Companion
     recording: Recording | None = None
+    requires_route_attestation = False
+    # The capability each test needs, when a class's tests need more than the
+    # rest of the suite. Every test in such a class must have an entry.
+    capabilities: Mapping[str, SuiteCapability] | None = None
+    route_attestation_timeout_seconds = ROUTE_ATTESTATION_TIMEOUT_SECONDS
+    resolve_process_executable = False
 
     # Set only while a documented demo is running, which is what makes a named
     # command capture its output.
@@ -986,6 +1731,7 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         }
 
     async def asyncSetUp(self) -> None:
+        self.skip_without_capability()
         await super().asyncSetUp()
         self.environment = await shared_environment()
         self.companion = await shared_companion()
@@ -993,6 +1739,28 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         self.recording.start_test(test_identity(self.id()))
         self.start_demo()
         self.check_companion()
+
+    def skip_without_capability(self) -> None:
+        if self.capabilities is None:
+            return
+        required = self.capabilities.get(self._testMethodName)
+        if required is None:
+            raise HarnessError(
+                f"No suite capability owns {type(self).__name__}.{self._testMethodName}"
+            )
+        if not suite_supports(required):
+            self.skipTest(
+                f"{self._testMethodName} requires {required.value} capability"
+            )
+
+    async def wait_or_fail(
+        self, what: str, timeout: float, poll: Callable[[], Awaitable[T]]
+    ) -> T:
+        """`wait_until`, reporting a wait that runs out as this test's failure."""
+        try:
+            return await wait_until(what, timeout, poll)
+        except HarnessError as error:
+            self.fail(str(error))
 
     def start_demo(self) -> None:
         demo = demo_for(self)
@@ -1060,31 +1828,18 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
     def simctl(self) -> Simctl:
         return self.environment.simctl
 
-    def _route_attestation(self) -> tuple[dict[str, str], Path]:
-        attestation = self.make_temporary_directory() / "selected"
-        environment = dict(os.environ)
-        environment[ROUTE_ATTESTATION_ENV] = str(attestation)
-        return environment, attestation
-
     async def run_client(
         self,
         argv: Sequence[str],
         timeout: float,
         stdin: bytes | None = None,
     ) -> Completed:
-        expected = expected_implementation()
-        if expected is None:
-            return await run(argv, timeout=timeout, stdin=stdin)
-        environment, attestation = self._route_attestation()
-        completed = await run(argv, timeout=timeout, stdin=stdin, env=environment)
-        try:
-            verify_route_attestation(attestation, expected)
-        except NotReady as error:
-            raise HarnessError(
-                f"the {expected} lane exited before completing route attestation at "
-                f"{attestation}: {error}"
-            ) from None
-        return completed
+        return await run_attested_client(
+            argv,
+            timeout,
+            stdin,
+            required=getattr(self, "requires_route_attestation", False),
+        )
 
     async def idb(
         self,
@@ -1106,44 +1861,123 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         """
         deadline = Deadline(TRANSIENT_ANSWER_TIMEOUT_SECONDS)
         while True:
-            started = time.monotonic()
-            if self.recording is not None:
-                self.recording.command(["idb", *args])
-            try:
-                completed = await self.run_client(
-                    idb_argv(self.environment, self.companion, *args),
-                    timeout=timeout,
-                    stdin=stdin,
-                )
-            except BaseException as error:
-                if self.recording is not None:
-                    # A command that raised is never published — a demo whose
-                    # test failed stops the documentation being generated at
-                    # all — so the argv is recorded as it ran rather than
-                    # normalised, which is what someone reading the trace to
-                    # debug the run needs.
-                    self.recording.event(
-                        "command_error",
-                        argv=["idb", *args],
-                        error=str(error),
-                        seconds=time.monotonic() - started,
-                    )
-                raise
-            repeat = worth_repeating(args, completed) and not deadline.passed
-            if self.recording is not None:
-                self.recording.event(
-                    "command_finished",
-                    returncode=completed.returncode,
-                    seconds=time.monotonic() - started,
-                    **self._command_fields(
-                        None if repeat else step, ["idb", *args], completed
-                    ),
-                )
+            repeat = False
+
+            def published(completed: Completed) -> str | None:
+                nonlocal repeat
+                repeat = worth_repeating(args, completed) and not deadline.passed
+                return None if repeat else step
+
+            completed = await self._run_once(
+                args, timeout=timeout, stdin=stdin, published=published
+            )
             if not repeat:
                 break
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         if check and completed.returncode != 0:
             self.fail_or_skip_for(" ".join(args), completed)
+        return completed
+
+    async def idb_repl(
+        self,
+        context: str,
+        *args: str,
+        check: bool = True,
+        timeout: float = REPL_COMMAND_TIMEOUT_SECONDS,
+        step: str | None = None,
+    ) -> Completed:
+        """Run idb-repl in `context` against this test's companion.
+
+        step publishes the command as it does for `idb`. The published argv
+        leaves out `--companion`, whose socket is private to this run.
+        """
+        repl = self.environment.repl_path
+        if repl is None:
+            raise HarnessError(
+                f"{IDB_E2E_REPL_PATH_ENV} is not set; it names the idb-repl this test drives."
+            )
+        argv = [str(repl), context, "--companion", self.companion.address, *args]
+        completed = await self._run_traced(
+            argv,
+            ["idb-repl", context, *args],
+            lambda: run(argv, timeout=timeout),
+            stdin=None,
+            published=lambda _: step,
+        )
+        if check and completed.returncode != 0:
+            self.fail_or_skip_for(" ".join(["idb-repl", context, *args]), completed)
+        return completed
+
+    async def _run_once(
+        self,
+        args: Sequence[str],
+        *,
+        timeout: float,
+        stdin: bytes | None = None,
+        published: Callable[[Completed], str | None],
+    ) -> Completed:
+        """Run idb once and trace it, published as the step `published` names.
+
+        `published` sees the answer before it is traced, so a caller that
+        repeats a command can publish only the attempt that ends it.
+        """
+        argv = idb_argv(self.environment, self.companion, *args)
+        return await self._run_traced(
+            argv,
+            ["idb", *args],
+            lambda: self.run_client(argv, timeout=timeout, stdin=stdin),
+            stdin=stdin,
+            published=published,
+        )
+
+    async def _run_traced(
+        self,
+        argv: Sequence[str],
+        shown: Sequence[str],
+        run: Callable[[], Awaitable[Completed]],
+        *,
+        stdin: bytes | None,
+        published: Callable[[Completed], str | None],
+    ) -> Completed:
+        """Run a client command and trace it as `shown`, the argv a reader sees."""
+        started = time.monotonic()
+        given = {} if stdin is None else {"stdin": stdin}
+        if self.recording is not None:
+            self.recording.command(list(shown))
+        try:
+            completed = await run()
+        except BaseException as error:
+            if self.recording is not None:
+                self.recording.exec_output(
+                    argv,
+                    f"raised after {time.monotonic() - started:.2f}s: {error!r}",
+                    given,
+                )
+                # A command that raised is never published — a demo whose
+                # test failed stops the documentation being generated at
+                # all — so the argv is recorded as it ran rather than
+                # normalised, which is what someone reading the trace to
+                # debug the run needs.
+                self.recording.event(
+                    "command_error",
+                    argv=list(shown),
+                    error=str(error),
+                    seconds=time.monotonic() - started,
+                )
+            raise
+        step = published(completed)
+        if self.recording is not None:
+            self.recording.exec_output(
+                argv,
+                f"exited {completed.returncode} after {time.monotonic() - started:.2f}s",
+                {**given, "stdout": completed.stdout, "stderr": completed.stderr},
+            )
+            self.recording.event(
+                "command_finished",
+                returncode=completed.returncode,
+                seconds=time.monotonic() - started,
+                **self._command_fields(step, shown, completed),
+            )
         return completed
 
     def _command_fields(
@@ -1208,6 +2042,38 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         await self.setup_terminate_quietly(bundle_id)
         await self.setup_idb("uninstall", bundle_id, check=False)
 
+    async def setup_deny_permission_prompts(self) -> None:
+        """Deny every permission prompt on screen, so none covers what a test reads.
+
+        SpringBoard holds a prompt above every app until it is answered, across
+        relaunches and uninstalls, so one left by an earlier test -- or by
+        anything else that used the simulator before -- covers everything a
+        later test reads. Denying grants nothing.
+        """
+        args = ("ui", "describe-all", "--json")
+
+        async def deny() -> None:
+            completed = await self.setup_idb(*args, check=False)
+            if completed.returncode != 0:
+                if worth_repeating(args, completed):
+                    raise NotReady(completed.error_text.strip())
+                self.fail_or_skip_for("setup: " + " ".join(args), completed)
+            document = json.loads(completed.text)
+            button = _permission_prompt_deny_button(document)
+            if button is None:
+                return
+            labels = [_label(element) for element in _elements(document)]
+            labels = [label for label in labels if label]
+            if self.recording is not None:
+                self.recording.event("permission_prompt_denied", labels=labels)
+            x, y = _center(button)
+            await self.setup_idb("ui", "tap", str(x), str(y))
+            raise NotReady(f"a permission prompt showed {labels}")
+
+        await self.wait_or_fail(
+            "A permission prompt was not dismissed", UI_UPDATE_TIMEOUT_SECONDS, deny
+        )
+
     async def setup_web_origin(
         self,
         live: str,
@@ -1241,24 +2107,41 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
     def idb_process(
         self,
         *args: str,
+        idb_bin: Path | None = None,
         process_config: IdbProcessConfig | None = None,
-    ) -> "IdbProcess":
+        companion: Companion | None = None,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> AbstractAsyncContextManager[IdbProcess]:
         """Start a streaming command and stop it when the async context exits."""
-        expected = expected_implementation()
-        environment = None
-        expected_route = None
-        if expected is not None:
-            environment, attestation = self._route_attestation()
-            expected_route = (attestation, expected)
-        return IdbProcess(
-            idb_argv(self.environment, self.companion, *args),
+        selected_companion = self.companion if companion is None else companion
+        argv = (
+            idb_argv(self.environment, selected_companion, *args)
+            if idb_bin is None
+            else client_argv(
+                idb_bin,
+                self.environment.idb_args,
+                selected_companion.address,
+                *args,
+            )
+        )
+        if getattr(self, "resolve_process_executable", False):
+            argv[0] = str(Path(argv[0]).resolve())
+        return attested_process(
+            argv,
             " ".join(args),
             display_argv=["idb", *args],
             failure=self.fail,
             recording=self.recording,
             config=process_config,
-            env=environment,
-            route_attestation=expected_route,
+            env=env,
+            cwd=cwd,
+            required=getattr(self, "requires_route_attestation", False),
+            attestation_timeout=getattr(
+                self,
+                "route_attestation_timeout_seconds",
+                ROUTE_ATTESTATION_TIMEOUT_SECONDS,
+            ),
         )
 
     def fail_or_skip_for(self, what: str, completed: Completed) -> NoReturn:
@@ -1315,6 +2198,128 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
     async def idb_json_lines(self, *args: str, **kwargs: Any) -> list[Any]:
         text = await self.idb_text(*args, "--json", **kwargs)
         return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+    async def wait_for(
+        self,
+        query: Query,
+        *,
+        until: Until = Until.PRESENT,
+        lookup: Lookup = DESCRIBE,
+        keys: Sequence[str] = (),
+        timeout: float = UI_UPDATE_TIMEOUT_SECONDS,
+        step: str | None = None,
+    ) -> Found:
+        """Wait until the query's element is `until`, and return it as last read.
+
+        Every read is one `ui describe` of the element, so the frame returned
+        is the frame the condition was judged on, not one read afterwards.
+        `ui describe` answers with the first element whose value contains the
+        query's, so once it answers with another element, the rest of the wait
+        reads the whole screen with `ui describe-all` instead. An element that
+        is not there yet and a transient answer are both waited through; any
+        other failure fails the test at once, as does a read that outlasts the
+        wait. Only the read that ends the wait is published, as `step`. `keys`
+        narrows what each read reports, with `--key`.
+        """
+        deadline = Deadline(timeout)
+        if isinstance(lookup, UiWait):
+            seconds = max(deadline.remaining, 1.0)
+            await self.setup_idb(
+                "ui",
+                "wait",
+                *replace(query, api=lookup.api or query.api).marker_args,
+                "--timeout",
+                f"{seconds:.0f}",
+                timeout=seconds + MIN_READ_TIMEOUT_SECONDS,
+            )
+        reported = (
+            "--format",
+            "complete",
+            *(
+                argument
+                for key in query.describe_keys(keys)
+                for argument in ("--key", key)
+            ),
+            "--json",
+        )
+        args = ("ui", "describe", *query.marker_args, *reported)
+        wait = ElementWait(query, until)
+
+        async def read() -> Found:
+            nonlocal args
+            outcome: Found | Exception | None = None
+
+            def published(completed: Completed) -> str | None:
+                nonlocal outcome
+                try:
+                    outcome = wait.observe(completed)
+                except (NotReady, UnexpectedAnswer) as error:
+                    outcome = error
+                    return None
+                return step
+
+            await self._run_once(
+                args,
+                timeout=min(
+                    DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                    max(deadline.remaining, MIN_READ_TIMEOUT_SECONDS),
+                ),
+                published=published,
+            )
+            if isinstance(outcome, UnexpectedAnswer):
+                self.fail_or_skip_for(" ".join(args), outcome.completed)
+            if isinstance(outcome, NoExactMatch):
+                args = ("ui", "describe-all", "--api", query.api.value, *reported)
+            if isinstance(outcome, Exception):
+                raise outcome
+            assert outcome is not None
+            return outcome
+
+        return await self.wait_or_fail(
+            f"{query} was not {until.value}", max(deadline.remaining, 0.0), read
+        )
+
+    async def wait_for_app(
+        self,
+        bundle_id: str,
+        state: AppState,
+        *,
+        timeout: float = APP_STATE_TIMEOUT_SECONDS,
+    ) -> None:
+        """Wait until simctl reports the app `state`, whatever idb reports."""
+        if state in (AppState.RUNNING, AppState.STOPPED):
+            listing = self.simctl.running_bundle_ids
+            listed, unlisted = AppState.RUNNING, AppState.STOPPED
+        else:
+            listing = self.simctl.installed_bundle_ids
+            listed, unlisted = AppState.INSTALLED, AppState.ABSENT
+
+        async def check() -> None:
+            try:
+                bundle_ids = await listing(timeout=SIMCTL_POLL_TIMEOUT_SECONDS)
+            except CommandTimedOut as timed_out:
+                # simctl can hang on the host without reaching the simulator,
+                # and a fresh simctl is not stuck behind it.
+                raise NotReady(str(timed_out)) from None
+            reported = listed if bundle_id in bundle_ids else unlisted
+            if reported is not state:
+                raise NotReady(f"simctl reports it {reported.value}")
+
+        await self.wait_or_fail(
+            f"{bundle_id} did not become {state.value}", timeout, check
+        )
+
+    async def tap_when_settled(
+        self, query: Query, *tap_args: str, step: str | None = None
+    ) -> Found:
+        """Tap the centre of the query's element once it has settled on screen.
+
+        The tap goes to the frame of the read that found it settled.
+        """
+        found = await self.wait_for(query, until=Until.SETTLED)
+        x, y = _center(found.element)
+        await self.idb("ui", "tap", str(x), str(y), *tap_args, step=step)
+        return found
 
     async def idb_expect_failure(
         self,
@@ -1540,6 +2545,16 @@ class _OutputSpool:
             self._file.close()
 
 
+def _bounded_output(output: ProcessOutput) -> bytes:
+    """What a streaming process printed, as much of it as its capture kept."""
+    omitted = output.total_bytes - len(output.prefix) - len(output.tail)
+    if omitted < 0:
+        return output.prefix + output.tail[-omitted:]
+    if omitted == 0:
+        return output.prefix + output.tail
+    return output.prefix + f"\n[{omitted} bytes omitted]\n".encode() + output.tail
+
+
 def _raise_process_failure(message: str) -> NoReturn:
     raise HarnessError(message)
 
@@ -1558,7 +2573,6 @@ class IdbProcess:
         config: IdbProcessConfig | None = None,
         env: Mapping[str, str] | None = None,
         cwd: Path | None = None,
-        route_attestation: tuple[Path, str] | None = None,
     ) -> None:
         self._argv = list(argv)
         self._display_argv = list(display_argv or argv)
@@ -1568,7 +2582,6 @@ class IdbProcess:
         self._config = config or IdbProcessConfig()
         self._env = None if env is None else dict(env)
         self._cwd = cwd
-        self._route_attestation = route_attestation
         self._process: asyncio.subprocess.Process | None = None
         self._process_group: int | None = None
         self._captures: dict[ProcessStream, _OutputSpool] = {}
@@ -1615,11 +2628,6 @@ class IdbProcess:
             self._close_spools()
             raise
         self._start_tasks(process)
-        try:
-            await self._wait_for_route_attestation()
-        except BaseException:
-            await self.aclose()
-            raise
         return self
 
     async def __aexit__(
@@ -1668,33 +2676,6 @@ class IdbProcess:
         }
         self._completion_task = asyncio.create_task(
             self._complete(), name="idb-e2e-process-completion"
-        )
-
-    async def _wait_for_route_attestation(self) -> None:
-        if self._route_attestation is None:
-            return
-        path, expected = self._route_attestation
-
-        async def inspect() -> None:
-            try:
-                verify_route_attestation(path, expected)
-            except NotReady as error:
-                completion = self._require_completion()
-                if completion.done():
-                    await completion
-                    stderr = self.spooled_output(ProcessStream.STDERR).decode(
-                        errors="replace"
-                    )
-                    raise HarnessError(
-                        f"idb {self._what} exited with {self.returncode} before "
-                        f"attesting the {expected} route: {error}\nstderr: {stderr}"
-                    ) from None
-                raise
-
-        await wait_until(
-            f"idb {self._what} did not attest the {expected} route",
-            ROUTE_ATTESTATION_TIMEOUT_SECONDS,
-            inspect,
         )
 
     async def _drain(self, stream: ProcessStream, reader: asyncio.StreamReader) -> None:
@@ -2082,6 +3063,14 @@ class IdbProcess:
         if self._recording is None or self._recording_finished:
             return
         self._recording_finished = True
+        self._recording.exec_output(
+            self._argv,
+            f"streamed, then exited {self.returncode}",
+            {
+                stream.value: _bounded_output(capture.snapshot())
+                for stream, capture in self._captures.items()
+            },
+        )
         self._recording.event(
             "command_finished",
             argv=self._display_argv,
@@ -2105,3 +3094,141 @@ class IdbProcess:
         if self._completion_task is None:
             raise HarnessError(f"{self._what} has not been started")
         return self._completion_task
+
+
+class GuestRPC:
+    """Exercise the packaged bridge contract through argv or one owned socket."""
+
+    def __init__(self, test: IdbEndToEndTestCase, *, persistent: bool) -> None:
+        self.test = test
+        self.persistent = persistent
+        self._lifetime = ExitStack()
+        self._process: asyncio.subprocess.Process | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._sequence = 0
+
+    async def __aenter__(self) -> GuestRPC:
+        if not self.persistent:
+            return self
+        try:
+            directory = tempfile.mkdtemp(prefix="idb-rpc-", dir="/tmp")
+            self._lifetime.callback(shutil.rmtree, directory)
+            self._path = Path(directory) / "bridge.sock"
+            self._stdout = self._lifetime.enter_context(tempfile.TemporaryFile())
+            self._stderr = self._lifetime.enter_context(tempfile.TemporaryFile())
+            self._binary = self.test.environment.guest_binary
+            self._process = await asyncio.create_subprocess_exec(
+                *self.test.simctl.argv(
+                    "spawn",
+                    self.test.udid,
+                    str(self._binary),
+                    "serve",
+                    str(self._path),
+                    "--startup-timeout",
+                    "10",
+                    "--idle-timeout",
+                    "120",
+                    "--exit-on-disconnect",
+                    "1",
+                ),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=self._stdout,
+                stderr=self._stderr,
+            )
+
+            async def connect() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                if self._process is not None and self._process.returncode is not None:
+                    raise HarnessError(
+                        f"guest exited before connecting: {self._diagnostics()}"
+                    )
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.open_unix_connection(self._path), 1.0
+                    )
+                except (OSError, asyncio.TimeoutError) as error:
+                    raise NotReady(str(error)) from error
+
+            self._reader, self._writer = await wait_until(
+                "guest RPC socket", 10.0, connect
+            )
+            self.test.assertEqual(await self.send({"ping": {}}), [])
+            return self
+        except BaseException as error:
+            await self._close_preserving(error)
+            raise
+
+    def _diagnostics(self) -> str:
+        self._stdout.seek(0)
+        self._stderr.seek(0)
+        return f"stdout: {self._stdout.read()!r}; stderr: {self._stderr.read()!r}"
+
+    async def send(self, command: dict[str, Any]) -> list[Any]:
+        return (await self.send_result(command))["values"]
+
+    async def send_result(self, command: dict[str, Any]) -> dict[str, Any]:
+        self._sequence += 1
+        request = {"version": 1, "id": f"test-{self._sequence}", "command": command}
+        payload = json.dumps(request).encode()
+        if self.persistent:
+            assert self._reader is not None and self._writer is not None
+            self._writer.write(len(payload).to_bytes(4, "big") + payload)
+            await asyncio.wait_for(self._writer.drain(), 60.0)
+            header = await asyncio.wait_for(self._reader.readexactly(4), 60.0)
+            size = int.from_bytes(header, "big")
+            self.test.assertGreater(size, 0)
+            self.test.assertLessEqual(size, 16 * 1024 * 1024)
+            response = json.loads(
+                await asyncio.wait_for(self._reader.readexactly(size), 60.0)
+            )
+        else:
+            response = json.loads(
+                (await self.test.guest("rpc", payload.decode())).stdout
+            )
+        self.test.assertEqual(response["version"], 1)
+        self.test.assertEqual(response["id"], request["id"])
+        self.test.assertEqual(response["result"]["exitCode"], 0, response)
+        return response["result"]
+
+    async def __aexit__(self, *exception: object) -> None:
+        error = exception[1] if isinstance(exception[1], BaseException) else None
+        try:
+            if self.persistent and exception[0] is None:
+                self.test.assertEqual(await self.send({"shutdown": {}}), [])
+                assert self._reader is not None
+                self.test.assertEqual(
+                    await asyncio.wait_for(self._reader.read(), 5.0), b""
+                )
+                assert self._process is not None
+                await asyncio.wait_for(self._process.wait(), 5.0)
+                self.test.assertEqual(self._process.returncode, 0, self._diagnostics())
+                self.test.assertFalse(self._path.exists())
+        except BaseException as shutdown_error:
+            error = shutdown_error
+            raise
+        finally:
+            await self._close_preserving(error)
+
+    async def _close_preserving(self, error: BaseException | None) -> None:
+        try:
+            await self._close()
+        except BaseException as cleanup_error:
+            if error is None:
+                raise
+            error.add_note(f"GuestRPC cleanup failed: {cleanup_error}")
+
+    async def _close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            try:
+                await asyncio.wait_for(self._writer.wait_closed(), 5.0)
+            except (OSError, asyncio.TimeoutError):
+                pass
+        if self._process is not None and self._process.returncode is None:
+            try:
+                await asyncio.wait_for(self._process.wait(), 60.0)
+            except asyncio.TimeoutError as error:
+                raise HarnessError(
+                    "owned guest did not exit after disconnect; retaining its socket directory"
+                ) from error
+        self._lifetime.close()

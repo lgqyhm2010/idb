@@ -11,9 +11,10 @@ import Foundation
 
 // MARK: - SimulatorHIDEvent
 
-/// A HID event that can be sent to a Simulator. A discriminated union of the primitive
-/// payloads (touch, button, keyboard, two-finger touch, orientation, shake, lock, in-call
-/// status bar, delay) plus a `composite` of ordered events.
+/// An input event that can be sent to a Simulator. A discriminated union of the primitive
+/// payloads (touch, button, remote button, keyboard, two-finger touch, trackpad, delay) plus a
+/// `composite` of ordered events. Device actions such as rotation, lock or shake are commands on the
+/// `Simulator`.
 public indirect enum SimulatorHIDEvent: Equatable, Hashable, Sendable {
 
   /// The per-sample step, in points, a swipe is broken into when the caller does not choose one.
@@ -26,11 +27,6 @@ public indirect enum SimulatorHIDEvent: Equatable, Hashable, Sendable {
   case twoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint)
   case trackpad(phase: SimulatorTrackpadPhase, point: SimulatorTrackpadPoint)
   case delay(TimeInterval)
-  case deviceOrientation(SimulatorHIDDeviceOrientation)
-  case hinge(SimulatorHingeAngle)
-  case shake
-  case toggleInCallStatusBar
-  case lockDevice
   case composite([SimulatorHIDEvent])
 
   /// For a `.composite` event, its ordered sub-events; otherwise `nil`.
@@ -41,17 +37,6 @@ public indirect enum SimulatorHIDEvent: Equatable, Hashable, Sendable {
     return events
   }
 
-}
-
-// MARK: - Dispatch
-
-public extension SimulatorHIDEvent {
-
-  /// Sends without draining afterwards. Prefer `SimulatorHID.send(event:logger:)`, which drains once per gesture.
-  /// `target` routes the touches to one display's touchscreen; nil sends them to the main screen.
-  func send(on hid: SimulatorHID, target: SimulatorTouchTarget? = nil) async throws {
-    _ = try await hid.deliver(self, target: target)
-  }
 }
 
 // MARK: - Factories
@@ -294,54 +279,43 @@ public extension SimulatorHIDEvent {
 
 // MARK: - CustomStringConvertible
 
+/// How much of an event's payload log lines carry. Coordinates and key codes can reveal what is being typed or tapped.
+public enum SimulatorHIDEventLogging: Sendable {
+  case redacted
+  case detailed
+}
+
 extension SimulatorHIDEvent: CustomStringConvertible {
   public var description: String {
+    logDescription(.redacted)
+  }
+
+  public func logDescription(_ logging: SimulatorHIDEventLogging) -> String {
+    let detailed = logging == .detailed
     switch self {
     case let .touch(direction, x, y, edge):
-      guard shouldLogHIDEventDetails() else { return "Touch <hidden>" }
+      guard detailed else { return "Touch <hidden>" }
       guard edge != .none else { return "Touch \(direction.name) at (\(x),\(y))" }
       return "Touch \(direction.name) at (\(x),\(y)) from the \(edge.name) edge"
     case let .button(direction, button):
-      guard shouldLogHIDEventDetails() else { return "Button <hidden>" }
+      guard detailed else { return "Button <hidden>" }
       return "Button \(button.name) \(direction.name)"
     case let .remoteButton(direction, button):
-      guard shouldLogHIDEventDetails() else { return "Remote <hidden>" }
+      guard detailed else { return "Remote <hidden>" }
       return "Remote \(button.name) \(direction.name)"
     case let .keyboard(direction, keyCode):
-      guard shouldLogHIDEventDetails() else { return "Key <hidden>" }
+      guard detailed else { return "Key <hidden>" }
       return "Keyboard Code=\(keyCode) \(direction.name)"
     case let .twoFingerTouch(direction, finger1, finger2):
-      guard shouldLogHIDEventDetails() else { return "TwoFingerTouch <hidden>" }
+      guard detailed else { return "TwoFingerTouch <hidden>" }
       return "TwoFingerTouch \(direction.name) at (\(finger1.x),\(finger1.y)) (\(finger2.x),\(finger2.y))"
     case let .trackpad(phase, point):
-      guard shouldLogHIDEventDetails() else { return "Trackpad <hidden>" }
+      guard detailed else { return "Trackpad <hidden>" }
       return "Trackpad \(phase.name) at (\(point.x),\(point.y))"
     case let .delay(duration):
       return "Delay for \(duration)"
-    case let .deviceOrientation(orientation):
-      return "Set Orientation \(orientation.name)"
-    case let .hinge(angle):
-      return "Set Hinge Angle \(angle.degrees) degrees"
-    case .shake:
-      return "Shake"
-    case .toggleInCallStatusBar:
-      return "Toggle In-Call Status Bar"
-    case .lockDevice:
-      return "Lock Device"
     case let .composite(events):
-      return "Composite [\(events.map { $0.description }.joined(separator: ", "))]"
+      return "Composite [\(events.map { $0.logDescription(logging) }.joined(separator: ", "))]"
     }
-  }
-}
-
-// MARK: - Private helpers
-
-private func shouldLogHIDEventDetails() -> Bool {
-  ProcessInfo.processInfo.environment["FBSIMULATORCONTROL_LOG_HID_DETAILS"]?.boolValue ?? false
-}
-
-private extension String {
-  var boolValue: Bool {
-    (self as NSString).boolValue
   }
 }

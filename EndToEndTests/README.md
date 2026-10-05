@@ -13,6 +13,7 @@ The permission test asks for what approving a service actually buys: the app sto
 | `IDB_SETUP_BIN` | optional client used only to prepare fixtures; defaults to `IDB_BIN` |
 | `IDB_E2E_COMPANION_PATH` | the `idb_companion` binary, with its `Resources/` directory beside it |
 | `IDB_E2E_RECORDER_PATH` | the built `sim-video` binary |
+| `IDB_E2E_REPL_PATH` | the built `idb-repl` binary, required by the demos that inject Swift |
 | `IDB_E2E_SUITE_CAPABILITY` | optional suite scope and companion readiness: `companion-process`, `accessibility-read`, or `accessibility-interaction` (the default) |
 | `DEVICE_UDID` | the booted simulator to test against |
 | `DEVICE_SET_PATH` | the device set `DEVICE_UDID` lives in |
@@ -45,6 +46,7 @@ xcrun simctl --set "$DEVICE_SET_PATH" bootstatus "$DEVICE_UDID"
 IDB_BIN="$(command -v idb)" \
 IDB_E2E_COMPANION_PATH="$PWD/Build/Distribution/idb_companion" \
 IDB_E2E_RECORDER_PATH="$PWD/Build/Distribution/sim-video" \
+IDB_E2E_REPL_PATH="$PWD/Build/Distribution/idb-repl" \
 python3 -m unittest discover -s EndToEndTests -t . -v
 ```
 
@@ -62,7 +64,7 @@ python3 -m unittest discover -s CI -p '*_tests.py' -t . -v
 python3 -m unittest EndToEndTests.harness_tests EndToEndTests.documentation_tests EndToEndTests.accessibility_tests -v
 ```
 
-`harness_tests.py`, `documentation_tests.py` and `accessibility_tests.py` are named separately from `test_*.py` so e2e discovery does not include them; the last checks, against a captured tree, what the accessibility tests take to be on the screen. In GitHub CI, the `pure-python` job runs these tests; `mac-end-to-end` builds on the companion artifact, provisions a simulator through `CI.provision_simulator`, runs the e2e suite in strict mode, and collects diagnostics on success and failure.
+`harness_tests.py`, `documentation_tests.py` and `accessibility_tests.py` are named separately from `test_*.py` so e2e discovery does not include them; the last checks, against a captured tree, what the accessibility tests take to be on the screen. In GitHub CI, the `pure-python` job runs these tests; `mac-end-to-end` builds on the companion artifact and runs the e2e suite in strict mode as parallel shards, each on its own runner with a simulator provisioned through `CI.provision_simulator`. `CI.end_to_end_shard` names each shard's modules: `demos` runs `test_demos.py` and is the only shard that generates the documentation, `ui` runs the accessibility and service tests, `system` runs the permission tests, `install` runs `test_install.py`, and `apps` runs every module no other shard names. `test_install.py` installs every artifact kind through every client route on its own companion targeting the Mac and compares the stored tree with the fixture, so it needs only `IDB_BIN` and `IDB_E2E_COMPANION_PATH`, and its shard provisions no simulator. Each shard collects diagnostics on success and failure, and prints every test's duration so the shards can be rebalanced.
 
 The harness writes companion logs to `IDB_E2E_ARTIFACTS_DIR`, falling back to `TEST_RESULT_ARTIFACTS_DIR` when available. Without either directory, logs stay at `/tmp/idb-e2e-*/companion.log`. The collector reads both layouts; `--artifacts-dir` overrides its artifact source without changing `--output`.
 
@@ -80,7 +82,7 @@ All diagnostics use unique, flat names in `IDB_E2E_ARTIFACTS_DIR`, falling back 
 
 ## Documented demos
 
-A few tests are also the source of the demos the website publishes. `documentation.py` holds the contract: `DOCUMENTED_DEMOS` maps each published slug to the test that performs it, and `@documented_demo` on that test declares the slug, title and summary. Declaring a slug the table does not publish, or declaring one the table attributes to a different test, raises as the suite is imported, so renaming or moving a documented test fails immediately rather than leaving the website describing a test that no longer exists.
+A few tests are also the source of the demos the website publishes. They live in `test_demos.py`, which holds nothing else, so a demo can tell a story across several commands: every behaviour a demo shows also has a targeted test beside the other tests of its command, and no coverage depends on a demo. `documentation.py` holds the contract: `DOCUMENTED_DEMOS` maps each published slug to the test that performs it, and `@documented_demo` on that test declares the slug, title and summary. Declaring a slug the table does not publish, or declaring one the table attributes to a different test, raises as the suite is imported, so renaming or moving a documented test fails immediately rather than leaving the website describing a test that no longer exists.
 
 The published name of a test is the one a checkout gives it, `EndToEndTests.<module>.<class>.<method>`. A build that imports these modules by repository path declares and records the same name, so one table serves both.
 
@@ -96,4 +98,4 @@ Demos are published as `h264`, the only encoding browsers agree on, by setting `
 
 Each demo also publishes its terminal session beside its clip, as an asciicast v2 file the website plays on the clip's timeline: the command line where the demo ran it, its output where the command finished, an exit line, and a marker naming each step where it begins, which the player shows on its scrubber so the steps can be jumped between from the timeline. It is eighty columns wide, the width the page plays it at beside a portrait clip. It is written from the trace rather than captured from a terminal, so it carries the same normalised output the transcript does, lasts as long as the clip, and comes out byte-identical from two generations of one run.
 
-CI runs that generator after the suite and uploads its output as the `documentation` artifact, and the website is deployed from a CI run that succeeded, at the commit that run tested. The demos on the site are therefore always the ones the code being documented actually performed.
+CI runs that generator after the suite and uploads its output as the `documentation` artifact, and the website is deployed from a CI run whose demos passed and whose site built from them, at the commit that run tested, even if another shard or job in that run failed. The demos on the site are therefore always the ones the code being documented actually performed.

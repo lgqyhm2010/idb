@@ -97,6 +97,9 @@ public struct TemporaryDirectory: Equatable {
   }
 
   /// Extracts the archive in `input` into a temporary directory scoped to `body`.
+  ///
+  /// Always with `bsdtar`: these streams are compressed by the client as it sends,
+  /// which starves an in-process reader of input.
   public func withArchiveExtracted<T>(
     fromStream input: FBProcessInput<AnyObject>,
     compression: FBCompressionFormat,
@@ -104,8 +107,10 @@ public struct TemporaryDirectory: Equatable {
     _ body: (URL) async throws -> T
   ) async throws -> T {
     try await withTemporaryDirectory { tempDir in
-      _ = try await bridgeFBFuture(
-        FBArchiveOperations.extractArchive(fromStream: input, toPath: tempDir.path, overrideModificationTime: overrideMTime, logger: logger, compression: compression))
+      try await ArchiveExtractors.bsdTar.extract(
+        .stream(input), to: tempDir.path,
+        options: ArchiveExtractOptions(overrideModificationTime: overrideMTime, compression: compression),
+        logger: logger)
       return try await body(tempDir)
     }
   }
@@ -123,8 +128,10 @@ public struct TemporaryDirectory: Equatable {
     _ body: (URL) async throws -> T
   ) async throws -> T {
     try await withTemporaryDirectory { tempDir in
-      _ = try await bridgeFBFuture(
-        FBArchiveOperations.extractArchive(atPath: filePath, toPath: tempDir.path, overrideModificationTime: overrideMTime, logger: logger))
+      try await ArchiveExtractors.default.extract(
+        .filePath(filePath), to: tempDir.path,
+        options: ArchiveExtractOptions(overrideModificationTime: overrideMTime),
+        logger: logger)
       return try await body(tempDir)
     }
   }

@@ -28,8 +28,11 @@ extension SimulatorLifecycleError: LocalizedError {
       return "More than one SimulatorApp \(runningApplications) running, focus is ambiguous"
     case let .focusFailed(applicationDescription):
       return "Failed to focus \(applicationDescription)"
-    case let .openURLFailed(url, simulatorDescription, _):
-      return "Failed to open URL \(url) on simulator \(simulatorDescription)"
+    case let .openURLFailed(url, simulatorDescription, underlying):
+      guard let underlying else {
+        return "Failed to open URL \(url) on simulator \(simulatorDescription)"
+      }
+      return "Failed to open URL \(url) on simulator \(simulatorDescription): \(underlying)"
     }
   }
 }
@@ -52,6 +55,15 @@ public struct SimulatorLifecycleCommands: LifecycleCommands, Sendable {
 
   public func resolveLeavesState(_ state: TargetState) async throws {
     try await CoreSimulatorNotifier.resolveLeavesState(state, for: simulator.device)
+  }
+
+  /// Waits until the Simulator is usable: it reports itself `.booted` while still coming up, so
+  /// the two are not the same moment. This is the wait `SimulatorBootOptions.verifyUsable`
+  /// performs during `boot`, available on its own for a caller that took the state first.
+  ///
+  /// - Parameter deadline: How long to wait for. Waits indefinitely when `nil`.
+  public func resolveUsable(deadline: PollDeadline? = nil) async throws {
+    try await verifySimulatorIsBooted(simulator, deadline: deadline)
   }
 
   public func focus() async throws {

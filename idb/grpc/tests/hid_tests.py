@@ -14,7 +14,6 @@ from idb.grpc.hid import (
     event_to_grpc,
     GrpcHIDButton,
     GrpcHIDDelay,
-    GrpcHIDDisplay,
     GrpcHIDEvent,
     GrpcHIDHinge,
     GrpcHIDKey,
@@ -30,7 +29,6 @@ from idb.grpc.hid import (
     HIDButtonType,
     HIDDelay,
     HIDDirection,
-    HIDDisplay,
     HIDHinge,
     HIDKey,
     HIDOrientation,
@@ -53,14 +51,6 @@ class HidTests(TestCase):
                 self.assertEqual(
                     event_to_grpc(HIDHinge(angle=angle)),
                     GrpcHIDEvent(hinge=GrpcHIDHinge(angle=angle)),
-                )
-
-    def test_display(self) -> None:
-        for unique_id in ["inner", ""]:
-            with self.subTest(unique_id=unique_id):
-                self.assertEqual(
-                    event_to_grpc(HIDDisplay(unique_id=unique_id)),
-                    GrpcHIDEvent(display=GrpcHIDDisplay(unique_id=unique_id)),
                 )
 
     def test_hinge_rejects_invalid_angles(self) -> None:
@@ -86,6 +76,17 @@ class HidTests(TestCase):
                     press=GrpcHIDPress(action=expected, direction=GrpcHIDEvent.UP)
                 ),
             )
+        for button in HIDButtonType:
+            with self.subTest(button=button):
+                grpc = event_to_grpc(
+                    HIDPress(
+                        action=HIDButton(button=button), direction=HIDDirection.DOWN
+                    )
+                )
+                self.assertEqual(
+                    GrpcHIDEvent.HIDButtonType.Name(grpc.press.action.button.button),
+                    button.name,
+                )
 
     def test_swipe(self) -> None:
         deltas = [None, 5]

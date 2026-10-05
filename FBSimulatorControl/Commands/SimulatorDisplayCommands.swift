@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import FBControlCore
 import Foundation
-import XPC
 
 public enum SimulatorDisplayRotation: String, Sendable, Decodable {
   case upright = "rot0"
@@ -15,17 +15,107 @@ public enum SimulatorDisplayRotation: String, Sendable, Decodable {
   case counterclockwise = "rot270"
 }
 
-/// A current display snapshot. Activity is reported by CoreDevice independently of IO port power.
+/// Interface geometry, independent of accessibility and touchscreen routing identities.
+public struct SimulatorDisplayGeometry: Equatable, Sendable {
+  public let bounds: CGRect
+  public let scale: Double
+  public let rotation: SimulatorDisplayRotation
+
+  public var pointSize: CGSize {
+    let size = CGSize(width: bounds.width / scale, height: bounds.height / scale)
+    switch rotation {
+    case .upright, .upsideDown: return size
+    case .clockwise, .counterclockwise: return CGSize(width: size.height, height: size.width)
+    }
+  }
+
+  /// Converts display-relative points to the unrotated point coordinates used by accessibility hit testing.
+  public func unrotatedPoint(from point: CGPoint) throws -> CGPoint {
+    let size = pointSize
+    guard point.x.isFinite, point.y.isFinite,
+      point.x >= 0, point.y >= 0, point.x <= size.width, point.y <= size.height
+    else { throw SimulatorDisplayInteractionError.invalidPoint(point, bounds: size) }
+    let width = bounds.width / scale
+    let height = bounds.height / scale
+    switch rotation {
+    case .upright: return point
+    case .clockwise: return CGPoint(x: point.y, y: height - point.x)
+    case .upsideDown: return CGPoint(x: width - point.x, y: height - point.y)
+    case .counterclockwise: return CGPoint(x: width - point.y, y: point.x)
+    }
+  }
+}
+
+/// A legacy provider can describe its sole integrated display without identifying it.
+enum SimulatorInteractionDisplay: Equatable, Sendable {
+  case identified(SimulatorDisplay)
+  case legacy(SimulatorDisplayGeometry)
+
+  func hasSameConfiguration(as other: Self) -> Bool {
+    switch (self, other) {
+    case let (.identified(first), .identified(second)): first.hasSameConfiguration(as: second)
+    case let (.legacy(first), .legacy(second)): first == second
+    case (.identified, .legacy), (.legacy, .identified): false
+    }
+  }
+
+  var geometry: SimulatorDisplayGeometry {
+    switch self {
+    case let .identified(display): display.geometry
+    case let .legacy(geometry): geometry
+    }
+  }
+
+  var uniqueID: String? {
+    switch self {
+    case let .identified(display): display.uniqueID
+    case .legacy: nil
+    }
+  }
+}
+
+public enum SimulatorDisplayActivity: Equatable, Sendable {
+  case active
+  case inactive
+  /// The runtime reports a backlight state of `unknown`.
+  case unknown
+}
+
+/// A current display snapshot. Activity evidence is independent of IO port power.
 public struct SimulatorDisplay: Equatable, Sendable {
   public let uniqueID: String
   public let name: String
-  public let isActive: Bool
+  public let activity: SimulatorDisplayActivity
+
+  public var isActive: Bool { activity == .active }
   public let isPrimary: Bool
   public let isIntegrated: Bool
   /// Bounds in the display's unrotated pixel coordinate space.
   public let bounds: CGRect
   public let scale: Double
   public let rotation: SimulatorDisplayRotation
+
+  init(
+    uniqueID: String, name: String, activity: SimulatorDisplayActivity, isPrimary: Bool, isIntegrated: Bool,
+    bounds: CGRect, scale: Double, rotation: SimulatorDisplayRotation
+  ) {
+    self.uniqueID = uniqueID
+    self.name = name
+    self.activity = activity
+    self.isPrimary = isPrimary
+    self.isIntegrated = isIntegrated
+    self.bounds = bounds
+    self.scale = scale
+    self.rotation = rotation
+  }
+
+  public var geometry: SimulatorDisplayGeometry {
+    SimulatorDisplayGeometry(bounds: bounds, scale: scale, rotation: rotation)
+  }
+
+  func hasSameConfiguration(as other: Self) -> Bool {
+    uniqueID == other.uniqueID && activity == other.activity && isIntegrated == other.isIntegrated && geometry == other.geometry
+  }
 
   /// Pixel dimensions after applying the current interface rotation.
   public var size: CGSize {
@@ -36,101 +126,157 @@ public struct SimulatorDisplay: Equatable, Sendable {
   }
 }
 
+extension TargetDisplayDescription {
+  init(_ display: SimulatorDisplay) {
+    self.init(
+      uniqueID: display.uniqueID, name: display.name, isActive: display.isActive, isIntegrated: display.isIntegrated,
+      widthPixels: UInt(exactly: display.size.width.rounded()) ?? 0, heightPixels: UInt(exactly: display.size.height.rounded()) ?? 0,
+      scale: display.scale)
+  }
+}
+
 public enum SimulatorDisplayError: Error, LocalizedError {
-  case noActiveIntegratedDisplay
-  case ambiguousActiveDisplays([String])
   case changed
+  /// Layout has moved to another display whose backlight has not caught up, as after a hinge change.
+  case transitioning
+  /// The current snapshot reports no active integrated display. A later snapshot may recover.
+  case noActiveIntegratedDisplay
+  /// The current snapshot reports more than one active integrated display. A later snapshot may settle.
+  case ambiguousActiveDisplays([String])
   case screensNotReported(within: TimeInterval)
-  case unknownDisplay(String, known: [String])
-  case inactiveDisplay(String)
-  case noTouchscreen(String)
-  /// The runtime cannot say which touchscreen covers which display, so touches cannot be routed by display.
-  case touchRoutingUnsupported(String)
 
   public var errorDescription: String? {
     switch self {
     case let .screensNotReported(seconds): "Simulator did not report its displays within \(seconds) seconds"
-    case .noActiveIntegratedDisplay: "Simulator has no active integrated display"
-    case let .ambiguousActiveDisplays(ids): "Simulator has multiple active integrated displays: \(ids.joined(separator: ", "))"
-    case .changed: "Simulator display changed during capture"
-    case let .unknownDisplay(id, known): "Simulator has no display \(id); it has: \(known.joined(separator: ", "))"
-    case let .inactiveDisplay(id): "Display \(id) is not active, so touches sent to it would reach nothing"
-    case let .noTouchscreen(id): "Display \(id) has no touchscreen to route touches to"
-    case let .touchRoutingUnsupported(detail): "Simulator cannot route touches to a display: \(detail)"
+    case .changed: "Simulator display changed during the operation"
+    case .transitioning: "Simulator display is still changing: layout has moved to a display that is not lit yet"
+    case .noActiveIntegratedDisplay: "Simulator currently reports no active integrated display"
+    case let .ambiguousActiveDisplays(identities):
+      "Simulator currently reports multiple active integrated displays: \(identities.joined(separator: ", "))"
     }
   }
 }
 
-public struct SimulatorDisplayCommands {
-  private let simulator: Simulator
+/// Memoized per `Simulator` through its command cache, so display identities learned by one
+/// interaction route the next.
+// SAFETY: `identities` and `configurationTracker` are lock-guarded and the weak simulator reference is only ever read.
+// patternlint-disable-next-line unchecked-sendable
+public final class SimulatorDisplayCommands: DisplayCommands, @unchecked Sendable {
+  private weak var simulator: Simulator?
+  let identities = DisplayIdentityCache()
+  let configurationTracker = DisplayConfigurationTracker()
 
-  public static func commands(with simulator: Simulator) -> SimulatorDisplayCommands {
+  public class func commands(with simulator: Simulator) -> SimulatorDisplayCommands {
     SimulatorDisplayCommands(simulator: simulator)
   }
 
-  /// Reads configured displays. Requires a current report with explicit per-display activity.
-  public func list() async throws -> [SimulatorDisplay] {
-    try await read(decode: SimulatorDisplayProtocol.displays)
+  private init(simulator: Simulator) {
+    self.simulator = simulator
+  }
+
+  /// Only cancellation and a released simulator throw; every CoreDevice failure is reported.
+  func report() async throws -> SimulatorDisplayReport {
+    do {
+      return try await target().coreDevice.perform(
+        action: SimulatorDisplayProtocol.action, service: SimulatorDisplayProtocol.service, input: CoreDeviceEmptyInput(),
+        decode: SimulatorDisplayProtocol.report)
+    } catch let error as SimulatorCoreDeviceError {
+      return .failed(error)
+    }
+  }
+
+  /// The display configuration once any transition settles. `.transitioning` only when the transition outlasts
+  /// `timeout`; a hinge change has been seen to take about 4 seconds on a heavily loaded host.
+  public func configuration(
+    settledWithin timeout: Duration = DisplayTransitionSettling.standard.timeout
+  ) async throws
+    -> SimulatorDisplayConfiguration
+  {
+    try await settledConfiguration(within: timeout)
+  }
+
+  /// The current display configuration, then each change to it, until the stream is cancelled. Follows
+  /// CoreDevice's display pushes, and polls when the runtime does not push or its pushes stop.
+  public func configurations() -> AsyncStream<SimulatorDisplayConfiguration> {
+    followConfigurations()
+  }
+
+  var logger: (any ControlCoreLogger)? { simulator?.logger }
+
+  /// The identified integrated display interactions currently target, after any transition settles.
+  public func activeIntegratedDisplay() async throws -> SimulatorDisplay {
+    try Self.activeIntegratedDisplay(in: try await resolveDisplay())
+  }
+
+  static func activeIntegratedDisplay(in resolution: SimulatorDisplayResolution) throws -> SimulatorDisplay {
+    switch resolution {
+    case let .target(.selected(display)), let .target(.sole(.identified(display))):
+      return display
+    case .target(.sole(.legacy)):
+      throw SimulatorDisplayInteractionError.unsupportedCapability(
+        "an identified integrated display")
+    case let .fallback(.unreadable(error)):
+      throw error
+    case .fallback(.noActiveIntegratedDisplay):
+      throw SimulatorDisplayError.noActiveIntegratedDisplay
+    case let .fallback(.ambiguousActiveDisplays(identities)):
+      throw SimulatorDisplayError.ambiguousActiveDisplays(identities)
+    case .fallback(.legacyIntegratedDisplays), .fallback(.unknownActivity):
+      throw SimulatorDisplayInteractionError.unsupportedCapability(
+        "one active integrated display")
+    case .transitioning:
+      throw SimulatorDisplayError.transitioning
+    }
+  }
+
+  /// The geometry of the display interactions currently target, whether or not the runtime can identify it.
+  public func displayGeometry() async throws -> SimulatorDisplayGeometry {
+    switch try await resolveDisplay() {
+    case let .target(target):
+      return target.display.geometry
+    case let .fallback(.unreadable(error)):
+      throw error
+    case .fallback:
+      throw SimulatorDisplayInteractionError.unsupportedCapability("one integrated display")
+    case .transitioning:
+      throw SimulatorDisplayError.transitioning
+    }
   }
 
   /// Lists connected touchscreens. Match `displayUniqueID` to a display snapshot before routing input.
   public func touchscreens() async throws -> [SimulatorTouchscreen] {
     // Universal HID can advertise a virtual digitizer even when the target has no touch display.
+    let simulator = try target()
     guard simulator.productFamily.hasTouchscreen else { return [] }
     return try await simulator.coreDevice.send(
       service: SimulatorTouchscreenProtocol.service, message: SimulatorTouchscreenProtocol.request(),
       decode: SimulatorTouchscreenProtocol.touchscreens)
   }
 
-  /// Lists connected touchscreens, or none when the provider cannot say which display each one covers.
-  public func touchscreensIfSupported() async throws -> [SimulatorTouchscreen] {
-    do {
-      return try await touchscreens()
-    } catch SimulatorCoreDeviceError.unsupported(_) {
-      return []
+  /// Resolves one active integrated display and its independent accessibility and input identities.
+  /// An explicit UUID must identify the active integrated display; inactive interaction is unsupported.
+  public func interactionContext(for displayUniqueID: String? = nil) async throws -> SimulatorDisplayInteractionContext {
+    try await interactionContext(for: displayUniqueID, transport: AXBridgeOneshotTransport(simulator: target()))
+  }
+
+  /// Fails if the observed active display, geometry or routing no longer matches the saved context, or the
+  /// configuration generation has moved on since it was resolved.
+  public func validate(_ context: SimulatorDisplayInteractionContext) async throws {
+    try await validate(context, transport: AXBridgeOneshotTransport(simulator: target()))
+  }
+
+  private func target() throws -> Simulator {
+    guard let simulator else { throw WeakTargetError.simulator }
+    return simulator
+  }
+
+  func reportPushes() throws -> AsyncThrowingStream<SimulatorDisplayReport, Error> {
+    let channel = UUID()
+    return try target().coreDevice.subscribe(
+      action: SimulatorDisplayUpdatesProtocol.action, service: SimulatorDisplayUpdatesProtocol.service,
+      input: SimulatorDisplayUpdatesProtocol.StreamInput(channel: channel)
+    ) { event in
+      try SimulatorDisplayUpdatesProtocol.report(event, channel: channel)
     }
-  }
-
-  /// The touchscreen to route touches to for a display; nil selects the active integrated display.
-  public func touchTarget(displayUniqueID: String?) async throws -> SimulatorTouchTarget {
-    let simulator = self.simulator
-    guard simulator.productFamily.hasTouchscreen else { throw SimulatorHIDError.touchUnsupportedOnAppleTV }
-    do {
-      return try await simulator.touchscreenTopology.touchTarget(
-        displayUniqueID: displayUniqueID,
-        readDisplays: { try await SimulatorDisplayCommands.commands(with: simulator).list() },
-        readTouchscreens: { try await SimulatorDisplayCommands.commands(with: simulator).touchscreens() })
-    } catch let SimulatorCoreDeviceError.unsupported(detail) {
-      // Internal to this module, so callers could only report it as an unexplained failure.
-      throw SimulatorDisplayError.touchRoutingUnsupported(detail)
-    }
-  }
-
-  /// Returns nil only when the provider lacks the capability needed to select a display.
-  func activeIntegratedDisplayIfSupported() async throws -> SimulatorDisplay? {
-    do {
-      switch try await read(decode: SimulatorDisplayProtocol.snapshot) {
-      case let .displays(displays): return try Self.activeIntegratedDisplay(in: displays)
-      case .legacyProvider: return nil
-      }
-    } catch SimulatorCoreDeviceError.unsupported(_) {
-      return nil
-    }
-  }
-
-  private func read<Response: Sendable>(decode: @escaping @Sendable (xpc_object_t) throws -> Response) async throws -> Response {
-    try await simulator.coreDevice.perform(
-      action: SimulatorDisplayProtocol.action, service: SimulatorDisplayProtocol.service, input: CoreDeviceEmptyInput(), decode: decode)
-  }
-
-  public func activeIntegratedDisplay() async throws -> SimulatorDisplay {
-    try Self.activeIntegratedDisplay(in: await list())
-  }
-
-  static func activeIntegratedDisplay(in displays: [SimulatorDisplay]) throws -> SimulatorDisplay {
-    let active = displays.filter { $0.isActive && $0.isIntegrated }
-    guard let display = active.first else { throw SimulatorDisplayError.noActiveIntegratedDisplay }
-    guard active.count == 1 else { throw SimulatorDisplayError.ambiguousActiveDisplays(active.map(\.uniqueID)) }
-    return display
   }
 }

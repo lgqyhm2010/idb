@@ -14,13 +14,21 @@ public struct SimulatorHingeCommands {
     SimulatorHingeCommands(simulator: simulator)
   }
 
-  public func setAngle(_ angle: SimulatorHingeAngle) async throws {
-    try await simulator.sendHIDGesture(.hinge(angle))
+  public func set(_ angle: SimulatorHingeAngle) async throws {
+    try await MotionCapabilities.resolve(on: simulator).require(.hingeAngle)
+    try await simulator.hid.vendorDefined.send(angle.vendorEvent())
+  }
+
+  /// Sets the hinge, then waits within `timeout` for the measured angle to come within half a degree of it and
+  /// for the displays to settle. Returns the configuration the change left the displays in, which is
+  /// `.transitioning` when they outlast the budget.
+  public func set(_ angle: SimulatorHingeAngle, confirmingWithin timeout: Duration) async throws -> SimulatorDisplayConfiguration {
+    try await set(angle, confirmingWithin: timeout, interval: .milliseconds(100))
   }
 
   /// Reads a fresh measured angle. During a hinge animation this can be between its endpoints.
-  public func angle() async throws -> SimulatorHingeAngle {
-    try await SimulatorMotionCapability.hingeAngle.requireSupported(on: simulator)
+  public func current() async throws -> SimulatorHingeAngle {
+    try await MotionCapabilities.resolve(on: simulator).require(.hingeAngle)
     let channel = UUID()
     // Samples older than the request are the provider replaying its last known state.
     let notBefore = ProcessInfo.processInfo.systemUptime
@@ -31,4 +39,14 @@ public struct SimulatorHingeCommands {
       try SimulatorHingeProtocol.sample(event, channel: channel, notBefore: notBefore, now: ProcessInfo.processInfo.systemUptime)
     }
   }
+}
+
+extension SimulatorHingeCommands: PoseCommands {
+  var displays: any DisplayCommands { simulator.displays }
+
+  func reached(_ value: SimulatorHingeAngle, target: SimulatorHingeAngle) -> Bool {
+    abs(value.degrees - target.degrees) <= 0.5
+  }
+
+  func pose(_ value: SimulatorHingeAngle) -> SimulatorPose { .hinge(value) }
 }

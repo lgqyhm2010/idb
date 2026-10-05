@@ -6,6 +6,7 @@
  */
 
 import Darwin
+@preconcurrency import FBControlCore
 import Foundation
 
 /// The failure cases of the HID layer. They are surfaced only as messages — no consumer inspects
@@ -25,23 +26,29 @@ public enum SimulatorHIDError: Error, LocalizedError {
   case machSendFailed(port: mach_port_t, detail: String, code: kern_return_t)
   /// The SimulatorKit framework executable could not be opened.
   case simulatorKitUnavailable
-  /// The legacy keyboard HID service has been handed over to `dtuhidd` (Xcode 27+).
-  case keyboardSuppressedByDTUHIDD
+  /// The guest drops the named kind of legacy Indigo input (Xcode 27+).
+  case legacyInputSuppressed(operation: String)
   /// A primitive is not (yet) implemented on the DTUHID transport.
   case notImplementedOnDTUHIDTransport(operation: String)
-  /// The `dtuhidd` digitizer service could not be looked up in the simulator's bootstrap namespace.
-  case dtuhidDigitizerServiceUnavailable(underlying: Error?)
+  /// The named `dtuhidd` service could not be looked up in the simulator's bootstrap namespace.
   case dtuhidServiceUnavailable(name: String, underlying: Error?)
+  /// The simulator's runtime does not vend the named `dtuhidd` service at all.
+  case dtuhidServiceNotVended(name: String)
+  /// The simulator is not booted, so it vends no `dtuhidd` service.
+  case dtuhidSimulatorNotBooted(name: String, state: TargetState)
   /// The private `_4sim` XPC endpoint symbols could not be resolved (older toolchain).
   case dtuhidXPCSymbolsUnavailable
   /// The `dtuhidd` host XPC connection could not be created.
   case dtuhidConnectionFailed
   /// The connection was built, but no live `dtuhidd` answered behind it.
   case dtuhidUnresponsive(attempts: Int, underlying: Error?)
+  /// An established connection to the named service has been invalidated, so nothing sent on it
+  /// can arrive.
+  case dtuhidConnectionInvalidated(name: String)
+  /// A vendor-defined report for the named virtual-machine control could not be serialized.
+  case vendorReportUnserializable(source: String)
   /// A touchscreen touch was attempted on a tvOS target, which has no touchscreen.
   case touchUnsupportedOnAppleTV
-  /// A touch was aimed at a display other than the main one, which only the DTUHID transport can address.
-  case touchTargetUnsupportedOnIndigoTransport(displayUniqueID: String)
 
   public var errorDescription: String? {
     switch self {
@@ -63,15 +70,17 @@ public enum SimulatorHIDError: Error, LocalizedError {
       return "mach_msg to PurpleWorkspacePort \(port) failed: \(detail) (kr=0x\(String(code, radix: 16)))"
     case .simulatorKitUnavailable:
       return "Could not open the SimulatorKit framework executable"
-    case .keyboardSuppressedByDTUHIDD:
+    case let .legacyInputSuppressed(operation):
       return
-        "Keyboard HID is suppressed: CoreSimulator-1155.4 (Xcode 27) and later hand the legacy keyboard service over to dtuhidd for the lifetime of the boot. Use the DTUHID transport, which is the default on this CoreSimulator."
+        "\(operation) over Indigo is suppressed: CoreSimulator-1155.4 (Xcode 27) and later do not reliably deliver legacy Indigo \(operation.lowercased()) events. Use the DTUHID transport, which is the default on this CoreSimulator."
     case let .notImplementedOnDTUHIDTransport(operation):
       return "\(operation) is not implemented on the DTUHID transport"
     case let .dtuhidServiceUnavailable(name, _):
       return "Could not look up the dtuhidd service (\(name))"
-    case .dtuhidDigitizerServiceUnavailable:
-      return "Could not look up the dtuhidd digitizer service (com.apple.coredevice.feature.remote.hid.digitizer)"
+    case let .dtuhidServiceNotVended(name):
+      return "The simulator's runtime does not vend the dtuhidd service (\(name))"
+    case let .dtuhidSimulatorNotBooted(name, state):
+      return "The simulator is \(state.stateString.rawValue), not booted, so the dtuhidd service (\(name)) cannot be looked up"
     case .dtuhidXPCSymbolsUnavailable:
       return "Could not resolve the private _4sim XPC endpoint symbols required for the DTUHID transport"
     case .dtuhidConnectionFailed:
@@ -80,11 +89,12 @@ public enum SimulatorHIDError: Error, LocalizedError {
       let detail = underlying.map { " (\($0))" } ?? ""
       return
         "dtuhidd did not answer a liveness probe in \(attempts) attempts\(detail) — the daemon is not running and launchd is not keeping it up, so every HID event sent to it would be discarded without error"
+    case let .dtuhidConnectionInvalidated(name):
+      return "The dtuhidd connection (\(name)) has been invalidated; events sent on it would be discarded"
+    case let .vendorReportUnserializable(source):
+      return "Could not serialize the vendor-defined HID report for \(source)"
     case .touchUnsupportedOnAppleTV:
       return "Touch input is not supported on tvOS targets (no touchscreen)"
-    case let .touchTargetUnsupportedOnIndigoTransport(displayUniqueID):
-      return
-        "Cannot route a touch to display \(displayUniqueID): the legacy Indigo HID transport only addresses the main screen"
     }
   }
 
@@ -93,6 +103,10 @@ public enum SimulatorHIDError: Error, LocalizedError {
     switch error {
     case .symbolsUnavailable:
       self = .dtuhidXPCSymbolsUnavailable
+    case let .notBooted(service, state):
+      self = .dtuhidSimulatorNotBooted(name: service, state: state)
+    case let .lookupFailed(service, _) where error.isServiceUnsupported:
+      self = .dtuhidServiceNotVended(name: service)
     case let .lookupFailed(service, underlying):
       self = .dtuhidServiceUnavailable(name: service, underlying: underlying)
     case .connectionFailed:
@@ -100,28 +114,15 @@ public enum SimulatorHIDError: Error, LocalizedError {
     }
   }
 
-  /// Whether this failure could clear on its own, so connecting is worth another attempt.
+  /// Whether this failure is a property of the toolchain, runtime or simulator that no amount of
+  /// waiting changes, so connecting is not worth another attempt.
   ///
-  /// The service lookup fails while the job is being torn down and respawned, which is the state a
-  /// retry exists to ride out. Absent `_4sim` symbols are the opposite: a property of the toolchain
-  /// that no amount of waiting changes.
-  var isTransientDTUHIDFailure: Bool {
+  /// Anything else is retried: the case retrying exists for — a `dtuhidd` that aborted early in boot
+  /// and whose respawn launchd is throttling — shows up as an unanswered probe, and a failure not
+  /// known to be permanent is worth riding out with it.
+  var isPermanentDTUHIDFailure: Bool {
     switch self {
-    case .dtuhidServiceUnavailable, .dtuhidDigitizerServiceUnavailable, .dtuhidConnectionFailed, .dtuhidUnresponsive:
-      return true
-    default:
-      return false
-    }
-  }
-
-  /// Whether this failure means `dtuhidd` could not be reached on this host at all, as opposed to a
-  /// fault in a transport that was successfully established. Only these are worth negotiating
-  /// around by falling back to the legacy Indigo transport; anything else is a real error that has
-  /// to surface to the caller.
-  var isDTUHIDUnreachable: Bool {
-    switch self {
-    case .dtuhidXPCSymbolsUnavailable, .dtuhidServiceUnavailable, .dtuhidDigitizerServiceUnavailable, .dtuhidConnectionFailed,
-      .dtuhidUnresponsive:
+    case .dtuhidXPCSymbolsUnavailable, .dtuhidServiceNotVended, .dtuhidSimulatorNotBooted:
       return true
     default:
       return false

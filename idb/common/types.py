@@ -41,6 +41,43 @@ class AccessibilityWaitResult:
         return self.found
 
 
+class QuiescenceState(Enum):
+    BUSY = "busy"
+    SETTLING = "settling"
+    QUIET = "quiet"
+
+
+@dataclass(frozen=True)
+class QuiescenceStateChanged:
+    pid: int
+    state: QuiescenceState
+    # Names of the signals left unanswered past the busy threshold; empty unless busy.
+    busy_signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuiescenceTouchesCompleted:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetChanged:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetExited:
+    pid: int
+
+
+QuiescenceEvent = Union[
+    QuiescenceStateChanged,
+    QuiescenceTouchesCompleted,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+]
+
+
 class IdbException(Exception):
     pass
 
@@ -151,6 +188,10 @@ class HIDButtonType(Enum):
     LOCK = 3
     SIDE_BUTTON = 4
     SIRI = 5
+    PLAY_PAUSE = 6
+    VOLUME_UP = 7
+    VOLUME_DOWN = 8
+    EJECT = 9
 
 
 ConnectionDestination = Union[str, Address]
@@ -163,6 +204,8 @@ class CompanionInfo:
     pid: int | None
     address: Address
     metadata: LoggingMetadata = field(default_factory=dict)
+    supported_compressions: "frozenset[Compression]" = frozenset()
+    zstd_zip_streams: bool = False
 
 
 @dataclass(frozen=True)
@@ -331,6 +374,15 @@ class Screenshot(bytes):
 DeviceDetails = Mapping[str, Union[int, str]]
 
 
+def _json_default(value: object) -> object:
+    # asdict leaves sets and plain enums in place, and json encodes neither.
+    if isinstance(value, frozenset):
+        return sorted(value, key=str)
+    if isinstance(value, Enum):
+        return value.name
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 @dataclass(frozen=True)
 class TargetDescription:
     udid: str
@@ -349,7 +401,7 @@ class TargetDescription:
 
     @property
     def as_json(self) -> str:
-        return json.dumps(asdict(self))
+        return json.dumps(asdict(self), default=_json_default)
 
 
 @dataclass(frozen=True)
@@ -681,44 +733,9 @@ class HIDHinge:
             raise ValueError("Hinge angle must be finite and between 0 and 180 degrees")
 
 
-# Selects the active integrated display, in place of a display's unique id.
-ACTIVE_DISPLAY = "active"
-
-
-@dataclass(frozen=True)
-class HIDDisplay:
-    """Routes the touches after it in the same HID stream to one display's
-    touchscreen. An empty unique_id selects the active integrated display."""
-
-    unique_id: str
-
-
 HIDEvent = Union[
-    HIDPress,
-    HIDSwipe,
-    HIDDelay,
-    HIDPinch,
-    HIDOrientation,
-    HIDShake,
-    HIDHinge,
-    HIDDisplay,
+    HIDPress, HIDSwipe, HIDDelay, HIDPinch, HIDOrientation, HIDShake, HIDHinge
 ]
-
-
-@dataclass(frozen=True)
-class DisplayInfo:
-    unique_id: str
-    name: str
-    active: bool
-    primary: bool
-    integrated: bool
-    # Size in the display's unrotated pixel space.
-    width: float
-    height: float
-    scale: float
-    rotation: str
-    # Whether touches can be routed to it.
-    touchscreen: bool
 
 
 @dataclass(frozen=True)
@@ -998,6 +1015,10 @@ class Client(ABC):
         pass
 
     @abstractmethod
+    async def clear_delivered_notifications(self, bundle_id: str) -> None:
+        pass
+
+    @abstractmethod
     async def approve(
         self, bundle_id: str, permissions: set[Permission], scheme: str | None = None
     ) -> None:
@@ -1040,13 +1061,7 @@ class Client(ABC):
         pass
 
     @abstractmethod
-    async def tap(
-        self,
-        x: float,
-        y: float,
-        duration: float | None = None,
-        display: str | None = None,
-    ) -> None:
+    async def tap(self, x: float, y: float, duration: float | None = None) -> None:
         pass
 
     @abstractmethod
@@ -1057,7 +1072,6 @@ class Client(ABC):
         count: int = 2,
         duration: float | None = None,
         pause: float = 0.1,
-        display: str | None = None,
     ) -> None:
         pass
 
@@ -1088,10 +1102,6 @@ class Client(ABC):
         pass
 
     @abstractmethod
-    async def list_displays(self) -> list[DisplayInfo]:
-        pass
-
-    @abstractmethod
     async def shake(self) -> None:
         pass
 
@@ -1110,7 +1120,6 @@ class Client(ABC):
         p_end: tuple[int, int],
         duration: float | None = None,
         delta: int | None = None,
-        display: str | None = None,
     ) -> None:
         pass
 
@@ -1152,6 +1161,19 @@ class Client(ABC):
     ) -> bool:
         """Wait for a marker; return False on timeout and propagate other failures."""
         pass
+
+    @abstractmethod
+    async def accessibility_quiescence(
+        self,
+        pid: int | None = None,
+        bundle_id: str | None = None,
+        busy_threshold_ms: int | None = None,
+        quiet_window_ms: int | None = None,
+    ) -> AsyncGenerator[QuiescenceEvent, None]:
+        """Stream quiescence events for an application, or the frontmost one when
+        neither pid nor bundle_id is given. A None tunable takes the companion's default."""
+        # pyrefly: ignore [invalid-yield]
+        yield
 
     async def accessibility_wait_result(
         self,
@@ -1303,7 +1325,6 @@ class Client(ABC):
         scale: float,
         duration: float = 0.5,
         radius: float = 100.0,
-        display: str | None = None,
     ) -> None: ...
 
     @abstractmethod

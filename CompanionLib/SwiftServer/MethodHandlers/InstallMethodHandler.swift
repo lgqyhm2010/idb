@@ -10,16 +10,18 @@ import FBSimulatorControl
 import Foundation
 import GRPCCore
 import IDBGRPCSwift
+import os
 
 struct InstallMethodHandler: @unchecked Sendable {
 
   let commandExecutor: IDBCommandExecutor
   let targetLogger: ControlCoreLogger
+  let streamCapabilities: StreamCapabilities
 
   func handle(requestStream: RequestStreamReader<Idb_InstallRequest>, responseStream: RPCWriter<Idb_InstallResponse>, context: ServerContext) async throws {
 
     let artifact = try await Self.mapSimulatorInstallErrors {
-      try await install(requestStream: requestStream, responseStream: responseStream)
+      try await install(requestStream: requestStream, responseStream: responseStream, context: context)
     }
 
     let response = Idb_InstallResponse.with {
@@ -45,7 +47,7 @@ struct InstallMethodHandler: @unchecked Sendable {
     }
   }
 
-  private func install(requestStream: RequestStreamReader<Idb_InstallRequest>, responseStream: RPCWriter<Idb_InstallResponse>) async throws -> InstalledArtifact {
+  private func install(requestStream: RequestStreamReader<Idb_InstallRequest>, responseStream: RPCWriter<Idb_InstallResponse>, context: ServerContext) async throws -> InstalledArtifact {
 
     func extractPayloadFromRequest() throws -> Idb_Payload {
       guard let payload = request.extractPayload() else {
@@ -94,21 +96,46 @@ struct InstallMethodHandler: @unchecked Sendable {
 
     var compression = FBCompressionFormat.GZIP
     if case let .compression(format) = payload.source {
-      compression = readCompressionFormat(from: format)
+      compression = FBCompressionFormat(format)
       request = try await requestStream.requiredNext()
       payload = try extractPayloadFromRequest()
     }
 
-    return try await installData(
-      from: payload.source,
-      to: destination,
-      requestStream: requestStream,
-      name: name,
-      makeDebuggable: makeDebuggable,
-      linkToBundle: linkToBundle,
-      compression: compression,
-      overrideModificationTime: overrideModificationTime,
-      skipSigningBundles: skipSigningBundles)
+    let telemetry = InstallTelemetry(payloadKind: try payloadKind(of: payload.source))
+    defer {
+      if let call = CallTelemetry.current {
+        telemetry.record(into: call)
+      }
+    }
+    do {
+      return try await installData(
+        from: payload.source,
+        to: destination,
+        requestStream: requestStream,
+        name: name,
+        makeDebuggable: makeDebuggable,
+        linkToBundle: linkToBundle,
+        compression: compression,
+        overrideModificationTime: overrideModificationTime,
+        skipSigningBundles: skipSigningBundles,
+        telemetry: telemetry)
+    } catch {
+      telemetry.failed(error, rpcCancelled: context.cancellation.isCancelled)
+      throw error
+    }
+  }
+
+  private func payloadKind(of source: Idb_Payload.OneOf_Source?) throws -> InstallPayloadKind {
+    switch source {
+    case .data:
+      return .data
+    case .url:
+      return .url
+    case .filePath:
+      return .filePath
+    default:
+      throw RPCError(code: .invalidArgument, message: "Incorrect payload source")
+    }
   }
 
   private func installData(
@@ -120,13 +147,14 @@ struct InstallMethodHandler: @unchecked Sendable {
     linkToBundle: DsymInstallLinkToBundle?,
     compression: FBCompressionFormat,
     overrideModificationTime: Bool,
-    skipSigningBundles: Bool
+    skipSigningBundles: Bool,
+    telemetry: InstallTelemetry
   ) async throws -> InstalledArtifact {
 
-    func installSource(dataStream: FBProcessInput<AnyObject>, skipSigningBundles: Bool) async throws -> InstalledArtifact {
+    func installSource(dataStream: FBProcessInput<AnyObject>, compression: FBCompressionFormat, skipSigningBundles: Bool) async throws -> InstalledArtifact {
       switch destination {
       case .app:
-        return try await commandExecutor.install_app_stream(dataStream, compression: compression, make_debuggable: makeDebuggable, override_modification_time: overrideModificationTime)
+        return try await commandExecutor.install_app_stream(dataStream, compression: compression, make_debuggable: makeDebuggable, override_modification_time: overrideModificationTime, on_progress: telemetry.observe)
       case .xctest:
         return try await commandExecutor.install_xctest_app_stream(dataStream, skipSigningBundles: skipSigningBundles)
       case .dsym:
@@ -143,18 +171,32 @@ struct InstallMethodHandler: @unchecked Sendable {
     switch source {
     case let .data(data):
       if destination == .app && isZipArchive(data) {
-        return try await installZipArchive(
-          initial: data,
-          requestStream: requestStream,
-          makeDebuggable: makeDebuggable,
-          overrideModificationTime: overrideModificationTime)
+        telemetry.streamed(.zip)
+        return try await installStreamedZip(makeDebuggable: makeDebuggable, overrideModificationTime: overrideModificationTime, telemetry: telemetry) { archiveURL, tee in
+          try await spool(initial: data, requestStream: requestStream, to: archiveURL, teeingTo: tee, telemetry: telemetry)
+        }
+      }
+      if destination == .app && Self.isZstdZipStream(data) {
+        telemetry.streamed(.zstdZip)
+        return try await installStreamedZip(makeDebuggable: makeDebuggable, overrideModificationTime: overrideModificationTime, telemetry: telemetry) { archiveURL, tee in
+          try await decompressZstd(initial: data, requestStream: requestStream, to: archiveURL, teeingTo: tee, telemetry: telemetry)
+        }
       }
 
+      let tarCompression = Self.tarCompression(declared: compression, initial: data)
+      if tarCompression != compression {
+        let head = data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+        targetLogger.log("Extracting a stream declared \(compression) as \(tarCompression), as it does not start with a zstd frame: \(head)")
+      }
+      if destination == .app {
+        telemetry.streamed(InstallStreamFormat(tarCompression: tarCompression))
+      }
       let input = FBProcessInput<OutputStream>.fromStream()
       let output = input.contents
-      async let writePayload: Void = writePayload(initial: data, requestStream: requestStream, output: output)
+      async let writePayload: Void = writePayload(initial: data, requestStream: requestStream, output: output, telemetry: telemetry)
       let artifact = try await installSource(
         dataStream: input.retyped(FBProcessInput<AnyObject>.self),
+        compression: tarCompression,
         skipSigningBundles: skipSigningBundles)
       try await writePayload
       return artifact
@@ -163,15 +205,18 @@ struct InstallMethodHandler: @unchecked Sendable {
       guard let url = URL(string: urlString) else {
         throw RPCError(code: .invalidArgument, message: "Invalid url source")
       }
+      if destination == .app {
+        return try await commandExecutor.install_app_url(url, compression: compression, make_debuggable: makeDebuggable, override_modification_time: overrideModificationTime, on_progress: telemetry.observe)
+      }
       let download = DataDownloadInput.dataDownload(withURL: url, logger: targetLogger)
       let input = download.input
 
-      return try await installSource(dataStream: input, skipSigningBundles: skipSigningBundles)
+      return try await installSource(dataStream: input, compression: compression, skipSigningBundles: skipSigningBundles)
 
     case let .filePath(filePath):
       switch destination {
       case .app:
-        return try await commandExecutor.install_app_file_path(filePath, make_debuggable: makeDebuggable, override_modification_time: overrideModificationTime)
+        return try await commandExecutor.install_app_file_path(filePath, make_debuggable: makeDebuggable, override_modification_time: overrideModificationTime, on_progress: telemetry.observe)
       case .xctest:
         return try await commandExecutor.install_xctest_app_file_path(filePath, skipSigningBundles: skipSigningBundles)
       case .dsym:
@@ -190,65 +235,180 @@ struct InstallMethodHandler: @unchecked Sendable {
   }
 
   private func isZipArchive(_ data: Data) -> Bool {
-    data.starts(with: [0x50, 0x4B, 0x03, 0x04])
+    data.starts(with: ZipSignature.localHeaderBytes)
   }
 
-  private func installZipArchive(
-    initial: Data,
-    requestStream: RequestStreamReader<Idb_InstallRequest>,
+  /// The zstd skippable frame that `CompanionInfo.zstd_zip_streams` clients start a compressed zip with.
+  static let zstdZipStreamMarker: [UInt8] = [0x5E, 0x2A, 0x4D, 0x18, 0x08, 0x00, 0x00, 0x00] + Array("idb-zip\0".utf8)
+
+  static func isZstdZipStream(_ data: Data) -> Bool {
+    data.starts(with: zstdZipStreamMarker)
+  }
+
+  /// The compression to extract a streamed tar with, given the one the client declared and the stream's first bytes.
+  ///
+  /// A stream declared zstd that does not start with a zstd frame is extracted as if undeclared, which detects gzip
+  /// and plain tars from their contents, rather than by the zstd decompressor, which would reject it.
+  static func tarCompression(declared: FBCompressionFormat, initial: Data) -> FBCompressionFormat {
+    guard declared == .ZSTD, initial.count >= 4 else {
+      return declared
+    }
+    let magic = Array(initial.prefix(4))
+    let isFrame = magic == [0x28, 0xB5, 0x2F, 0xFD]
+    let isSkippableFrame = magic[0] & 0xF0 == 0x50 && magic[1...] == [0x2A, 0x4D, 0x18]
+    return isFrame || isSkippableFrame ? .ZSTD : .GZIP
+  }
+
+  /// A zip is extracted as `receive` spools it to disk, and also from the spool
+  /// once complete, as its central directory is at the end.
+  private func installStreamedZip(
     makeDebuggable: Bool,
-    overrideModificationTime: Bool
+    overrideModificationTime: Bool,
+    telemetry: InstallTelemetry,
+    receive: sending @escaping (_ archiveURL: URL, _ tee: OutputStream) async throws -> Void
   ) async throws -> InstalledArtifact {
-    let archiveURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent(UUID().uuidString)
-      .appendingPathExtension("ipa")
+    let archiveURL = try makeArchiveFile()
+    defer { try? FileManager.default.removeItem(at: archiveURL) }
+
+    let input = FBProcessInput<OutputStream>.fromStream()
+    let (spooled, spoolCompletion) = AsyncThrowingStream<Never, Error>.makeStream()
+    async let receiving: Void = {
+      do {
+        try await receive(archiveURL, input.contents)
+        spoolCompletion.finish()
+      } catch {
+        spoolCompletion.finish(throwing: error)
+        throw error
+      }
+    }()
+    let artifact: InstalledArtifact
+    do {
+      artifact = try await commandExecutor.install_app_zip_stream(
+        input.retyped(FBProcessInput<AnyObject>.self),
+        spoolPath: archiveURL.path,
+        spooled: {
+          for try await _ in spooled {}
+        },
+        make_debuggable: makeDebuggable,
+        override_modification_time: overrideModificationTime,
+        on_progress: telemetry.observe)
+    } catch {
+      // The installer sees a failed receive only as a failed extraction.
+      try await receiving
+      throw error
+    }
+    try await receiving
+    return artifact
+  }
+
+  private func makeArchiveFile() throws -> URL {
+    let archiveURL = commandExecutor.temporaryDirectory.ephemeralTemporaryDirectory().appendingPathExtension("ipa")
     guard FileManager.default.createFile(atPath: archiveURL.path, contents: nil) else {
       throw RPCError(code: .internalError, message: "Failed to create temporary install archive")
     }
-    defer { try? FileManager.default.removeItem(at: archiveURL) }
+    return archiveURL
+  }
 
+  private func spool(
+    initial: Data,
+    requestStream: RequestStreamReader<Idb_InstallRequest>,
+    to archiveURL: URL,
+    teeingTo output: OutputStream,
+    telemetry: InstallTelemetry
+  ) async throws {
     let file = try FileHandle(forWritingTo: archiveURL)
-    do {
-      try file.write(contentsOf: initial)
-      for try await request in requestStream {
-        guard let data = request.extractDataFrame() else {
-          continue
-        }
+    var tee: OutputStream? = output
+    tee?.open()
+    defer { tee?.close() }
+    try await telemetry.receive { receive in
+      func append(_ data: Data) throws {
         try file.write(contentsOf: data)
+        receive.count(data)
+        guard let stream = tee else {
+          return
+        }
+        do {
+          try stream.writeAll(data)
+        } catch {
+          // The reader may finish before the end or fail; the spooled file carries on regardless.
+          targetLogger.log("Stopped teeing the streamed zip to its stream extractor, which extraction from the spooled file recovers from: \(error)")
+          stream.close()
+          tee = nil
+        }
       }
-      try file.close()
-    } catch {
-      try? file.close()
-      throw error
+      do {
+        try append(initial)
+        for try await request in requestStream {
+          guard let data = request.extractDataFrame() else {
+            continue
+          }
+          try append(data)
+        }
+        try file.close()
+      } catch {
+        try? file.close()
+        throw error
+      }
     }
+  }
 
-    return try await commandExecutor.install_app_file_path(
-      archiveURL.path,
-      make_debuggable: makeDebuggable,
-      override_modification_time: overrideModificationTime)
+  /// The decompressor writes to the archive file, which is followed as it grows
+  /// to tee the zip, as a pipe between them would need a third process.
+  private func decompressZstd(
+    initial: Data,
+    requestStream: RequestStreamReader<Idb_InstallRequest>,
+    to archiveURL: URL,
+    teeingTo tee: OutputStream,
+    telemetry: InstallTelemetry
+  ) async throws {
+    guard let decompressor = streamCapabilities.zstdDecompressorPath else {
+      throw RPCError(code: .failedPrecondition, message: "A zstd zip stream needs pzstd on the companion's PATH")
+    }
+    targetLogger.log("Decompressing a zstd zip stream with \(decompressor)")
+    let input = FBProcessInput<OutputStream>.fromStream()
+    let decompressed = OSAllocatedUnfairLock(initialState: false)
+    async let writePayload: Void = writePayload(initial: initial, requestStream: requestStream, output: input.contents, telemetry: telemetry)
+    async let decompressing: Void = {
+      defer { decompressed.withLock { $0 = true } }
+      _ = try await bridgeFBFuture(
+        FBArchiveOperations.extractZstd(
+          fromStream: input.retyped(FBProcessInput<AnyObject>.self),
+          toPath: archiveURL.path,
+          decompressorPath: decompressor,
+          logger: targetLogger))
+    }()
+    tee.open()
+    defer { tee.close() }
+    do {
+      try await GrowingFile.copy(from: archiveURL.path, to: tee) { decompressed.withLock { $0 } }
+    } catch {
+      // The reader may finish before the end or fail; the archive file carries on regardless.
+      targetLogger.log("Stopped teeing the decompressed zip to its stream extractor, which extraction from the archive file recovers from: \(error)")
+      tee.close()
+    }
+    try await decompressing
+    try await writePayload
   }
 
   private func writePayload(
     initial: Data,
     requestStream: RequestStreamReader<Idb_InstallRequest>,
-    output: OutputStream
+    output: OutputStream,
+    telemetry: InstallTelemetry
   ) async throws {
     output.open()
     defer { output.close() }
 
-    try write(initial, to: output)
-    for try await request in requestStream {
-      guard let data = request.extractDataFrame() else {
-        continue
+    try await telemetry.receive { receive in
+      try output.writeAll(initial)
+      receive.count(initial)
+      for try await request in requestStream {
+        guard let data = request.extractDataFrame() else {
+          continue
+        }
+        try output.writeAll(data)
+        receive.count(data)
       }
-      try write(data, to: output)
-    }
-  }
-
-  private func write(_ data: Data, to output: OutputStream) throws {
-    var buffer = [UInt8](data)
-    guard output.write(&buffer, maxLength: buffer.count) == buffer.count else {
-      throw output.streamError ?? RPCError(code: .internalError, message: "Failed to write install payload")
     }
   }
 
@@ -266,15 +426,6 @@ struct InstallMethodHandler: @unchecked Sendable {
       return .xcTest
     case .UNRECOGNIZED:
       return .app
-    }
-  }
-
-  private func readCompressionFormat(from compression: Idb_Payload.Compression) -> FBCompressionFormat {
-    switch compression {
-    case .gzip, .UNRECOGNIZED:
-      return .GZIP
-    case .zstd:
-      return .ZSTD
     }
   }
 }

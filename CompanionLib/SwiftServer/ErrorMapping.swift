@@ -5,8 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import FBSimulatorControl
 import Foundation
 import GRPCCore
+import GRPCProtobuf
 
 /// Turns errors a handler throws into the status the client sees.
 ///
@@ -14,7 +16,16 @@ import GRPCCore
 /// with no message, which would discard the `NSError` descriptions the Objective-C frameworks
 /// produce. This keeps `RPCError`s as thrown and gives everything else an `internalError`
 /// carrying the error's description, unwrapping legacy `NSError` `userInfo` for detail.
+///
+/// A UI automation failure also carries whether it is safe to retry, as an `ErrorInfo` in the
+/// status details. Its code and message stay as they were, so clients that match on either are
+/// unaffected.
 enum ErrorMapping {
+
+  static let retryDomain = "idb"
+  static let retryErrorInfoReason = "UI_AUTOMATION_FAILURE"
+  static let retryVerdictKey = "retry"
+  static let retryReasonKey = "retry_reason"
 
   static func rpcError(from error: any Error) -> RPCError {
     if let rpcError = error as? RPCError {
@@ -22,12 +33,28 @@ enum ErrorMapping {
     }
 
     var message = error.localizedDescription
-    if type(of: error) == NSError.self {
+    let reported = reportedError(error)
+    if type(of: reported) == NSError.self {
       // Legacy NSError from objc, we should unwrap it for more expressive error handling.
       // Don't use `is NSError` check because all swift errors bridges to NSError successfully and this check passed
-      message = extractMessage(fromLegacyNSError: error as NSError)
+      message = extractMessage(fromLegacyNSError: reported as NSError)
     }
-    return RPCError(code: .internalError, message: message)
+    guard let retry = UIAutomationRetry(for: error) else {
+      return RPCError(code: .internalError, message: message)
+    }
+    let info = ErrorDetails.errorInfo(
+      reason: retryErrorInfoReason,
+      domain: retryDomain,
+      metadata: [retryVerdictKey: retry.verdict.rawValue, retryReasonKey: retry.reason.rawValue])
+    return RPCError(GoogleRPCStatus(code: .internalError, message: message, details: info))
+  }
+
+  /// An unconfirmed write reports the failure it wraps, so a legacy `NSError` underneath keeps its detail.
+  private static func reportedError(_ error: any Error) -> any Error {
+    guard case let .writeUnconfirmed(_, _, underlying)? = error as? UIAutomationError else {
+      return error
+    }
+    return underlying
   }
 
   private static func extractMessage(fromLegacyNSError error: NSError) -> String {

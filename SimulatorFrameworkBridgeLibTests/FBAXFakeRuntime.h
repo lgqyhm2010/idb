@@ -7,14 +7,16 @@
 
 #import <Foundation/Foundation.h>
 
-#import <SimulatorFrameworkBridgeLib/AccessibilityRuntime.h>
+#import <SimulatorFrameworkBridgeRuntime/AccessibilityRuntime.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
 @interface FBAXGeometryDictionaryProbeValue : NSDictionary
 @property (nonatomic) BOOL raises;
 @property (nonatomic) NSUInteger lookups;
+@property (nonatomic) NSUInteger maximumSuccessfulLookups;
 + (instancetype)geometry;
++ (instancetype)attributes;
 @end
 
 /** Exercises CoreGraphics dictionary access wholly inside an Objective-C exception guard. */
@@ -99,8 +101,22 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
 + (instancetype)throwingOnAccess:(NSString *)access;
 @end
 
+/** A quiescence monitor whose reports a test delivers by hand. */
+@interface FBAXFakeQuiescenceMonitor : NSObject <FBAXQuiescenceMonitor>
+
+/** Every request as `{signal, element}`, in order. */
+@property (nonatomic, readonly, strong) NSMutableArray<NSDictionary<NSString *, id> *> *requests;
+/** What `-requestSignal:fromApplication:` answers with. */
+@property (nonatomic, strong) FBAXWriteOutcome *requestOutcome;
+@property (nonatomic, readonly, getter = isInvalidated) BOOL invalidated;
+
+/** Calls the handler as the live monitor would on hearing `report`. Dropped once invalidated. */
+- (void)deliver:(FBAXQuiescenceReport)report pid:(pid_t)pid;
+
+@end
+
 /**
- * A fake `FBAXRuntime`, wired into the service by `FBAXBridgeSetRuntimeForTesting`.
+ * A fake `FBAXRuntime`, wired into the service by `+[FBAXClientProvider setRuntimeForTesting:]`.
  *
  * Reaches the outcomes the live runtime only produces against a broken, dead or unresponsive
  * application — which on a real simulator need an app to be killed, SIGSTOP-ed or hit mid-launch — with
@@ -109,10 +125,14 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
  */
 @interface FBAXFakeRuntime : NSObject <FBAXRuntime>
 
+@property (nullable, nonatomic, strong) FBAXGeometryDictionaryProbeValue *attributeRead;
+
 /** The named interaction to raise from; nil disables injection. */
 @property (nullable, nonatomic, copy) NSString *raiseOnOperation;
 /** Every interaction attempted, including the one that raised. */
 @property (nonatomic, readonly, strong) NSMutableArray<NSString *> *operations;
+
+@property (nonatomic, strong) FBAXDisplayInventoryOutcome *displayInventoryOutcome;
 
 /** Application elements by pid. A pid absent here is answered with nil, as an unknown pid is. */
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, FBAXFakeElement *> *applicationElements;
@@ -182,6 +202,11 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
 
 /** How many translator reads have been made — one request per node is the point of the batched form. */
 @property (nonatomic, readonly) NSUInteger translatorReadCount;
+/** When set, `-quiescenceMonitorWithHandler:error:` fails with this reason. */
+@property (nullable, nonatomic, copy) NSString *quiescenceMonitorError;
+/** Every monitor started, in order. */
+@property (nonatomic, readonly, strong) NSMutableArray<FBAXFakeQuiescenceMonitor *> *quiescenceMonitors;
+
 /** What both write methods answer with. */
 @property (nonatomic, strong) FBAXWriteOutcome *writeOutcome;
 
@@ -207,6 +232,8 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
 /** The point of the most recent hit-test, and the pid it was scoped to (0 for display-wide). */
 @property (nonatomic, readonly) CGPoint lastHitTestPoint;
 @property (nonatomic, readonly) pid_t lastHitTestProcessIdentifier;
+@property (nullable, nonatomic, readonly) NSNumber *lastHitTestDisplayIdentifier;
+@property (nullable, nonatomic, readonly) NSNumber *lastFrontmostDisplayIdentifier;
 /**
  * What the most recent write was asked to do.
  *

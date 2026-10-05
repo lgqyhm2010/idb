@@ -9,11 +9,11 @@
 
 #import <dlfcn.h>
 
+#import "Private/SystemConfigurationPrivate.h"
 #import "SystemConfigurationLoader.h"
-#import "SystemConfigurationPrivate.h"
 
 @implementation FBNetworkConfigurationRead
-- (instancetype)initWithConfiguration:(NSDictionary<NSString *, id> *)configuration
+- (instancetype)initWithConfiguration:(id)configuration
 {
   self = [super init];
   if (self) {
@@ -88,7 +88,7 @@
     NSLog(@"[%@] SCDynamicStoreCopyValue not found", _service);
     return nil;
   }
-  NSDictionary *configuration = CFBridgingRelease(copyValue(_store, _key));
+  id configuration = CFBridgingRelease(copyValue(_store, _key));
   return [[FBNetworkConfigurationRead alloc] initWithConfiguration:configuration];
 }
 

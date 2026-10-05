@@ -9,51 +9,6 @@ import Foundation
 
 extension FBArchiveOperations {
 
-  /// Async wrapper for `extractArchiveAtPath:toPath:overrideModificationTime:logger:`.
-  public static func extractArchiveAsync(
-    atPath path: String,
-    toPath extractPath: String,
-    overrideModificationTime overrideMTime: Bool,
-    logger: any ControlCoreLogger
-  ) async throws -> String {
-    let value = try await bridgeFBFuture(
-      extractArchive(
-        atPath: path,
-        toPath: extractPath,
-        overrideModificationTime: overrideMTime,
-        logger: logger))
-    return value as String
-  }
-
-  /// Async wrapper for `extractArchiveFromStream:toPath:overrideModificationTime:logger:compression:`.
-  public static func extractArchiveAsync(
-    fromStream stream: FBProcessInput<AnyObject>,
-    toPath extractPath: String,
-    overrideModificationTime overrideMTime: Bool,
-    logger: any ControlCoreLogger,
-    compression: FBCompressionFormat
-  ) async throws -> String {
-    let value = try await bridgeFBFuture(
-      extractArchive(
-        fromStream: stream,
-        toPath: extractPath,
-        overrideModificationTime: overrideMTime,
-        logger: logger,
-        compression: compression))
-    return value as String
-  }
-
-  /// Async wrapper for `extractGzipFromStream:toPath:logger:`.
-  public static func extractGzipAsync(
-    fromStream stream: FBProcessInput<AnyObject>,
-    toPath extractPath: String,
-    logger: any ControlCoreLogger
-  ) async throws -> String {
-    let value = try await bridgeFBFuture(
-      extractGzip(fromStream: stream, toPath: extractPath, logger: logger))
-    return value as String
-  }
-
   /// Async wrapper for `createGzipDataFromProcessInput:logger:`.
   public static func createGzipDataAsync(
     from input: FBProcessInput<AnyObject>,
@@ -76,16 +31,5 @@ extension FBArchiveOperations {
     logger: any ControlCoreLogger
   ) async throws -> FBSubprocess<NSNull, InputStream, AnyObject> {
     return try await bridgeFBFuture(createGzippedTar(forPath: path, logger: logger))
-  }
-
-  /// Async wrapper for `createGzippedTarDataForPath:queue:logger:`.
-  public static func createGzippedTarDataAsync(
-    forPath path: String,
-    queue: DispatchQueue,
-    logger: any ControlCoreLogger
-  ) async throws -> Data {
-    let value = try await bridgeFBFuture(
-      createGzippedTarData(forPath: path, queue: queue, logger: logger))
-    return value as Data
   }
 }

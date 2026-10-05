@@ -5,12 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#import <XCTestBootstrap/FBActivityRecord.h>
-#import <XCTestBootstrap/FBAttachment.h>
 #import <XCTestBootstrap/FBTestBundleDTXConnection.h>
 #import <XCTestBootstrap/FBTestConfiguration.h>
 #import <XCTestBootstrap/FBTestManagerAPIMediatorIDEInterface.h>
 #import <XCTestBootstrap/TestManagerResultSummary.h>
-#import <XCTestBootstrap/XCTestBootstrapError.h>
 
 // FBTestReporterAdapter.h is excluded: it imports XCTestPrivate headers.

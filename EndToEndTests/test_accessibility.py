@@ -7,11 +7,11 @@
 
 `--api ax` reads from macOS; `--api axbridge` runs SimulatorFrameworkBridge
 inside the simulator. Complete output identifies which backend served the
-request. Tests select labelled Settings rows at runtime to avoid
-locale-specific names. Tap and scroll tests verify navigation and movement
-through axbridge. SpringBoard and Safari are read as well, for the elements
-ax cannot reach: the notification banner drawn for an app that is not
-running, and the web content another process is showing.
+request. ReplHost, launched with `--accessibility-fixture`, shows a fixed
+screen whose elements carry known identifiers and change only when something
+acts on them; taps and scrolls are read back through axbridge. Safari is read
+as well, for the web content another process is showing, which ax cannot
+reach.
 """
 
 from __future__ import annotations
@@ -21,33 +21,44 @@ import json
 import unittest
 from typing import Any
 
-from .documentation import documented_demo
 from .harness import (
+    _center,
+    _describe_matches,
+    _elements,
+    _has_area,
+    _label,
+    _on_screen,
+    _screen,
     ACCESSIBILITY_NOT_READY_MARKER,
     ACCESSIBILITY_READY_TIMEOUT_SECONDS,
-    Deadline,
     FIXTURE_APP_BUNDLE_ID,
-    HarnessError,
     IdbEndToEndTestCase,
+    LocalPages,
     NotReady,
-    POLL_INTERVAL_SECONDS,
-    run_with_registered_cleanup,
+    Query,
     select_tests_for_capability,
-    suite_supports,
     SuiteCapability,
+    UI_UPDATE_TIMEOUT_SECONDS,
+    UiWait,
+    Until,
     wait_until,
 )
 
-SETTINGS_BUNDLE_ID = "com.apple.Preferences"
 SAFARI_BUNDLE_ID = "com.apple.mobilesafari"
-GENERAL_ROW_ID = "com.apple.settings.general"
-SETTINGS_ROW_PREFIX = "com.apple.settings."
+FIXTURE_LAUNCH_ARGUMENT = "--accessibility-fixture"
+ROW_PREFIX = "com.facebook.idb.replhost.row."
+GENERAL_ROW_ID = f"{ROW_PREFIX}general"
+GENERAL_ROW = Query(GENERAL_ROW_ID)
+SEARCH_FIELD_ID = "com.facebook.idb.replhost.search"
+SEARCH_FIELD = Query(SEARCH_FIELD_ID)
 # Views that carry the rows' identifier prefix without being rows.
 ROW_CONTAINER_TYPES = frozenset({"CollectionView", "Table", "ScrollView", "List"})
-UI_UPDATE_TIMEOUT_SECONDS = 30.0
 # A tap idb refused does nothing at all, so a wait long enough to catch a
 # screen that did change is short.
 NOTHING_OPENS_TIMEOUT_SECONDS = 2.0
+# Long enough for a `ui wait` to read the screen before General opens, so its
+# answer shows that it waited rather than that it started late.
+WAIT_BLOCKS_SECONDS = 2.0
 MINIMUM_SCROLL_DISTANCE = 20.0
 
 # The companion uses an exclusive simulator process for --api axbridge.
@@ -57,25 +68,7 @@ AXBRIDGE_BACKEND = "axbridge-exclusive"
 # Exclude narrow elements such as keyboard keys and status-bar icons.
 MINIMUM_CONTROL_WIDTH = 100
 
-CONTROL_DISCOVERY_TIMEOUT_SECONDS = ACCESSIBILITY_READY_TIMEOUT_SECONDS
 DESCRIBE_ALL_ARGS = ("ui", "describe-all", "--nested")
-
-NEWS_BUNDLE_ID = "com.apple.news"
-NOTIFICATION_TITLE = "Breaking"
-NOTIFICATION_PAYLOAD = json.dumps(
-    {
-        "aps": {
-            "alert": {
-                "title": NOTIFICATION_TITLE,
-                "body": "idb delivered this without the app running.",
-            }
-        }
-    }
-)
-# SpringBoard draws the banner, and a read is scoped to the frontmost
-# application, so the banner is only in the tree while SpringBoard is it.
-BANNER_ID = "ShortLook.Platter.Content.Seamless"
-NOTIFICATION_STORE_TIMEOUT_SECONDS = 300.0
 
 # Enough of a matched element to say what it is and where it sits, rather
 # than every attribute a read would otherwise carry on every match.
@@ -134,37 +127,6 @@ STAND_IN_PAGES = {
 }
 
 
-def _elements(node: Any) -> list[dict[str, Any]]:
-    """Flatten flat, nested and complete accessibility output into dictionaries."""
-    found: list[dict[str, Any]] = []
-    if isinstance(node, dict):
-        found.append(node)
-        for value in node.values():
-            found.extend(_elements(value))
-    elif isinstance(node, list):
-        for child in node:
-            found.extend(_elements(child))
-    return found
-
-
-def _label(element: dict[str, Any]) -> str:
-    """Read the label from legacy output (AXLabel) or complete output (label)."""
-    for key in ("AXLabel", "label"):
-        value = element.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def _has_area(element: dict[str, Any]) -> bool:
-    frame = element.get("frame")
-    return (
-        isinstance(frame, dict)
-        and bool(frame.get("width"))
-        and bool(frame.get("height"))
-    )
-
-
 def _labelled_controls(document: Any) -> list[dict[str, Any]]:
     """Select labelled, row-width elements smaller than the largest container."""
     elements = [
@@ -185,49 +147,13 @@ def _labelled_controls(document: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _identifier(element: dict[str, Any]) -> str | None:
+    """Read the identifier from legacy output (AXUniqueId) or complete output."""
+    return element.get("AXUniqueId") or element.get("identifier")
+
+
 def _labels(document: Any) -> set[str]:
     return {_label(element) for element in _labelled_controls(document)}
-
-
-def _screen(document: Any) -> dict[str, float] | None:
-    """The bounds of the screen everything in a document sits on.
-
-    A complete document says which screen it was read from. One that does not
-    is measured by its largest frame, which is only the screen when the tree
-    holds nothing larger: a list's background can extend well above the
-    window, and the application's own frame can be reported in pixels.
-    """
-    reported = document.get("screen") if isinstance(document, dict) else None
-    if isinstance(reported, dict) and reported.get("width") and reported.get("height"):
-        return {
-            "x": 0.0,
-            "y": 0.0,
-            "width": float(reported["width"]),
-            "height": float(reported["height"]),
-        }
-    frames = [element["frame"] for element in _elements(document) if _has_area(element)]
-    if not frames:
-        return None
-    return max(frames, key=lambda frame: frame["width"] * frame["height"])
-
-
-def _on_screen(element: dict[str, Any], screen: dict[str, float] | None) -> bool:
-    """Something a viewer can see: it has area, is not hidden, and is on the screen.
-
-    The accessibility tree holds what an app has built, not what is in front of
-    the viewer: a row scrolled out of the window, a zero-sized placeholder and a
-    hidden element are all in it. A demo is a recording of a screen, so what it
-    claims to show has to be on that screen.
-    """
-    if screen is None or not _has_area(element) or element.get("hidden") is True:
-        return False
-    frame = element["frame"]
-    return (
-        frame["x"] < screen["x"] + screen["width"]
-        and frame["y"] < screen["y"] + screen["height"]
-        and frame["x"] + frame["width"] > screen["x"]
-        and frame["y"] + frame["height"] > screen["y"]
-    )
 
 
 def _visible(
@@ -244,8 +170,8 @@ def _visible(
     ]
 
 
-def _settings_rows(document: Any) -> list[dict[str, Any]]:
-    """The Settings rows, which are the elements identified with their prefix.
+def _rows(document: Any) -> list[dict[str, Any]]:
+    """The fixture's rows, which are the elements identified with their prefix.
 
     The list the rows sit in shares that prefix without being a row: its
     position never changes as it scrolls, and it is not something a scroll can
@@ -254,53 +180,96 @@ def _settings_rows(document: Any) -> list[dict[str, Any]]:
     return [
         element
         for element in _elements(document)
-        if str(element.get("identifier", "")).startswith(SETTINGS_ROW_PREFIX)
+        if str(element.get("identifier", "")).startswith(ROW_PREFIX)
         and element.get("type") not in ROW_CONTAINER_TYPES
         and _has_area(element)
     ]
 
 
-def _settings_row_positions(document: Any) -> dict[str, float]:
+def _row_positions(document: Any) -> dict[str, float]:
     """Where every row is, on the screen or off it, so movement can be measured."""
+    return {element["identifier"]: element["frame"]["y"] for element in _rows(document)}
+
+
+def _row_movement(
+    before: dict[str, float], after: dict[str, float]
+) -> dict[str, float]:
+    """How far each row in both readings moved; negative is up the screen."""
     return {
-        element["identifier"]: element["frame"]["y"]
-        for element in _settings_rows(document)
+        identifier: after[identifier] - y
+        for identifier, y in before.items()
+        if identifier in after
     }
 
 
-def _settings_rows_on_screen(document: Any) -> list[str]:
+def _rows_on_screen(document: Any) -> list[str]:
     """The rows a viewer can see, from the top of the screen down."""
     screen = _screen(document)
     return [
         element["identifier"]
         for element in sorted(
-            _settings_rows(document), key=lambda element: element["frame"]["y"]
+            _rows(document), key=lambda element: element["frame"]["y"]
         )
         if _on_screen(element, screen)
     ]
 
 
+def _search_field(document: Any, value: str | None = None) -> dict[str, Any]:
+    """The fixture's search field, holding `value` if one is given.
+
+    Anything but exactly one field with a frame is not ready, and says what
+    carried the field's identifier so the extra or missing one can be told
+    apart.
+    """
+
+    def is_search_field(element: dict[str, Any]) -> bool:
+        return element.get("identifier") == SEARCH_FIELD_ID
+
+    fields = [
+        element
+        for element in _elements(document)
+        if is_search_field(element) and _has_area(element)
+    ]
+    if len(fields) != 1:
+        raise NotReady(
+            f"Expected one search field with a frame, found {len(fields)}; "
+            + _describe_matches(document, is_search_field)
+        )
+    if value is not None and fields[0].get("value") != value:
+        raise NotReady(
+            f"Search field has value {fields[0].get('value')!r}, expected {value!r}"
+        )
+    return fields[0]
+
+
 ACCESSIBILITY_READ_TESTS = frozenset(
     {
-        "test_ui_describe_all_reads_both_backends_and_honours_its_options",
+        "test_ui_describe_all_reads_the_fixture_through_both_backends",
+        "test_ui_describe_all_reports_what_its_options_ask_for",
+        "test_ui_describe_all_filtered_to_interactable_reports_only_visible_rows",
         "test_ui_describe_resolves_a_point_and_a_marker",
     }
 )
 INTERACTION_TESTS = frozenset(
     {
-        "test_ui_scroll_moves_settings_rows_down_and_up",
+        "test_ui_scroll_moves_rows_down_and_up",
         "test_ui_set_value_updates_the_search_field",
-        "test_ui_opens_general_by_identifier_and_confirms_it",
-        "test_ui_tap_opens_general_by_point",
-        "test_ui_wait_returns_after_general_opens",
-        "test_ui_wait_times_out_and_rejects_an_invalid_poll_interval",
-        "test_a_delivered_notification_is_held_until_it_is_opened",
-        "test_web_content_is_readable_from_inside_the_simulator",
+        "test_ui_tap_by_identifier_opens_general",
+        "test_ui_tap_by_point_opens_general",
+        "test_ui_tap_refuses_a_mismatched_expected_value",
+        "test_ui_wait_blocks_until_the_element_appears",
+        "test_ui_wait_rejects_a_zero_poll_interval",
+        "test_ui_wait_times_out_on_a_missing_element",
     }
 )
 ACCESSIBILITY_TEST_CAPABILITIES = {
     **{name: SuiteCapability.ACCESSIBILITY_READ for name in ACCESSIBILITY_READ_TESTS},
     **{name: SuiteCapability.ACCESSIBILITY_INTERACTION for name in INTERACTION_TESTS},
+}
+WEB_CONTENT_TEST_CAPABILITIES = {
+    "test_ui_describe_all_reads_an_offscreen_web_element": (
+        SuiteCapability.ACCESSIBILITY_INTERACTION
+    ),
 }
 
 
@@ -309,39 +278,28 @@ def load_tests(
     tests: unittest.TestSuite,
     pattern: str | None,
 ) -> unittest.TestSuite:
-    return select_tests_for_capability(
-        loader,
-        tests,
-        AccessibilityTests,
-        ACCESSIBILITY_TEST_CAPABILITIES,
+    return unittest.TestSuite(
+        select_tests_for_capability(
+            loader, loader.loadTestsFromTestCase(test_case), test_case, requirements
+        )
+        for test_case, requirements in (
+            (AccessibilityTests, ACCESSIBILITY_TEST_CAPABILITIES),
+            (WebContentTests, WEB_CONTENT_TEST_CAPABILITIES),
+        )
     )
 
 
-class AccessibilityTests(IdbEndToEndTestCase):
+class AccessibilityFixtureTestCase(IdbEndToEndTestCase):
     control: dict[str, Any]
 
     async def asyncSetUp(self) -> None:
-        required = ACCESSIBILITY_TEST_CAPABILITIES.get(self._testMethodName)
-        if required is None:
-            raise HarnessError(
-                f"No suite capability owns {type(self).__name__}.{self._testMethodName}"
-            )
-        if not suite_supports(required):
-            self.skipTest(
-                f"{self._testMethodName} requires {required.value} capability"
-            )
         await super().asyncSetUp()
-        for bundle_id in (SAFARI_BUNDLE_ID, FIXTURE_APP_BUNDLE_ID, SETTINGS_BUNDLE_ID):
+        await self.setup_deny_permission_prompts()
+        for bundle_id in (SAFARI_BUNDLE_ID, FIXTURE_APP_BUNDLE_ID):
             await self.setup_terminate_quietly(bundle_id)
-        await run_with_registered_cleanup(
-            self.addAsyncCleanup,
-            lambda: self.setup_terminate_quietly(SETTINGS_BUNDLE_ID),
-            lambda: self.setup_idb("launch", SETTINGS_BUNDLE_ID),
-        )
+        await self.setup_install_fixture_app()
+        await self.setup_idb("launch", FIXTURE_APP_BUNDLE_ID, FIXTURE_LAUNCH_ARGUMENT)
         self.control = await self.wait_for_control()
-
-    async def describe_all(self, *extra: str) -> Any:
-        return await self.idb_json(*DESCRIBE_ALL_ARGS, *extra)
 
     async def describe_all_complete(self, api: str) -> dict[str, Any]:
         document = await self.idb_json(
@@ -350,12 +308,12 @@ class AccessibilityTests(IdbEndToEndTestCase):
         self.assertIsInstance(
             document,
             dict,
-            "--format complete should report a document, not an element array",
+            "--format complete reported an element array, not a document",
         )
         return document
 
     async def wait_for_control(self) -> dict[str, Any]:
-        """Wait for a labelled Settings row. Relaunch Settings if it has exited.
+        """Wait for the fixture's General row. Relaunch the fixture if it has exited.
 
         Retry only an empty result or a missing translation object.
         """
@@ -365,64 +323,55 @@ class AccessibilityTests(IdbEndToEndTestCase):
             if completed.returncode != 0:
                 if ACCESSIBILITY_NOT_READY_MARKER not in completed.error_text:
                     self.fail_or_skip_for(" ".join(DESCRIBE_ALL_ARGS), completed)
-                if SETTINGS_BUNDLE_ID not in await self.simctl.running_bundle_ids():
-                    await self.setup_idb("launch", SETTINGS_BUNDLE_ID, check=False)
+                if FIXTURE_APP_BUNDLE_ID not in await self.simctl.running_bundle_ids():
+                    await self.setup_idb(
+                        "launch",
+                        FIXTURE_APP_BUNDLE_ID,
+                        FIXTURE_LAUNCH_ARGUMENT,
+                        check=False,
+                    )
                 raise NotReady("the simulator has no accessibility translation object")
-            controls = _labelled_controls(json.loads(completed.text))
+            controls = [
+                control
+                for control in _labelled_controls(json.loads(completed.text))
+                if _identifier(control) == GENERAL_ROW_ID
+            ]
             if not controls:
                 raise NotReady(
-                    f"Settings has no labelled rows yet; response: {completed.text}"
+                    f"The fixture has no General row yet; response: {completed.text}"
                 )
             return controls[0]
 
-        try:
-            return await wait_until(
-                "No labelled control", CONTROL_DISCOVERY_TIMEOUT_SECONDS, read
-            )
-        except HarnessError as error:
-            self.fail(str(error))
-
-    async def wait_for_element(
-        self, identifier: str, element_type: str | None = None
-    ) -> dict[str, Any]:
-        await self.setup_idb(
-            "ui",
-            "wait",
-            identifier,
-            "--match-key",
-            "AXUniqueId",
-            "--timeout",
-            str(UI_UPDATE_TIMEOUT_SECONDS),
+        return await self.wait_or_fail(
+            "No General row", ACCESSIBILITY_READY_TIMEOUT_SECONDS, read
         )
 
-        # `ui wait` resolves the marker through ax and the snapshot is read
-        # through axbridge, so the two can disagree for a moment after the
-        # screen the element sits on has changed.
-        async def read() -> dict[str, Any]:
-            for element in _elements(await self.describe_all_complete("axbridge")):
-                if element.get("identifier") == identifier and (
-                    element_type is None or element.get("type") == element_type
-                ):
-                    return element
-            raise NotReady("axbridge has not reported it yet")
+    async def wait_for_scroll(
+        self, before: dict[str, float], direction: str
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        """Where the rows are once the list has moved the way it was scrolled, and the reading that showed it."""
 
-        try:
-            return await wait_until(
-                f"No {element_type or 'element'} with identifier {identifier!r}",
-                UI_UPDATE_TIMEOUT_SECONDS,
-                read,
-            )
-        except HarnessError as error:
-            self.fail(str(error))
+        async def read() -> tuple[dict[str, float], dict[str, Any]]:
+            snapshot = await self.describe_all_complete("axbridge")
+            after = _row_positions(snapshot)
+            movement = _row_movement(before, after)
+            # Scrolling down moves the rows up the screen.
+            sign = -1 if direction == "down" else 1
+            if not any(
+                sign * delta > MINIMUM_SCROLL_DISTANCE for delta in movement.values()
+            ):
+                raise NotReady(f"Row movement after scrolling {direction}: {movement}")
+            return after, snapshot
 
-    def center(self, element: dict[str, Any]) -> tuple[int, int]:
-        frame = element["frame"]
-        return (
-            int(frame["x"] + frame["width"] / 2),
-            int(frame["y"] + frame["height"] / 2),
+        return await wait_until(
+            f"The list did not scroll {direction}", UI_UPDATE_TIMEOUT_SECONDS, read
         )
 
-    async def test_ui_describe_all_reads_both_backends_and_honours_its_options(
+
+class AccessibilityTests(AccessibilityFixtureTestCase):
+    capabilities = ACCESSIBILITY_TEST_CAPABILITIES
+
+    async def test_ui_describe_all_reads_the_fixture_through_both_backends(
         self,
     ) -> None:
         ax = await self.describe_all_complete("ax")
@@ -432,7 +381,7 @@ class AccessibilityTests(IdbEndToEndTestCase):
         self.assertEqual(axbridge["backend"], AXBRIDGE_BACKEND)
         for name, document in ((AX_BACKEND, ax), (AXBRIDGE_BACKEND, axbridge)):
             controls = _labelled_controls(document)
-            self.assertTrue(controls, f"{name} should see Settings' rows")
+            self.assertTrue(controls, f"{name} saw none of the fixture's rows")
         shared = _labels(ax) & _labels(axbridge)
         self.assertTrue(
             shared,
@@ -441,6 +390,7 @@ class AccessibilityTests(IdbEndToEndTestCase):
             f"{AXBRIDGE_BACKEND} saw {sorted(_labels(axbridge))}",
         )
 
+    async def test_ui_describe_all_reports_what_its_options_ask_for(self) -> None:
         selected = await self.idb_json(
             "ui",
             "describe-all",
@@ -468,17 +418,48 @@ class AccessibilityTests(IdbEndToEndTestCase):
         self.assertEqual(selected["frames"]["total"], len(elements))
         self.assertGreater(selected["coverage"]["frame"], 0)
 
+    async def test_ui_describe_all_filtered_to_interactable_reports_only_visible_rows(
+        self,
+    ) -> None:
+        everything = await self.describe_all_complete("axbridge")
+        interactable = await self.idb_json(
+            "ui",
+            "describe-all",
+            "--api",
+            "axbridge",
+            "--format",
+            "complete",
+            "--filter",
+            "interactable",
+        )
+
+        visible = _rows_on_screen(everything)
+        offscreen_labels = {
+            _label(row) for row in _rows(everything) if row["identifier"] not in visible
+        }
+        self.assertTrue(
+            offscreen_labels, "describe-all reported no rows below the screen"
+        )
+        self.assertEqual(sorted(_row_positions(interactable)), sorted(visible))
+        # An offscreen row's label reports a frame in the row's own coordinates,
+        # which can place it on screen, so it is matched by name.
+        self.assertFalse(
+            offscreen_labels & {_label(element) for element in _elements(interactable)},
+            "--filter interactable reported the label of a row below the screen",
+        )
+        _search_field(interactable)
+
     async def test_ui_describe_resolves_a_point_and_a_marker(self) -> None:
         marker = _label(self.control)
-        x, y = self.center(self.control)
+        x, y = _center(self.control)
 
         self.assertTrue(
             await self.idb_json("ui", "describe-point", str(x), str(y)),
-            "describe-point should report the element under the point",
+            "describe-point reported nothing under the point",
         )
         self.assertTrue(
             await self.idb_json("ui", "describe", marker),
-            f"describe {marker!r} should report the element",
+            f"describe {marker!r} reported nothing",
         )
         document = await self.idb_json(
             "ui", "describe", marker, "--api", "axbridge", "--format", "complete"
@@ -486,7 +467,7 @@ class AccessibilityTests(IdbEndToEndTestCase):
         self.assertEqual(document["backend"], AXBRIDGE_BACKEND)
         self.assertTrue(
             _elements(document["elements"]),
-            f"{AXBRIDGE_BACKEND} should resolve the marker {marker!r}",
+            f"{AXBRIDGE_BACKEND} did not resolve the marker {marker!r}",
         )
 
         axbridge_point = await self.idb_json(
@@ -513,19 +494,10 @@ class AccessibilityTests(IdbEndToEndTestCase):
             expected_error="found no element whose",
         )
 
-    async def test_ui_wait_returns_after_general_opens(self) -> None:
-        general = await self.wait_for_element(GENERAL_ROW_ID)
-        title = _label(general)
-        self.assertTrue(title, "The General row has no label")
+    async def test_ui_wait_blocks_until_the_element_appears(self) -> None:
+        title = _label(self.control)
         before = _elements(await self.describe_all_complete("axbridge"))
         self.assertNotIn(title, [element.get("identifier") for element in before])
-        marker = _label(self.control)
-        for api in ("ax", "axbridge"):
-            self.assertEqual(
-                await self.idb_json("ui", "wait", marker, "--api", api),
-                {"found": True},
-                api,
-            )
 
         async with self.idb_process(
             "ui",
@@ -537,24 +509,14 @@ class AccessibilityTests(IdbEndToEndTestCase):
             str(UI_UPDATE_TIMEOUT_SECONDS),
             "--json",
         ) as waiting:
-            await asyncio.sleep(2)
+            await asyncio.sleep(WAIT_BLOCKS_SECONDS)
             self.assertIsNone(waiting.returncode, "wait finished before General opened")
             await self.idb("ui", "tap", GENERAL_ROW_ID, "--match-key", "AXUniqueId")
             result = await waiting.read_some(UI_UPDATE_TIMEOUT_SECONDS)
             self.assertEqual(json.loads(result), {"found": True})
             self.assertEqual(await waiting.wait_for_exit(10), 0)
 
-        after = _elements(await self.describe_all_complete("axbridge"))
-        self.assertIn(
-            title,
-            [
-                element.get("identifier")
-                for element in after
-                if element.get("type") == "NavigationBar"
-            ],
-        )
-
-    async def test_ui_wait_times_out_and_rejects_an_invalid_poll_interval(self) -> None:
+    async def test_ui_wait_times_out_on_a_missing_element(self) -> None:
         for backend in ("axbridge", "ax"):
             with self.subTest(backend=backend):
                 completed = await self.idb_expect_failure(
@@ -591,6 +553,7 @@ class AccessibilityTests(IdbEndToEndTestCase):
                     "idb-e2e-no-such-element", diagnostics["unmatched_values"]
                 )
 
+    async def test_ui_wait_rejects_a_zero_poll_interval(self) -> None:
         rejected = await self.idb_expect_failure(
             "ui",
             "wait",
@@ -602,61 +565,35 @@ class AccessibilityTests(IdbEndToEndTestCase):
         )
         self.assertEqual(rejected.stdout, b"")
 
-    async def wait_for_search_field(self, value: str | None = None) -> dict[str, Any]:
-        async def read() -> dict[str, Any]:
-            fields = [
-                element
-                for element in _elements(await self.describe_all_complete("axbridge"))
-                if _has_area(element)
-                and (
-                    element.get("type") == "SearchField"
-                    or (
-                        element.get("type") == "TextField"
-                        and element.get("subrole") == "SearchField"
-                    )
-                )
-            ]
-            if len(fields) != 1:
-                raise NotReady(f"Expected one search field, found {len(fields)}")
-            if value is not None and fields[0].get("value") != value:
-                raise NotReady(
-                    f"Search field has value {fields[0].get('value')!r}, expected {value!r}"
-                )
-            return fields[0]
+    async def wait_for_search_value(self, value: str) -> None:
+        async def read() -> None:
+            _search_field(await self.describe_all_complete("axbridge"), value)
 
-        return await wait_until(
-            "Settings search field", UI_UPDATE_TIMEOUT_SECONDS, read
+        await wait_until(
+            f"The fixture's search field holding {value!r}",
+            UI_UPDATE_TIMEOUT_SECONDS,
+            read,
         )
 
-    async def restore_search_field(self, value: str) -> None:
-        field = await self.wait_for_search_field()
-        x, y = self.center(field)
-        await self.idb("ui", "set-value", str(x), str(y), "--value", value)
-
     async def test_ui_set_value_updates_the_search_field(self) -> None:
-        field = await self.wait_for_search_field()
-        original = field.get("value") or ""
-        self.assertIsInstance(original, str)
-        self.addAsyncCleanup(self.restore_search_field, original)
-        x, y = self.center(field)
+        field = (await self.wait_for(SEARCH_FIELD, until=Until.SETTLED)).element
+        x, y = _center(field)
 
         completed = await self.idb(
             "ui", "set-value", str(x), str(y), "--value", "idb-first"
         )
 
         self.assertEqual(completed.stdout, b"")
-        await self.wait_for_search_field("idb-first")
-        # The first write puts Settings into search mode, so the second is
-        # written against a raised keyboard and a layout that has moved under it.
-        field = await self.wait_for_search_field()
-        x, y = self.center(field)
+        await self.wait_for_search_value("idb-first")
+        # The first write can give the field the keyboard, so the second is
+        # written at wherever the field is once that has settled.
+        field = (await self.wait_for(SEARCH_FIELD, until=Until.SETTLED)).element
+        x, y = _center(field)
         await self.idb("ui", "set-value", str(x), str(y), "--value", "idb-second")
-        await self.wait_for_search_field("idb-second")
+        await self.wait_for_search_value("idb-second")
 
-    async def test_ui_tap_opens_general_by_point(self) -> None:
-        general = await self.wait_for_element(GENERAL_ROW_ID)
-        title = _label(general)
-        self.assertTrue(title, "The General row has no label")
+    async def test_ui_tap_refuses_a_mismatched_expected_value(self) -> None:
+        title = _label(self.control)
 
         await self.idb_expect_failure(
             "ui",
@@ -684,434 +621,43 @@ class AccessibilityTests(IdbEndToEndTestCase):
             "The rejected tap opened General",
         )
 
-        general = await self.wait_for_element(GENERAL_ROW_ID)
-        x, y = self.center(general)
-        await self.idb("ui", "tap", str(x), str(y), "--api", "ax")
-        await self.wait_for_element(title, "NavigationBar")
+    async def test_ui_tap_by_point_opens_general(self) -> None:
+        title = _label(self.control)
+        await self.tap_when_settled(GENERAL_ROW, "--api", "ax")
+        await self.wait_for(Query(title, element_type="NavigationBar"), lookup=UiWait())
 
-    async def describe_by_id(self, identifier: str, *, step: str) -> dict[str, Any]:
-        """One element, read from inside the simulator by its accessibility id.
+    async def test_ui_tap_by_identifier_opens_general(self) -> None:
+        title = _label(self.control)
+        await self.idb("ui", "tap", GENERAL_ROW_ID, "--match-key", "AXUniqueId")
+        await self.wait_for(Query(title, element_type="NavigationBar"), lookup=UiWait())
 
-        A read addressed to the element is the read a demo can show: it answers
-        with that element, its frame and the screen it sits on, rather than
-        with everything the app has built.
-        """
-        document = await self.idb_json(
-            "ui",
-            "describe",
-            identifier,
-            "--match-key",
-            "AXUniqueId",
-            "--api",
-            "axbridge",
-            "--format",
-            "complete",
-            step=step,
-        )
-        self.assertEqual(document["backend"], AXBRIDGE_BACKEND)
-        return document
-
-    @staticmethod
-    def _placed(element: dict[str, Any], screen: dict[str, float] | None) -> str:
-        frame = element["frame"]
-        where = (
-            f"{frame['width']:.0f}×{frame['height']:.0f} points at "
-            f"({frame['x']:.0f}, {frame['y']:.0f})"
-        )
-        if screen is None:
-            return where
-        return f"{where} on a {screen['width']:.0f}×{screen['height']:.0f} screen"
-
-    @documented_demo(
-        slug="open-a-settings-page-by-id",
-        title="Open a Settings page by accessibility identifier",
-        summary=(
-            "Use an accessibility identifier to find and tap the General row "
-            "in Settings without calculating screen coordinates. Then wait "
-            "for the General page and read its navigation bar to verify that "
-            "the tap opened the expected destination."
-        ),
-    )
-    async def test_ui_opens_general_by_identifier_and_confirms_it(self) -> None:
-        await self.wait_for_element(GENERAL_ROW_ID)
-
-        before = await self.describe_by_id(
-            GENERAL_ROW_ID, step="Find the General row by accessibility identifier"
-        )
-        # The row the demo opens, and the label it is published under, both come
-        # from this one reading of the element the clip is showing.
-        rows = _visible(before, GENERAL_ROW_ID)
-        self.assertEqual(len(rows), 1, f"Expected one General row on screen: {rows}")
-        title = _label(rows[0])
-        self.assertTrue(title, "The General row has no label")
-        self.note(
-            f"The row is a {rows[0].get('type')} labelled {title!r}, with "
-            f"accessibility identifier {GENERAL_ROW_ID}. It is "
-            f"{self._placed(rows[0], _screen(before))}.",
-            GENERAL_ROW_ID,
-            title,
-        )
-        already_open = await self.idb_json(
-            "ui", "describe-all", "--api", "axbridge", "--format", "complete"
-        )
-        self.assertEqual(
-            _visible(already_open, title, "NavigationBar"),
-            [],
-            "General is already open, so the demo would show nothing opening",
-        )
-
-        self.assertEqual(
-            await self.idb_json(
-                "ui",
-                "wait",
-                GENERAL_ROW_ID,
-                "--match-key",
-                "AXUniqueId",
-                "--api",
-                "axbridge",
-                "--timeout",
-                str(UI_UPDATE_TIMEOUT_SECONDS),
-                step="Wait until the General row is available",
-            ),
-            {"found": True},
-        )
-        self.note("The row is available, so idb can address it by identifier.", "found")
+    async def test_ui_scroll_moves_rows_down_and_up(self) -> None:
+        before = _row_positions(await self.describe_all_complete("axbridge"))
 
         await self.idb(
-            "ui",
-            "tap",
-            GENERAL_ROW_ID,
-            "--match-key",
-            "AXUniqueId",
-            step="Tap the General row by accessibility identifier",
-        )
-        self.note(
-            "idb tapped the row by identifier; the test did not calculate a "
-            "screen coordinate."
-        )
-
-        self.assertEqual(
-            await self.idb_json(
-                "ui",
-                "wait",
-                title,
-                "--match-key",
-                "AXUniqueId",
-                "--api",
-                "axbridge",
-                "--timeout",
-                str(UI_UPDATE_TIMEOUT_SECONDS),
-                step="Wait for the General page to open",
-            ),
-            {"found": True},
-        )
-        self.note("The General page's navigation bar is now present.", "found")
-
-        after = await self.describe_by_id(
-            title, step="Verify that the General page opened"
-        )
-        opened = _visible(after, title, "NavigationBar")
-        self.assertEqual(
-            len(opened),
-            1,
-            f"No navigation bar named {title!r} is on screen after the tap",
-        )
-        self.note(
-            f"The navigation bar labelled {title!r} confirms that the expected "
-            f"page opened. It is {self._placed(opened[0], _screen(after))}.",
-            "NavigationBar",
-            title,
-        )
-
-    async def wait_for_scroll(
-        self, before: dict[str, float], direction: str
-    ) -> tuple[dict[str, float], dict[str, Any]]:
-        """Where the rows are once the list has moved the way it was scrolled, and the reading that showed it."""
-
-        async def read() -> tuple[dict[str, float], dict[str, Any]]:
-            snapshot = await self.describe_all_complete("axbridge")
-            after = _settings_row_positions(snapshot)
-            movement = {
-                identifier: after[identifier] - y
-                for identifier, y in before.items()
-                if identifier in after
-            }
-            if direction == "down":
-                moved = any(
-                    delta < -MINIMUM_SCROLL_DISTANCE for delta in movement.values()
-                )
-            else:
-                moved = any(
-                    delta > MINIMUM_SCROLL_DISTANCE for delta in movement.values()
-                )
-            if not moved:
-                raise NotReady(f"Row movement after scrolling {direction}: {movement}")
-            return after, snapshot
-
-        return await wait_until(
-            f"Settings did not scroll {direction}", UI_UPDATE_TIMEOUT_SECONDS, read
-        )
-
-    @documented_demo(
-        slug="scroll-a-list",
-        title="Scroll a list and verify the result",
-        summary=(
-            "Scroll the Settings list down from the General row and use the "
-            "accessibility tree to measure how far the rows moved. Pick a "
-            "visible row as the starting point for the reverse gesture, scroll "
-            "back up, and measure again. This verifies the effect of each "
-            "gesture instead of treating a successful command as proof that "
-            "the list moved."
-        ),
-    )
-    async def test_ui_scroll_moves_settings_rows_down_and_up(self) -> None:
-        await self.wait_for_element(GENERAL_ROW_ID)
-        before = _settings_row_positions(await self.describe_all_complete("axbridge"))
-        self.assertIn(GENERAL_ROW_ID, before)
-
-        await self.idb(
-            "ui",
-            "scroll",
-            "down",
-            GENERAL_ROW_ID,
-            "--match-key",
-            "AXUniqueId",
-            step="Scroll down from the General row",
+            "ui", "scroll", "down", GENERAL_ROW_ID, "--match-key", "AXUniqueId"
         )
         after_down, scrolled = await self.wait_for_scroll(before, "down")
-        self.note(self._movement(before, after_down, "up"), GENERAL_ROW_ID)
 
-        on_screen = _settings_rows_on_screen(scrolled)
-        self.assertTrue(on_screen, "No Settings row is on screen after scrolling down")
-        # A row from the middle of the screen: one at an edge can sit half
-        # under the bar the list scrolls beneath, which is not where a scroll
-        # can begin.
-        row_after_scroll = on_screen[len(on_screen) // 2]
-        self.note(
-            f"{on_screen[0]} is now the top visible row. {row_after_scroll} is "
-            "near the middle and can be used to start the reverse scroll.",
-            row_after_scroll,
-        )
-        await self.idb(
-            "ui",
-            "scroll",
-            "up",
-            row_after_scroll,
-            "--match-key",
-            "AXUniqueId",
-            step="Scroll back up from a visible row",
-        )
-        after_up, _ = await self.wait_for_scroll(after_down, "up")
-        self.note(self._movement(after_down, after_up, "down"), row_after_scroll)
+        on_screen = _rows_on_screen(scrolled)
+        self.assertTrue(on_screen, "No row is on screen after scrolling down")
+        # A row at an edge can sit half under the bar the list scrolls
+        # beneath, which is not where a scroll can begin.
+        row = on_screen[len(on_screen) // 2]
+        await self.idb("ui", "scroll", "up", row, "--match-key", "AXUniqueId")
+        await self.wait_for_scroll(after_down, "up")
 
-    @staticmethod
-    def _movement(
-        before: dict[str, float], after: dict[str, float], direction: str
-    ) -> str:
-        """What the rows did, read from where they were and where they are."""
-        moved = {
-            identifier: after[identifier] - y
-            for identifier, y in before.items()
-            if identifier in after
-        }
-        furthest = max(moved.values(), key=abs, default=0.0)
-        return (
-            f"{len(moved)} rows moved {direction} by as much as "
-            f"{abs(furthest):.0f} points."
-        )
 
-    @staticmethod
-    def _retained(text: str) -> list[tuple[str, str]]:
-        """The identifier and title of each notification the system still holds."""
-        held = []
-        for line in text.splitlines():
-            fields = [field.strip().strip('"') for field in line.split("|")]
-            if len(fields) >= 3:
-                held.append((fields[1], fields[2]))
-        return held
-
-    @documented_demo(
-        slug="deliver-a-notification-and-watch-it-clear",
-        title="Test notification delivery without handling a permission prompt",
-        summary=(
-            "Prepare a simulator for notification testing without launching "
-            "the app or automating its permission prompt. Grant notification "
-            "permission directly, deliver a push while the app is not running, "
-            "and use the in-simulator accessibility backend to inspect the "
-            "banner that SpringBoard draws. Open the banner, then query the "
-            "delivered-notification list again to verify that the system "
-            "removed it."
-        ),
-    )
-    async def test_a_delivered_notification_is_held_until_it_is_opened(self) -> None:
-        self.addAsyncCleanup(self.setup_terminate_quietly, NEWS_BUNDLE_ID)
-        await self.setup_terminate_quietly(NEWS_BUNDLE_ID)
-        # The first push a simulator receives after it is erased waits on the
-        # system building its notification store, for long enough that a
-        # banner would be drawn and withdrawn before the command returned.
-        # This one is sent before the permission is granted, so the system
-        # refuses it and stores nothing, and the demo's own push is quick.
-        await self.setup_idb(
-            "send-notification",
-            NEWS_BUNDLE_ID,
-            NOTIFICATION_PAYLOAD,
-            check=False,
-            timeout=NOTIFICATION_STORE_TIMEOUT_SECONDS,
-        )
-
-        await self.idb(
-            "approve",
-            NEWS_BUNDLE_ID,
-            "notification",
-            step="Grant notification permission without showing a prompt",
-        )
-        self.note(
-            f"Notification permission is already granted to {NEWS_BUNDLE_ID}, "
-            "so the test can deliver a notification without waiting for the "
-            "app to request access.",
-            NEWS_BUNDLE_ID,
-        )
-
-        before = await self.idb(
-            "notification",
-            "list",
-            NEWS_BUNDLE_ID,
-            step="List notifications before delivery",
-        )
-        held = {identifier for identifier, _ in self._retained(before.text)}
-        self.note(
-            "No delivered notifications are currently stored for this app."
-            if not held
-            else (
-                f"The system already holds {len(held)} delivered notifications "
-                "for this app; the test records them so it can identify the new one."
-            )
-        )
-
-        await self.idb(
-            "ui",
-            "button",
-            "HOME",
-            step="Return to the Home Screen before delivery",
-        )
-        self.note(
-            "With no app in front, SpringBoard owns the visible accessibility "
-            "tree. The notification banner will appear there."
-        )
-
-        await self.idb(
-            "send-notification",
-            NEWS_BUNDLE_ID,
-            NOTIFICATION_PAYLOAD,
-            step="Deliver a notification while the app is not running",
-        )
-        after = await self.idb(
-            "notification",
-            "list",
-            NEWS_BUNDLE_ID,
-            step="List notifications after delivery",
-        )
-        delivered = [
-            identifier
-            for identifier, title in self._retained(after.text)
-            if title == NOTIFICATION_TITLE and identifier not in held
-        ]
-        self.assertEqual(len(delivered), 1, f"expected one new {NOTIFICATION_TITLE!r}")
-        self.note(
-            f"The delivered-notification list now contains a new entry titled "
-            f"{NOTIFICATION_TITLE!r}. The test keeps its system-assigned "
-            "identifier so it can verify that the same entry is removed after "
-            "it opens.",
-            NOTIFICATION_TITLE,
-        )
-
-        # SpringBoard withdraws the banner about eight seconds after delivery,
-        # so the list of what the system is holding is read first and the wait,
-        # the frame read and the tap follow it back to back.
-        await self.setup_idb(
-            "ui",
-            "wait",
-            BANNER_ID,
-            "--match-key",
-            "AXUniqueId",
-            "--api",
-            "axbridge",
-            "--timeout",
-            str(UI_UPDATE_TIMEOUT_SECONDS),
-        )
-
-        banner = await self.idb_json(
-            "ui",
-            "describe-all",
-            "--api",
-            "axbridge",
-            "--format",
-            "complete",
-            "--match",
-            BANNER_ID,
-            "--match-key",
-            "AXUniqueId",
-            *LABEL_AND_FRAME_KEYS,
-            step="Read the notification banner from inside the simulator",
-        )
-        self.assertEqual(banner["backend"], AXBRIDGE_BACKEND)
-        platters = [
-            element
-            for element in _elements(banner["elements"])
-            if element.get("identifier") == BANNER_ID and _has_area(element)
-        ]
-        self.assertTrue(platters, f"no {BANNER_ID} was reported")
-        platter = platters[0]
-        self.assertIn(NOTIFICATION_TITLE, _label(platter))
-        self.note(
-            f"SpringBoard, not {NEWS_BUNDLE_ID}, owns the banner. The banner is "
-            f"{self._placed(platter, _screen(banner))}.",
-            BANNER_ID,
-        )
-
-        frame = platter["frame"]
-        await self.idb(
-            "ui",
-            "tap",
-            f"{frame['x'] + frame['width'] / 2:.0f}",
-            f"{frame['y'] + frame['height'] / 2:.0f}",
-            "--reason",
-            "the banner is SpringBoard's, so a marker tap cannot resolve it",
-            step="Open the banner at its reported position",
-        )
-
-        async def released() -> None:
-            completed = await self.setup_idb("notification", "list", NEWS_BUNDLE_ID)
-            if delivered[0] in [i for i, _ in self._retained(completed.text)]:
-                raise NotReady(f"{NOTIFICATION_TITLE!r} is still held")
-
-        await wait_until(
-            f"The system did not release {NOTIFICATION_TITLE!r}",
-            UI_UPDATE_TIMEOUT_SECONDS,
-            released,
-        )
-
-        cleared = await self.idb(
-            "notification",
-            "list",
-            NEWS_BUNDLE_ID,
-            step="List notifications after opening the banner",
-        )
-        self.assertNotIn(
-            delivered[0], [identifier for identifier, _ in self._retained(cleared.text)]
-        )
-        self.note(
-            "The notification is no longer in the delivered-notification list, "
-            "confirming that opening it cleared the stored entry."
-        )
+class SafariTestCase(IdbEndToEndTestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        await self.setup_deny_permission_prompts()
+        await self.setup_terminate_quietly(FIXTURE_APP_BUNDLE_ID)
+        self.addAsyncCleanup(self.setup_terminate_quietly, SAFARI_BUNDLE_ID)
+        await self.setup_terminate_quietly(SAFARI_BUNDLE_ID)
 
     async def wait_for_tappable_address_bar(self) -> None:
-        """Wait for the address bar to be drawn, before it is tapped.
-
-        Safari settles its chrome for a second or two after a page arrives,
-        and a marker tap resolves through ax, so the wait has to look at
-        what the tap will rather than through axbridge.
-        """
+        """Wait for Safari to draw the address bar, which it settles for a second or two after a page arrives."""
         await self.setup_idb(
             "ui",
             "wait",
@@ -1166,33 +712,18 @@ class AccessibilityTests(IdbEndToEndTestCase):
             str(UI_UPDATE_TIMEOUT_SECONDS),
         )
 
-    @documented_demo(
-        slug="read-a-web-page-in-safari",
-        title="Read a web page's content from inside the simulator",
-        summary=(
-            "Use the accessibility backend that runs inside the simulator to "
-            "read a web page's own content rather than Safari's chrome. Find a "
-            "single heading among the hundreds of elements the page builds, "
-            "without scrolling to bring it on screen. Then navigate to a second "
-            "page by typing into Safari's address bar and submitting it with a "
-            "key press, and verify what loaded by finding a label drawn inside "
-            "one of that page's diagrams."
-        ),
-    )
-    async def test_web_content_is_readable_from_inside_the_simulator(self) -> None:
-        self.addAsyncCleanup(self.setup_terminate_quietly, SAFARI_BUNDLE_ID)
-        await self.setup_terminate_quietly(SAFARI_BUNDLE_ID)
-        origin = await self.setup_web_origin(
-            LIVE_ORIGIN, STAND_IN_PAGES, self.safari_shows_first_page
-        )
-        first_page = origin + FIRST_PAGE_PATH
-        second_page = origin + SECOND_PAGE_PATH
 
-        await self.idb("open", first_page, step="Open idb's documentation in Safari")
+class WebContentTests(SafariTestCase):
+    capabilities = WEB_CONTENT_TEST_CAPABILITIES
+
+    async def test_ui_describe_all_reads_an_offscreen_web_element(self) -> None:
+        pages = LocalPages({FIRST_PAGE_PATH: STAND_IN_PAGES[FIRST_PAGE_PATH]})
+        origin = pages.start()
+        self.addCleanup(pages.stop)
+        await self.idb("open", origin + FIRST_PAGE_PATH)
         await self.wait_for_web_label(FIRST_PAGE_HEADING)
-        self.note("Safari has loaded the page and its content is now readable.")
 
-        first = await self.idb_json(
+        document = await self.idb_json(
             "ui",
             "describe-all",
             "--api",
@@ -1202,117 +733,18 @@ class AccessibilityTests(IdbEndToEndTestCase):
             "--match",
             FIRST_PAGE_MATCH,
             *LABEL_AND_FRAME_KEYS,
-            step="Find a single heading in the page's accessibility tree",
         )
-        self.assertEqual(first["backend"], AXBRIDGE_BACKEND)
+
         headings = [
             element
-            for element in _elements(first["elements"])
+            for element in _elements(document["elements"])
             if _label(element) == FIRST_PAGE_HEADING and _has_area(element)
         ]
         self.assertTrue(headings, f"no {FIRST_PAGE_HEADING!r} heading was reported")
-        self.note(
-            f"idb walked {first['narrowing']['walked']} elements to find the "
-            f"heading, and they belong to the page rather than to Safari's "
-            f"chrome. The heading is {self._placed(headings[0], _screen(first))}, "
-            f"far below the visible part of the page, and no scrolling was "
-            f"needed to read it.",
-            FIRST_PAGE_HEADING,
-            str(first["narrowing"]["walked"]),
-        )
-
-        await self.wait_for_tappable_address_bar()
-        await self.idb(
-            "ui",
-            "tap",
-            SAFARI_ADDRESS_BAR_ID,
-            "--match-key",
-            "AXUniqueId",
-            step="Tap the address bar by accessibility identifier",
-        )
-        await self.wait_for_address_bar()
-        self.note(
-            "The address bar belongs to Safari rather than to the web page, so "
-            "idb can address it by its accessibility identifier."
-        )
-
-        await self.idb(
-            "ui", "text", second_page, step="Type the address of a second page"
-        )
-        # Typing is delivered key by key, so the field holds part of the
-        # address for as long as the rest is still arriving.
-        await self.setup_idb(
-            "ui",
-            "wait",
-            second_page,
-            "--match-key",
-            "AXValue",
-            "--api",
-            "axbridge",
-            "--timeout",
-            str(UI_UPDATE_TIMEOUT_SECONDS),
-        )
-        typed = await self.idb_json(
-            "ui",
-            "describe",
-            SAFARI_URL_FIELD_ID,
-            "--match-key",
-            "AXUniqueId",
-            "--api",
-            "axbridge",
-            "--format",
-            "complete",
-            step="Read the address bar's value back",
-        )
-        fields = [
-            element
-            for element in _elements(typed["elements"])
-            if element.get("identifier") == SAFARI_URL_FIELD_ID
-        ]
-        self.assertEqual([field.get("value") for field in fields], [second_page])
-        self.note(
-            f"The address bar holds {second_page!r}, character for character, "
-            f"so every keystroke arrived.",
-            second_page,
-        )
-
-        await self.idb(
-            "ui",
-            "key",
-            str(RETURN_KEY_CODE),
-            step="Submit the address with a key press",
-        )
-        await self.wait_for_web_label(SECOND_PAGE_LABEL)
-
-        second = await self.idb_json(
-            "ui",
-            "describe-all",
-            "--api",
-            "axbridge",
-            "--format",
-            "complete",
-            "--match",
-            SECOND_PAGE_LABEL,
-            *LABEL_AND_FRAME_KEYS,
-            step="Verify that the second page loaded",
-        )
-        named = [
-            element
-            for element in _elements(second["elements"])
-            if SECOND_PAGE_LABEL in _label(element) and _has_area(element)
-        ]
-        self.assertTrue(
-            named, f"the page that loaded does not name {SECOND_PAGE_LABEL}"
-        )
-        smallest = min(
-            named,
-            key=lambda element: element["frame"]["width"] * element["frame"]["height"],
-        )
-        self.note(
-            f"The page that loaded names {SECOND_PAGE_LABEL} in {len(named)} "
-            f"places, which confirms that the typed address opened. The smallest "
-            f"is {self._placed(smallest, _screen(second))}: a label drawn inside "
-            f"one of the page's diagrams, which the accessibility tree reports "
-            f"as an ordinary element.",
-            SECOND_PAGE_LABEL,
+        screen = _screen(document)
+        assert screen is not None
+        self.assertGreater(
+            headings[0]["frame"]["y"],
+            screen["height"],
+            "the heading is on screen, so this read shows nothing below it",
         )

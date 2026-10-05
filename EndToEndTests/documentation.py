@@ -41,21 +41,33 @@ DEMO_ATTRIBUTE = "__idb_documented_demo__"
 
 # The demos the website publishes, and the test that performs each one.
 DOCUMENTED_DEMOS: Mapping[str, str] = {
-    "open-a-settings-page-by-id": (
-        "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_ui_opens_general_by_identifier_and_confirms_it"
+    "navigate-a-list-by-accessibility-id": (
+        "EndToEndTests.test_demos.AccessibilityDemos"
+        ".test_navigate_a_list_by_accessibility_id"
     ),
-    "scroll-a-list": (
-        "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_ui_scroll_moves_settings_rows_down_and_up"
+    "open-an-app-from-a-notification-banner": (
+        "EndToEndTests.test_demos.NotificationDemos"
+        ".test_open_an_app_from_a_notification_banner"
     ),
-    "deliver-a-notification-and-watch-it-clear": (
-        "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_a_delivered_notification_is_held_until_it_is_opened"
+    "read-web-content-in-safari": (
+        "EndToEndTests.test_demos.WebContentDemos.test_read_web_content_in_safari"
     ),
-    "read-a-web-page-in-safari": (
-        "EndToEndTests.test_accessibility.AccessibilityTests"
-        ".test_web_content_is_readable_from_inside_the_simulator"
+    "drive-an-app-from-injected-swift": (
+        "EndToEndTests.test_demos.InjectedSwiftDemos"
+        ".test_drive_an_app_from_injected_swift"
+    ),
+    "spin-safaris-address-bar": (
+        "EndToEndTests.test_demos.SpinningSafariDemos.test_spin_safaris_address_bar"
+    ),
+    "seed-photos-and-a-location": (
+        "EndToEndTests.test_demos.SeededLibraryDemos.test_seed_photos_and_a_location"
+    ),
+    "one-screen-across-display-settings": (
+        "EndToEndTests.test_demos.DisplaySettingsDemos."
+        "test_one_screen_across_display_settings"
+    ),
+    "crash-and-read-the-report": (
+        "EndToEndTests.test_demos.CrashReportDemos.test_crash_and_read_the_report"
     ),
 }
 

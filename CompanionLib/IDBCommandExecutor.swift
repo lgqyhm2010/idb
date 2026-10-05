@@ -26,7 +26,6 @@ public enum IDBCommandError: Error {
   case noDebugServer
   case debugServerAlreadyRunning
   case notPersistedApplication(bundleID: String, suitable: [String])
-  case noAppBundleExtracted
   case userDevelopmentSigningRequired(applicationDescription: String)
 }
 
@@ -57,8 +56,6 @@ extension IDBCommandError: LocalizedError {
       return "Debug server is already running"
     case let .notPersistedApplication(bundleID, suitable):
       return "\(bundleID) not persisted application and is therefore not debuggable. Suitable applications: \(CollectionInformation.oneLineDescription(from: suitable))"
-    case .noAppBundleExtracted:
-      return "No app bundle could be extracted"
     case let .userDevelopmentSigningRequired(applicationDescription):
       return "Requested debuggable install of \(applicationDescription) but User Development signing is required"
     }
@@ -110,21 +107,20 @@ public final class IDBCommandExecutor {
     return listing
   }
 
-  public func install_app_file_path(_ filePath: String, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool) async throws -> InstalledArtifact {
-    if BundleDescriptor.isApplication(atPath: filePath) {
-      let bundleDescriptor = try BundleDescriptor.bundle(fromPath: filePath)
-      return try await installAppBundle(bundleDescriptor, makeDebuggable: makeDebuggable)
-    } else {
-      return try await temporaryDirectory.withArchiveExtracted(fromFile: filePath, overrideModificationTime: overrideModificationTime) { extractPath in
-        return try await installExtractedApp(extractPath, makeDebuggable: makeDebuggable)
-      }
-    }
+  public func install_app_file_path(_ filePath: String, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool, on_progress onProgress: @escaping @Sendable (InstallProgressEvent) -> Void = { _ in }) async throws -> InstalledArtifact {
+    return try await installApp(from: .localPath(filePath), makeDebuggable: makeDebuggable, options: InstallOptions(overrideModificationTime: overrideModificationTime), onProgress: onProgress)
   }
 
-  public func install_app_stream(_ input: FBProcessInput<AnyObject>, compression: FBCompressionFormat, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool) async throws -> InstalledArtifact {
-    return try await temporaryDirectory.withArchiveExtracted(fromStream: input, compression: compression, overrideModificationTime: overrideModificationTime) { extractPath in
-      return try await installExtractedApp(extractPath, makeDebuggable: makeDebuggable)
-    }
+  public func install_app_stream(_ input: FBProcessInput<AnyObject>, compression: FBCompressionFormat, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool, on_progress onProgress: @escaping @Sendable (InstallProgressEvent) -> Void = { _ in }) async throws -> InstalledArtifact {
+    return try await installApp(from: .processInput(input), makeDebuggable: makeDebuggable, options: InstallOptions(overrideModificationTime: overrideModificationTime, compression: compression), onProgress: onProgress)
+  }
+
+  public func install_app_zip_stream(_ input: FBProcessInput<AnyObject>, spoolPath: String, spooled: @escaping @Sendable () async throws -> Void, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool, on_progress onProgress: @escaping @Sendable (InstallProgressEvent) -> Void = { _ in }) async throws -> InstalledArtifact {
+    return try await installApp(from: .zipStream(input, spoolPath: spoolPath, spooled: spooled), makeDebuggable: makeDebuggable, options: InstallOptions(overrideModificationTime: overrideModificationTime), onProgress: onProgress)
+  }
+
+  public func install_app_url(_ url: URL, compression: FBCompressionFormat, make_debuggable makeDebuggable: Bool, override_modification_time overrideModificationTime: Bool, on_progress onProgress: @escaping @Sendable (InstallProgressEvent) -> Void = { _ in }) async throws -> InstalledArtifact {
+    return try await installApp(from: .remoteURL(url), makeDebuggable: makeDebuggable, options: InstallOptions(overrideModificationTime: overrideModificationTime, compression: compression), onProgress: onProgress)
   }
 
   public func install_xctest_app_file_path(_ filePath: String, skipSigningBundles: Bool) async throws -> InstalledArtifact {
@@ -212,6 +208,21 @@ public final class IDBCommandExecutor {
       throw IDBCommandError.simulatorOnlyOperation(operation: "wait for accessibility", targetDescription: String(describing: target))
     }
     try await simulator.uiAutomation(backend: backend).wait(query, timeout: timeout, pollInterval: pollInterval)
+  }
+
+  public func accessibility_quiescence(
+    query: AccessibilityElementQuery,
+    parameters: QuiescenceParameters,
+    backend: UIAutomationBackend
+  ) async throws -> AsyncThrowingStream<QuiescenceEvent, Error> {
+    guard let simulator = target as? Simulator else {
+      throw IDBCommandError.simulatorOnlyOperation(operation: "stream accessibility quiescence", targetDescription: String(describing: target))
+    }
+    return try await simulator.uiAutomation(backend: backend).quiescence(query, parameters: parameters)
+  }
+
+  public func process_id(forBundleID bundleID: String) async throws -> pid_t {
+    try await target.application.processID(forBundleID: bundleID)
   }
 
   public func accessibility_scroll(
@@ -536,29 +547,14 @@ public final class IDBCommandExecutor {
     return try await logger.tailToConsumer(consumer)
   }
 
-  public func diagnostic_information() async throws -> NSDictionary {
-    guard let device = target as? Device else {
-      return NSDictionary()
-    }
-    return try await device.diagnosticInformation.fetch() as NSDictionary
+  public func hid(_ event: SimulatorHIDEvent) async throws {
+    // The shared HID outlives the call, and `simulator.hid.disconnect()` drains it when closing it.
+    try await connectToHID().send(event: event, logger: logger, drain: .onClose)
   }
 
-  /// `touchTarget` routes the event's touches to one display's touchscreen; nil sends them to the main screen.
-  public func hid(_ event: SimulatorHIDEvent, touchTarget: SimulatorTouchTarget? = nil) async throws {
+  public func hid<S: AsyncSequence>(events: S) async throws where S.Element == SimulatorHIDEvent {
     let hid = try await connectToHID()
-    try await event.send(on: hid, target: touchTarget)
-  }
-
-  /// The touchscreen of a display; nil selects the active integrated display.
-  public func touch_target(displayUniqueID: String?) async throws -> SimulatorTouchTarget {
-    try await simulatorTarget().displays.touchTarget(displayUniqueID: displayUniqueID)
-  }
-
-  /// The displays, and the identities of those a touchscreen covers.
-  public func list_displays() async throws -> (displays: [SimulatorDisplay], touchscreenDisplayIDs: Set<String>) {
-    let commands = try simulatorTarget().displays
-    let displays = try await commands.list()
-    return (displays, Set(try await commands.touchscreensIfSupported().map(\.displayUniqueID)))
+    try await hid.send(events: events, logger: logger)
   }
 
   public func set_hardware_keyboard_enabled(_ enabled: Bool) async throws {
@@ -581,12 +577,20 @@ public final class IDBCommandExecutor {
     try await simulatorTarget().orientation.current()
   }
 
-  public func set_orientation(_ orientation: SimulatorDeviceOrientation) async throws {
-    try await simulatorTarget().orientation.setOrientation(orientation)
+  public func set_orientation(_ orientation: SimulatorHIDDeviceOrientation, convention: SimulatorOrientationConvention) async throws {
+    try await simulatorTarget().orientation.set(orientation, convention: convention)
+  }
+
+  public func shake() async throws {
+    try await simulatorTarget().hardware.shake()
   }
 
   public func hinge_angle() async throws -> Double {
-    try await simulatorTarget().hinge.angle().degrees
+    try await simulatorTarget().hinge.current().degrees
+  }
+
+  public func set_hinge_angle(_ angle: SimulatorHingeAngle) async throws {
+    try await simulatorTarget().hinge.set(angle)
   }
 
   public func get_current_locale_identifier() async throws -> String {
@@ -634,7 +638,7 @@ public final class IDBCommandExecutor {
       try await self.withFileContainer(for: containerType) { container in
         _ = try await container.copy(fromContainer: path, toHost: tempPath)
       }
-      return try await FBArchiveOperations.createGzippedTarDataAsync(forPath: tempPath, queue: self.target.workQueue, logger: self.target.logger)
+      return try await FBArchiveOperations.createGzippedTarData(forPath: tempPath, logger: self.target.logger)
     }
   }
 
@@ -688,6 +692,10 @@ public final class IDBCommandExecutor {
 
   public func deliveredNotifications(forBundleID bundleID: String) async throws -> [DeliveredNotification] {
     try await simulatorTarget().notification.deliveredNotifications(forBundleID: bundleID)
+  }
+
+  public func clearDeliveredNotifications(forBundleID bundleID: String) async throws {
+    try await simulatorTarget().notification.clearDeliveredNotifications(forBundleID: bundleID)
   }
 
   public func sendPushNotification(forBundleID bundleID: String, jsonPayload: String) async throws {
@@ -842,14 +850,18 @@ public final class IDBCommandExecutor {
     return try await simulator.hid.connect()
   }
 
-  private func installExtractedApp(_ extractPath: URL, makeDebuggable: Bool) async throws -> InstalledArtifact {
-    guard let bundleDescriptor = try? BundleDescriptor.findAppPath(fromDirectory: extractPath, logger: target.logger) else {
-      throw IDBCommandError.noAppBundleExtracted
+  private func installApp(from source: InstallSource, makeDebuggable: Bool, options: InstallOptions, onProgress: @escaping @Sendable (InstallProgressEvent) -> Void) async throws -> InstalledArtifact {
+    let totalStart = Date()
+    return try await ApplicationArchive.withResolvedBundle(from: source, options: options, totalStart: totalStart, temporaryDirectory: temporaryDirectory, logger: target.logger, onProgress: onProgress) { bundle in
+      let installStart = Date()
+      onProgress(.installStarted(timing: .measure(stageStart: installStart, totalStart: totalStart), appPath: bundle.path))
+      let artifact = try await installAppBundle(bundle, makeDebuggable: makeDebuggable, persistByMoving: ApplicationArchive.unpacks(source))
+      onProgress(.installCompleted(timing: .measure(stageStart: installStart, totalStart: totalStart), appPath: bundle.path, bundleId: bundle.identifier))
+      return artifact
     }
-    return try await installAppBundle(bundleDescriptor, makeDebuggable: makeDebuggable)
   }
 
-  private func installAppBundle(_ appBundle: BundleDescriptor, makeDebuggable: Bool) async throws -> InstalledArtifact {
+  private func installAppBundle(_ appBundle: BundleDescriptor, makeDebuggable: Bool, persistByMoving: Bool) async throws -> InstalledArtifact {
     let userDevelopmentAppIsRequired = target is Device
     try storageManager.application.checkArchitecture(appBundle)
     let installedApp = try await target.application.install(atPath: appBundle.path)
@@ -857,7 +869,7 @@ public final class IDBCommandExecutor {
     // as installed apps are referenced from xctestrun files and expanded by idb
     // by using its own application storage. Fix this by replacing xctestrun
     // placeholders by app bundle paths instead
-    _ = try await storageManager.application.saveBundle(appBundle)
+    _ = try await storageManager.application.saveBundle(appBundle, usingSymlink: !persistByMoving, skipSigningBundles: false)
     if makeDebuggable && installedApp.installType != .userDevelopment && userDevelopmentAppIsRequired {
       throw IDBCommandError.userDevelopmentSigningRequired(applicationDescription: String(describing: installedApp))
     }

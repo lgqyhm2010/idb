@@ -3,29 +3,26 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Check URL handling and whether a pre-approval removes the system prompt."""
+"""Open URLs, and approve and revoke the permissions apps ask for."""
 
 from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .harness import (
+    AppState,
     HarnessError,
     IdbEndToEndTestCase,
     NotReady,
-    suite_supports,
     SuiteCapability,
-    wait_until,
 )
 
 # Only Safari launch is checked; page loading does not need to succeed.
 URL = "https://example.com"
 SAFARI_BUNDLE_ID = "com.apple.mobilesafari"
-
-RUNNING_TIMEOUT_SECONDS = 60.0
 
 TCC_DATABASE = Path("Library") / "TCC" / "TCC.db"
 TCC_ALLOWED = 2
@@ -44,7 +41,7 @@ DENY_BUTTON = "Don’t Allow"
 PROMPT_TIMEOUT_SECONDS = 60.0
 
 PERMISSION_TEST_CAPABILITIES = {
-    "test_pre_approval_removes_the_system_prompt": (
+    "test_approve_removes_the_system_prompt": (
         SuiteCapability.ACCESSIBILITY_INTERACTION
     ),
     "test_revoke_removes_only_the_requested_permission": (
@@ -55,56 +52,31 @@ PERMISSION_TEST_CAPABILITIES = {
 
 class OpenUrlTests(IdbEndToEndTestCase):
     async def test_opening_a_url_launches_the_app_that_handles_it(self) -> None:
-        # Start with Safari stopped so the test can detect the URL launching it.
-        await self.terminate_quietly(SAFARI_BUNDLE_ID)
-        await self.wait_until_running(SAFARI_BUNDLE_ID, False)
-        self.addAsyncCleanup(self.terminate_quietly, SAFARI_BUNDLE_ID)
+        # Safari starts stopped, so its launch can only come from the URL.
+        await self.setup_terminate_quietly(SAFARI_BUNDLE_ID)
+        await self.wait_for_app(SAFARI_BUNDLE_ID, AppState.STOPPED)
+        self.addAsyncCleanup(self.setup_terminate_quietly, SAFARI_BUNDLE_ID)
 
         await self.idb("open", URL)
 
-        await self.wait_until_running(SAFARI_BUNDLE_ID, True)
-
-    async def wait_until_running(self, bundle_id: str, running: bool) -> None:
-        async def check() -> None:
-            listed = bundle_id in await self.simctl.running_bundle_ids()
-            if listed != running:
-                raise NotReady(
-                    "launchctl still lists it"
-                    if listed
-                    else "launchctl does not list it"
-                )
-
-        state = "running" if running else "stopped"
-        try:
-            await wait_until(
-                f"{bundle_id} was not {state}", RUNNING_TIMEOUT_SECONDS, check
-            )
-        except HarnessError as error:
-            self.fail(str(error))
+        await self.wait_for_app(SAFARI_BUNDLE_ID, AppState.RUNNING)
 
 
 class PermissionTests(IdbEndToEndTestCase):
-    async def asyncSetUp(self) -> None:
-        required = PERMISSION_TEST_CAPABILITIES.get(self._testMethodName)
-        if required is None:
-            raise HarnessError(
-                f"No suite capability owns {type(self).__name__}.{self._testMethodName}"
-            )
-        if not suite_supports(required):
-            self.skipTest(
-                f"{self._testMethodName} requires {required.value} capability"
-            )
-        await super().asyncSetUp()
+    capabilities = PERMISSION_TEST_CAPABILITIES
 
-    async def test_pre_approval_removes_the_system_prompt(self) -> None:
+    async def test_approve_removes_the_system_prompt(self) -> None:
         """What approving a service buys: the app stops having to ask for it.
 
         TCC authorization is scoped to the requesting client, so the approval is
         only observable from inside the app. Asking for it is what makes the
         difference visible -- unapproved, the request reaches the user as a
-        system prompt; pre-approved, it is answered without one.
+        system prompt; approved, it is answered without one.
         """
+        await self.setup_deny_permission_prompts()
         bundle_id = await self.install_fixture_app()
+        # A prompt left up by a failure here would cover every later test.
+        self.addAsyncCleanup(self.setup_deny_permission_prompts)
 
         for service in PRIVACY_SERVICES:
             await self.relaunch(bundle_id)
@@ -112,7 +84,7 @@ class PermissionTests(IdbEndToEndTestCase):
             await self.wait_for_system_prompt(service)
             await self.deny_system_prompt()
 
-        await self.idb("approve", bundle_id, *PRIVACY_SERVICES)
+        await self.approve(bundle_id, *PRIVACY_SERVICES)
 
         for service in PRIVACY_SERVICES:
             await self.relaunch(bundle_id)
@@ -123,6 +95,16 @@ class PermissionTests(IdbEndToEndTestCase):
                 await self.system_prompt_showing(),
                 f"{service} was approved beforehand, so the app must not ask for it",
             )
+
+    async def approve(self, bundle_id: str, *services: str) -> None:
+        """Approve the services, and revoke them again when the test ends.
+
+        Uninstalling does not reliably take the grants away: tccd drops them
+        seconds later, and not at all if the app has been reinstalled by then,
+        so the next test's fresh install would inherit them.
+        """
+        self.addAsyncCleanup(self.idb, "revoke", bundle_id, *services, check=False)
+        await self.idb("approve", bundle_id, *services)
 
     async def relaunch(self, bundle_id: str) -> None:
         await self.idb("terminate", bundle_id, check=False)
@@ -160,7 +142,11 @@ class PermissionTests(IdbEndToEndTestCase):
             if DENY_BUTTON not in labels:
                 raise NotReady(f"the buttons on screen are {labels}")
 
-        await self.wait_or_fail(f"requesting {service} raised no system prompt", check)
+        await self.wait_or_fail(
+            f"requesting {service} raised no system prompt",
+            PROMPT_TIMEOUT_SECONDS,
+            check,
+        )
         self.recording.event("system_prompt", service=service)
 
     async def wait_for_marker(self, marker: str) -> None:
@@ -171,27 +157,20 @@ class PermissionTests(IdbEndToEndTestCase):
             if marker not in identifiers:
                 raise NotReady(f"the app reports {[i for i in identifiers if i]}")
 
-        await self.wait_or_fail(f"{marker} did not appear", check)
+        await self.wait_or_fail(
+            f"{marker} did not appear", PROMPT_TIMEOUT_SECONDS, check
+        )
         self.recording.event("app_marker", marker=marker)
-
-    async def wait_or_fail(
-        self, what: str, poll: Callable[[], Awaitable[None]]
-    ) -> None:
-        try:
-            await wait_until(what, PROMPT_TIMEOUT_SECONDS, poll)
-        except HarnessError as error:
-            self.fail(str(error))
 
     async def test_revoke_removes_only_the_requested_permission(self) -> None:
         bundle_id = await self.install_fixture_app()
-        # Uninstall cleanup should remove permissions from previous runs.
         self.assertEqual(
             self.permission_records(bundle_id),
             {},
             "a freshly installed app has been granted nothing",
         )
 
-        await self.idb("approve", bundle_id, "photos", "contacts")
+        await self.approve(bundle_id, "photos", "contacts")
 
         self.assertEqual(
             self.permission_records(bundle_id),
@@ -203,7 +182,7 @@ class PermissionTests(IdbEndToEndTestCase):
         self.assertEqual(
             self.permission_records(bundle_id),
             {CONTACTS_SERVICE: TCC_ALLOWED},
-            "revoking photos should leave contacts permission unchanged",
+            "revoking photos changed the contacts permission",
         )
 
     def permission_records(self, bundle_id: str) -> dict[str, int]:

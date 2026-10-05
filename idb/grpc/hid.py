@@ -12,7 +12,6 @@ from idb.common.types import (
     HIDButtonType,
     HIDDelay,
     HIDDirection,
-    HIDDisplay,
     HIDEvent,
     HIDHinge,
     HIDKey,
@@ -31,7 +30,6 @@ from idb.grpc.idb_pb2 import HIDEvent as GrpcHIDEvent, Point as GrpcPoint
 
 GrpcHIDButton = GrpcHIDEvent.HIDButton
 GrpcHIDDelay = GrpcHIDEvent.HIDDelay
-GrpcHIDDisplay = GrpcHIDEvent.HIDDisplay
 GrpcHIDHinge = GrpcHIDEvent.HIDHinge
 GrpcHIDKey = GrpcHIDEvent.HIDKey
 GrpcHIDPinch = GrpcHIDEvent.HIDPinch
@@ -54,6 +52,10 @@ BUTTON_TYPE_PAIRS: "List[Tuple[HIDButtonType, GrpcHIDButtonType]]" = [
     (HIDButtonType.LOCK, GrpcHIDEvent.LOCK),
     (HIDButtonType.SIDE_BUTTON, GrpcHIDEvent.SIDE_BUTTON),
     (HIDButtonType.SIRI, GrpcHIDEvent.SIRI),
+    (HIDButtonType.PLAY_PAUSE, GrpcHIDEvent.PLAY_PAUSE),
+    (HIDButtonType.VOLUME_UP, GrpcHIDEvent.VOLUME_UP),
+    (HIDButtonType.VOLUME_DOWN, GrpcHIDEvent.VOLUME_DOWN),
+    (HIDButtonType.EJECT, GrpcHIDEvent.EJECT),
 ]
 
 DIRECTION_PAIRS: "List[Tuple[HIDDirection, GrpcHIDDirection]]" = [
@@ -171,7 +173,5 @@ def event_to_grpc(event: HIDEvent) -> GrpcHIDEvent:
         return GrpcHIDEvent(hinge=GrpcHIDHinge(angle=event.angle))
     elif isinstance(event, HIDShake):
         return GrpcHIDEvent(shake=shake_to_grpc(event))
-    elif isinstance(event, HIDDisplay):
-        return GrpcHIDEvent(display=GrpcHIDDisplay(unique_id=event.unique_id))
     else:
         raise Exception(f"Invalid event {event}")

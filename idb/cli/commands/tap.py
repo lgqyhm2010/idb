@@ -10,7 +10,6 @@ from enum import Enum, unique
 
 from idb.cli import ClientCommand
 from idb.cli.commands.accessibility import action_backend
-from idb.cli.commands.displays import add_display_argument, display_kwargs
 from idb.common.types import (
     ACCESSIBILITY_BACKEND_BY_NAME,
     ACCESSIBILITY_KEY_BY_NAME as _SEARCHABLE_KEY_NAMES,
@@ -95,7 +94,6 @@ class TapCommand(ClientCommand):
             default=False,
             help="Compare the marker case-insensitively",
         )
-        add_display_argument(parser)
         super().add_parser_arguments(parser)
 
     def is_coordinate_hid_tap(self, args: Namespace) -> bool:
@@ -136,19 +134,8 @@ class TapCommand(ClientCommand):
             )
 
         if self.is_coordinate_hid_tap(args):
-            await client.tap(
-                x=int(target[0]),
-                y=int(target[1]),
-                duration=args.duration,
-                **display_kwargs(args),
-            )
+            await client.tap(x=int(target[0]), y=int(target[1]), duration=args.duration)
             return
-
-        if args.display is not None:
-            raise IdbException(
-                "--display is only valid for coordinate HID taps (not --api ax "
-                "or marker taps)"
-            )
 
         if args.duration is not None:
             raise IdbException(

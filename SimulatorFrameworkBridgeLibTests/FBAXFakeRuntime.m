@@ -32,6 +32,13 @@ static NSString *const kAXChildren = @"XC_kAXXCAttributeChildren";
   return [[self alloc] initWithObjects:objects forKeys:keys count:4];
 }
 
++ (instancetype)attributes
+{
+  id objects[] = {@"UIApplication", @"label", @[]};
+  id<NSCopying> keys[] = {kAXElementType, kAXLabel, kAXChildren};
+  return [[self alloc] initWithObjects:objects forKeys:keys count:3];
+}
+
 - (NSUInteger)count
 {
   return _values.count;
@@ -45,7 +52,7 @@ static NSString *const kAXChildren = @"XC_kAXXCAttributeChildren";
 - (id)objectForKey:(id)key
 {
   self.lookups++;
-  if (self.raises) {
+  if (self.raises || (self.maximumSuccessfulLookups > 0 && self.lookups > self.maximumSuccessfulLookups)) {
     [NSException raise:NSInternalInconsistencyException format:@"geometry dictionary lookup failed"];
   }
   return [_values objectForKey:key];
@@ -242,6 +249,43 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
 
 @end
 
+@implementation FBAXFakeQuiescenceMonitor
+{
+  FBAXQuiescenceHandler _handler;
+}
+
+- (instancetype)initWithHandler:(FBAXQuiescenceHandler)handler
+{
+  self = [super init];
+  if (self) {
+    _handler = [handler copy];
+    _requests = [NSMutableArray array];
+    _requestOutcome = [FBAXWriteOutcome written];
+  }
+  return self;
+}
+
+- (FBAXWriteOutcome *)requestSignal:(FBAXQuiescenceSignal)signal fromApplication:(id)element
+{
+  [self.requests addObject:@{@"signal" : @(signal), @"element" : element}];
+  return self.requestOutcome;
+}
+
+- (void)invalidate
+{
+  _invalidated = YES;
+  _handler = nil;
+}
+
+- (void)deliver:(FBAXQuiescenceReport)report pid:(pid_t)pid
+{
+  if (_handler) {
+    _handler(report, pid);
+  }
+}
+
+@end
+
 @implementation FBAXFakeRuntime
 {
   NSUInteger _translatorReadCount;
@@ -264,8 +308,10 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
   _snapshotOwnerElements = [NSMutableArray array];
   _applicationElements = [NSMutableDictionary dictionary];
   _automationModeWrites = [NSMutableArray array];
+  _quiescenceMonitors = [NSMutableArray array];
   _deviceSettings = [NSMutableDictionary dictionary];
   _deviceSettingWrites = [NSMutableArray array];
+  _displayInventoryOutcome = [FBAXDisplayInventoryOutcome available:@[]];
   _hitTestOutcome = [FBAXHitTestOutcome empty];
   _windowServerOutcome = [FBAXFrontmostOutcome unresolved:@"no window-server outcome configured"];
   _runningBoardOutcome = [FBAXFrontmostOutcome unresolved:@"no running-board outcome configured"];
@@ -287,6 +333,12 @@ NSDictionary<NSString *, id> *FBAXGeometryDictionaryProbe(BOOL rectangle, BOOL r
 {
   [self recordOperation:@"applicationElement"];
   return self.applicationElements[@(pid)];
+}
+
+- (FBAXDisplayInventoryOutcome *)displayInventory
+{
+  [self recordOperation:@"displayInventory"];
+  return self.displayInventoryOutcome;
 }
 
 // The snapshot API's own keys, spelled here rather than shared with the service so a test fails if the
@@ -394,6 +446,11 @@ static NSDictionary *FBAXFakeSnapshotNode(FBAXFakeElement *element,
   return fake.owningProcessIdentifier;
 }
 
+- (pid_t)owningProcessIdentifierOfElement:(id)element
+{
+  return [element isKindOfClass:FBAXFakeElement.class] ? ((FBAXFakeElement *)element).owningProcessIdentifier : 0;
+}
+
 - (nullable id)snapshotOfSnapshotElement:(id)element
                           attributeNames:(NSArray<NSString *> *)names
                            namesByNumber:(NSDictionary<NSNumber *, NSString *> *_Nullable *_Nonnull)namesByNumber
@@ -465,6 +522,9 @@ static NSDictionary *FBAXFakeSnapshotNode(FBAXFakeElement *element,
   }
   // Children come back as element handles, exactly as the live runtime returns them — the tree walk is
   // what turns them into nested dictionaries, and covering that is the point.
+  if (self.attributeRead) {
+    return [FBAXReadOutcome read:self.attributeRead];
+  }
   NSMutableDictionary<NSString *, id> *read = [fake.attributes mutableCopy];
   read[kAXChildren] = fake.children;
   return [FBAXReadOutcome read:read];
@@ -476,7 +536,22 @@ static NSDictionary *FBAXFakeSnapshotNode(FBAXFakeElement *element,
   _hitTestCount++;
   _lastHitTestPoint = point;
   _lastHitTestProcessIdentifier = pid;
+  _lastHitTestDisplayIdentifier = nil;
   return self.hitTestOutcome;
+}
+
+- (FBAXHitTestOutcome *)hitTestAtPoint:(CGPoint)point processIdentifier:(pid_t)pid displayIdentifier:(uint32_t)displayID
+{
+  FBAXHitTestOutcome *outcome = [self hitTestAtPoint:point processIdentifier:pid];
+  _lastHitTestDisplayIdentifier = @(displayID);
+  return outcome;
+}
+
+- (FBAXFrontmostOutcome *)windowServerFrontmostOnDisplay:(uint32_t)displayID
+{
+  FBAXFrontmostOutcome *outcome = [self windowServerFrontmost];
+  _lastFrontmostDisplayIdentifier = @(displayID);
+  return outcome;
 }
 
 - (FBAXWriteOutcome *)performAction:(FBAXAction)action onElement:(id)element
@@ -501,6 +576,7 @@ static NSDictionary *FBAXFakeSnapshotNode(FBAXFakeElement *element,
 {
   [self recordOperation:@"windowServerFrontmost"];
   _windowServerCount++;
+  _lastFrontmostDisplayIdentifier = nil;
   return self.windowServerOutcome;
 }
 
@@ -546,6 +622,23 @@ static NSDictionary *FBAXFakeSnapshotNode(FBAXFakeElement *element,
   // Read back, exactly as the live runtime does: what a caller learns is the state afterwards, not that
   // the write was attempted.
   return self.automationMode;
+}
+
+#pragma mark Quiescence
+
+- (nullable id<FBAXQuiescenceMonitor>)quiescenceMonitorWithHandler:(FBAXQuiescenceHandler)handler
+                                                             error:(NSString *_Nullable *_Nullable)error
+{
+  [self recordOperation:@"quiescenceMonitor"];
+  if (self.quiescenceMonitorError) {
+    if (error) {
+      *error = self.quiescenceMonitorError;
+    }
+    return nil;
+  }
+  FBAXFakeQuiescenceMonitor *monitor = [[FBAXFakeQuiescenceMonitor alloc] initWithHandler:handler];
+  [self.quiescenceMonitors addObject:monitor];
+  return monitor;
 }
 
 - (FBAXDeviceSettingOutcome *)enabledStateForDeviceSetting:(FBAXDeviceSetting)setting

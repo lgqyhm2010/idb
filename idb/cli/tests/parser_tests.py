@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import asyncio
 import json
 import logging
 import os
+import sys
 import tempfile
 from argparse import ArgumentParser, Namespace
 from collections.abc import AsyncIterator
@@ -38,7 +40,6 @@ from idb.common.types import (
     CrashLogQuery,
     DeliveredNotification,
     DeviceOrientation,
-    DisplayInfo,
     DomainSocketAddress,
     FileContainerType,
     HIDButtonType,
@@ -50,6 +51,12 @@ from idb.common.types import (
     InstrumentsTimings,
     LoggingMetadata,
     Permission,
+    QuiescenceEvent,
+    QuiescenceState,
+    QuiescenceStateChanged,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+    QuiescenceTouchesCompleted,
     Screenshot,
     ScreenshotCrop,
     ScreenshotFormat,
@@ -316,6 +323,25 @@ class TestParser(TestCase):
             override_modification_time=None,
         )
 
+    async def test_install_from_stdin(self) -> None:
+        self.client_mock.install = MagicMock(
+            return_value=AsyncGeneratorMock(
+                (
+                    InstalledArtifact(
+                        name="com.example.app", uuid="app-uuid", progress=None
+                    ),
+                )
+            )
+        )
+        with redirect_stdout(StringIO()):
+            self.assertEqual(await cli_main(cmd_input=["install", "-"]), 0)
+        self.client_mock.install.assert_called_once_with(
+            bundle=sys.stdin.buffer,
+            make_debuggable=None,
+            compression=None,
+            override_modification_time=None,
+        )
+
     async def test_install_with_mtime_override(self) -> None:
         self.client_mock.install = MagicMock(
             return_value=AsyncGeneratorMock(
@@ -400,7 +426,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\nInstalled: Symbols.dSYM\n",
+            "Installed 50.0%\nInstalled: Symbols.dSYM\n",
         )
         self.client_mock.install_dsym.assert_called_once_with(
             "Symbols.dSYM",
@@ -429,8 +455,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: libExample.dylib dylib-uuid\n",
+            "Installed 50.0%\nInstalled: libExample.dylib dylib-uuid\n",
         )
         self.client_mock.install_dylib.assert_called_once_with("libExample.dylib")
 
@@ -456,8 +481,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: Example.framework framework-uuid\n",
+            "Installed 50.0%\nInstalled: Example.framework framework-uuid\n",
         )
         self.client_mock.install_framework.assert_called_once_with("Example.framework")
 
@@ -789,8 +813,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: com.example.tests xctest-uuid\n",
+            "Installed 50.0%\nInstalled: com.example.tests xctest-uuid\n",
         )
         self.client_mock.install_xctest.assert_called_once_with(test_bundle_path, True)
 
@@ -1555,6 +1578,193 @@ class TestParser(TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(output.getvalue(), "")
 
+    def _stream_quiescence(
+        self, *events: QuiescenceEvent, then_block: bool = False
+    ) -> tuple[list[dict[str, Any]], list[bool]]:
+        calls: list[dict[str, Any]] = []
+        closed: list[bool] = []
+
+        async def stream(**kwargs: Any) -> AsyncIterator[QuiescenceEvent]:
+            calls.append(kwargs)
+            try:
+                for event in events:
+                    yield event
+                if then_block:
+                    await asyncio.Event().wait()
+            finally:
+                closed.append(True)
+
+        self.client_mock.accessibility_quiescence = stream
+        return calls, closed
+
+    async def test_quiet_now_answers_with_the_first_busy_or_quiet_state(
+        self,
+    ) -> None:
+        calls, closed = self._stream_quiescence(
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.SETTLING),
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+            QuiescenceStateChanged(
+                pid=42, state=QuiescenceState.BUSY, busy_signals=("run_loop_idle",)
+            ),
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(cmd_input=["ui", "quiet"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "settling (pid 42)\nquiet (pid 42)\n")
+        # Reporting now, the quiet window defaults to zero.
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "pid": None,
+                    "bundle_id": None,
+                    "busy_threshold_ms": None,
+                    "quiet_window_ms": 0,
+                }
+            ],
+        )
+        self.assertEqual(closed, [True])
+
+    async def test_quiet_now_exits_1_when_busy(self) -> None:
+        calls, _ = self._stream_quiescence(
+            QuiescenceStateChanged(
+                pid=42,
+                state=QuiescenceState.BUSY,
+                busy_signals=("run_loop_idle", "animations_inactive"),
+            ),
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(
+                cmd_input=["ui", "quiet", "--pid", "42", "--quiet-window-ms", "5"]
+            )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue(), "busy (animations_inactive, run_loop_idle) (pid 42)\n"
+        )
+        self.assertEqual(calls[0]["pid"], 42)
+        self.assertEqual(calls[0]["quiet_window_ms"], 5)
+
+    async def test_quiet_with_a_timeout_waits_for_quiet(self) -> None:
+        # A timeout of 0 waits for as long as it takes. A watch that ends quiet
+        # reports every event and answers the same way.
+        for timeout in (["30"], ["0"], ["0.01", "--watch"]):
+            with self.subTest(timeout=timeout):
+                calls, closed = self._stream_quiescence(
+                    QuiescenceStateChanged(
+                        pid=42,
+                        state=QuiescenceState.BUSY,
+                        busy_signals=("run_loop_idle",),
+                    ),
+                    QuiescenceTouchesCompleted(pid=42),
+                    QuiescenceTargetChanged(pid=43),
+                    QuiescenceStateChanged(pid=43, state=QuiescenceState.QUIET),
+                    then_block=True,
+                )
+                with redirect_stdout(StringIO()) as output:
+                    exit_code = await cli_main(
+                        cmd_input=[
+                            "ui",
+                            "quiet",
+                            *timeout,
+                            "--bundle-id",
+                            "com.example.app",
+                            "--busy-threshold-ms",
+                            "100",
+                            "--json",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(
+                    [json.loads(line) for line in output.getvalue().splitlines()],
+                    [
+                        {
+                            "event": "state",
+                            "state": "busy",
+                            "signals": ["run_loop_idle"],
+                            "pid": 42,
+                        },
+                        {"event": "touches_completed", "pid": 42},
+                        {"event": "target_changed", "pid": 43},
+                        {"event": "state", "state": "quiet", "pid": 43},
+                    ],
+                )
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "pid": None,
+                            "bundle_id": "com.example.app",
+                            "busy_threshold_ms": 100,
+                            "quiet_window_ms": None,
+                        }
+                    ],
+                )
+                self.assertEqual(closed, [True])
+
+    async def test_quiet_exits_1_when_the_timeout_elapses(self) -> None:
+        _, closed = self._stream_quiescence(
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.SETTLING),
+            then_block=True,
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01"])
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue(), "settling (pid 42)\nnot quiet within 0.01s\n"
+        )
+        self.assertEqual(closed, [True])
+
+        with self.subTest("a watch keeps reporting past quiet"):
+            _, closed = self._stream_quiescence(
+                QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+                QuiescenceStateChanged(
+                    pid=42, state=QuiescenceState.BUSY, busy_signals=("run_loop_idle",)
+                ),
+                then_block=True,
+            )
+            with redirect_stdout(StringIO()) as output:
+                exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01", "--watch"])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                output.getvalue(), "quiet (pid 42)\nbusy (run_loop_idle) (pid 42)\n"
+            )
+            self.assertEqual(closed, [True])
+
+        with self.subTest("a watch that ends after the target changes is not quiet"):
+            self._stream_quiescence(
+                QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+                QuiescenceTargetChanged(pid=43),
+                then_block=True,
+            )
+            with redirect_stdout(StringIO()) as output:
+                exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01", "--watch"])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                output.getvalue(), "quiet (pid 42)\nnow following pid 43\n"
+            )
+
+    async def test_quiet_target_exit_is_an_error(self) -> None:
+        for arguments in [["5"], ["5", "--watch"]]:
+            with self.subTest(arguments=arguments):
+                self._stream_quiescence(QuiescenceTargetExited(pid=42))
+                with (
+                    redirect_stdout(StringIO()) as output,
+                    redirect_stderr(StringIO()) as error,
+                ):
+                    exit_code = await cli_main(cmd_input=["ui", "quiet", *arguments])
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(output.getvalue(), "pid 42 exited\n")
+                self.assertIn("The application with pid 42 exited", error.getvalue())
+
+    async def test_quiet_rejects_negative_values(self) -> None:
+        for arguments in [["-1"], ["--busy-threshold-ms", "-1"], ["--watch"]]:
+            with self.subTest(arguments=arguments):
+                calls, _ = self._stream_quiescence()
+                with redirect_stderr(StringIO()):
+                    exit_code = await cli_main(cmd_input=["ui", "quiet", *arguments])
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(calls, [])
+
     async def test_scroll_frontmost(self) -> None:
         # No target is not a reason to fall back: the guest addresses the
         # application by pid rather than by point.
@@ -2064,88 +2274,6 @@ class TestParser(TestCase):
                 exit_code = await cli_main(cmd_input=["hinge", angle])
                 self.assertEqual(exit_code, 2)
         self.client_mock.set_hinge_angle.assert_not_called()
-
-    async def test_list_displays(self) -> None:
-        self.client_mock.list_displays = AsyncMock(
-            return_value=[
-                DisplayInfo(
-                    unique_id="inner",
-                    name="Inner",
-                    active=True,
-                    primary=False,
-                    integrated=True,
-                    width=2007,
-                    height=2853,
-                    scale=3,
-                    rotation="rot0",
-                    touchscreen=True,
-                )
-            ]
-        )
-        with redirect_stdout(StringIO()) as output:
-            self.assertEqual(await cli_main(cmd_input=["list-displays", "--json"]), 0)
-        self.assertEqual(
-            json.loads(output.getvalue()),
-            [
-                {
-                    "unique_id": "inner",
-                    "name": "Inner",
-                    "active": True,
-                    "primary": False,
-                    "integrated": True,
-                    "width": 2007,
-                    "height": 2853,
-                    "scale": 3,
-                    "rotation": "rot0",
-                    "touchscreen": True,
-                }
-            ],
-        )
-        self.client_mock.list_displays.assert_called_once_with()
-
-    async def test_touches_route_to_the_chosen_display(self) -> None:
-        for method, cmd_input, expected in [
-            ("tap", ["ui", "tap", "10", "20"], {"x": 10, "y": 20, "duration": None}),
-            (
-                "swipe",
-                ["ui", "swipe", "1", "2", "3", "4"],
-                {"p_start": (1, 2), "p_end": (3, 4), "duration": None, "delta": None},
-            ),
-            (
-                "multi_tap",
-                ["ui", "multi-tap", "10", "20"],
-                {"x": 10, "y": 20, "count": 2, "duration": None, "pause": 0.1},
-            ),
-            (
-                "pinch",
-                ["ui", "pinch", "200", "400", "2.0"],
-                {
-                    "center_x": 200.0,
-                    "center_y": 400.0,
-                    "scale": 2.0,
-                    "duration": 0.5,
-                    "radius": 100.0,
-                },
-            ),
-        ]:
-            for display in ["inner", "active"]:
-                with self.subTest(method=method, display=display):
-                    mock = AsyncMock(return_value=[])
-                    setattr(self.client_mock, method, mock)
-                    await cli_main(cmd_input=[*cmd_input, "--display", display])
-                    mock.assert_called_once_with(**expected, display=display)
-
-    async def test_display_is_refused_for_accessibility_taps(self) -> None:
-        self.client_mock.tap = AsyncMock()
-        self.client_mock.accessibility_tap = AsyncMock()
-        for cmd_input in [
-            ["ui", "tap", "Play", "--display", "inner"],
-            ["ui", "tap", "10", "20", "--api", "ax", "--display", "inner"],
-        ]:
-            with self.subTest(cmd_input=cmd_input):
-                self.assertNotEqual(await cli_main(cmd_input=cmd_input), 0)
-        self.client_mock.tap.assert_not_called()
-        self.client_mock.accessibility_tap.assert_not_called()
 
     async def test_shake(self) -> None:
         self.client_mock.shake = AsyncMock(return_value=[])
@@ -3135,6 +3263,16 @@ class TestParser(TestCase):
         # arrived is the one thing that cannot be done: it is not JSON.
         self.assertIsNone(records[2]["date"])
         self.assertIsNone(records[3]["date"])
+
+    async def test_notification_clear(self) -> None:
+        self.client_mock.clear_delivered_notifications = AsyncMock()
+        output = StringIO()
+        with redirect_stdout(output):
+            await cli_main(cmd_input=["notification", "clear", "com.foo.bar"])
+        self.client_mock.clear_delivered_notifications.assert_called_once_with(
+            "com.foo.bar"
+        )
+        self.assertEqual(output.getvalue(), "")
 
     async def test_debugserver_start(self) -> None:
         self.client_mock.debugserver_start = AsyncMock(return_value=["aaa", "bbb"])
