@@ -135,6 +135,81 @@ final class ApplicationArchiveTests: XCTestCase {
     }
   }
 
+  // MARK: - Download/extraction lifetime
+
+  func testDownloadFailure_JoinsExtractionWithoutCancellingIt() async throws {
+    let probe = ExtractionJoinProbe()
+    let started = HandedOver(FBMutableFuture<NSNull>())
+    do {
+      try await ApplicationArchive.finishDownloadAndExtraction {
+        _ = try await bridgeFBFuture(started.value)
+        throw JoinTestError.download
+      } extract: {
+        _ = started.value.resolve(withResult: NSNull())
+        // Keep extraction suspended while the already-ready download fails.
+        // The old scope-unwind path cancels this sleep and the child task.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await probe.finish(cancelled: Task.isCancelled)
+        throw JoinTestError.extraction
+      }
+      XCTFail("Expected the download error")
+    } catch {
+      XCTAssertEqual(error as? JoinTestError, .download)
+    }
+    let cancelled = await probe.cancelled
+    XCTAssertEqual(cancelled, false, "A transfer failure must join, not cancel, extraction")
+  }
+
+  func testSuccessfulDownload_PreservesExtractionFailure() async throws {
+    do {
+      try await ApplicationArchive.finishDownloadAndExtraction(download: {}) {
+        throw JoinTestError.extraction
+      }
+      XCTFail("Expected the extraction error")
+    } catch {
+      XCTAssertEqual(error as? JoinTestError, .extraction)
+    }
+  }
+
+  func testSuccessfulDownloadAndExtraction_Completes() async throws {
+    let probe = ExtractionJoinProbe()
+    try await ApplicationArchive.finishDownloadAndExtraction(download: {}) {
+      await probe.finish(cancelled: Task.isCancelled)
+    }
+    let cancelled = await probe.cancelled
+    XCTAssertEqual(cancelled, false)
+  }
+
+  func testCallerCancellation_CancelsExtractionAndCompletes() async throws {
+    let started = expectation(description: "extraction started")
+    let finished = expectation(description: "cancelled operation finished")
+    let probe = ExtractionJoinProbe()
+    let operation = Task {
+      defer { finished.fulfill() }
+      do {
+        try await ApplicationArchive.finishDownloadAndExtraction {
+          try await Task.sleep(nanoseconds: 60_000_000_000)
+        } extract: {
+          started.fulfill()
+          do {
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+          } catch {
+            await probe.finish(cancelled: Task.isCancelled)
+            throw error
+          }
+        }
+        XCTFail("Expected caller cancellation")
+      } catch {
+        XCTAssertTrue(error is CancellationError)
+      }
+    }
+    await fulfillment(of: [started], timeout: 5)
+    operation.cancel()
+    await fulfillment(of: [finished], timeout: 5)
+    let cancelled = await probe.cancelled
+    XCTAssertEqual(cancelled, true)
+  }
+
   // MARK: - Local sources
 
   func testResolve_WhenGivenAnAppBundle_SkipsExtractionEntirely() async throws {
@@ -274,6 +349,30 @@ final class ApplicationArchiveTests: XCTestCase {
       XCTAssertEqual(statusCode, 404)
     }
     XCTAssertEqual(leftBehind, [], "A failed download leaves nothing behind")
+  }
+
+  func testResolve_WhenTheServerRejectsWithAnEmptyBody_FailsWithTheHTTPStatus() async throws {
+    StubURLProtocol.behaviour = .respond(statusCode: 404, body: Data())
+    try await assertResolveThrows(.remoteURL(Self.stubbedURL), overStubbedNetwork: true) { error in
+      guard case .httpStatus(_, let statusCode)? = error as? InstallError else {
+        XCTFail("Expected an HTTP status failure, got: \(error)")
+        return
+      }
+      XCTAssertEqual(statusCode, 404)
+    }
+    XCTAssertEqual(leftBehind, [])
+  }
+
+  func testResolve_WhenTheTransferFailsBeforeAnyResponse_FailsWithTheTransferError() async throws {
+    // The stub's .none behaviour immediately fails without response headers or data.
+    StubURLProtocol.behaviour = .none
+    try await assertResolveThrows(.remoteURL(Self.stubbedURL), overStubbedNetwork: true) { error in
+      guard case .transferFailed? = error as? InstallError else {
+        XCTFail("Expected a transfer failure, got: \(error)")
+        return
+      }
+    }
+    XCTAssertEqual(leftBehind, [])
   }
 
   /// The extractor sees a truncated transfer as a short archive; the transfer's
@@ -463,5 +562,18 @@ private final class EventCollector: @unchecked Sendable {
 
   @Sendable func append(_ event: InstallProgressEvent) {
     lock.withLock { storage.append(event) }
+  }
+}
+
+private enum JoinTestError: Error, Equatable {
+  case download
+  case extraction
+}
+
+private actor ExtractionJoinProbe {
+  private(set) var cancelled: Bool?
+
+  func finish(cancelled: Bool) {
+    self.cancelled = cancelled
   }
 }

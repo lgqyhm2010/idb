@@ -198,12 +198,10 @@ public enum ApplicationArchive {
     try await runExtractStage(to: extractPath, totalStart: totalStart, onProgress: onProgress) {
       switch try await router.route() {
       case .stream:
-        async let extraction: Void = ArchiveExtractors.default.extract(
-          .stream(download.input), to: extractPath, options: options.extractOptions, logger: logger)
-        // The transfer's outcome first: the extractor only sees bytes and then an
-        // end of file, so a failed transfer looks to it like a short archive.
-        try await downloadCompleted()
-        try await extraction
+        try await finishDownloadAndExtraction(download: downloadCompleted) {
+          try await ArchiveExtractors.default.extract(
+            .stream(download.input), to: extractPath, options: options.extractOptions, logger: logger)
+        }
       case .spooled:
         logger.log("Spooling the zip at \(url) to \(spoolPath) as it is extracted")
         try await extractZipStream(
@@ -215,6 +213,30 @@ public enum ApplicationArchive {
           to: extractPath, options: options, logger: logger)
       }
     }
+  }
+
+  /// Joins an extractor after a failed transfer without cancelling it merely
+  /// because the transfer failed. The download delegate sends EOF even on failure;
+  /// the extractor must be allowed to attach its input and consume that EOF.
+  /// Otherwise a cancelled tar fallback can leave its replay writer waiting for
+  /// an attachment that will never happen. Caller cancellation still propagates
+  /// through the structured child task rather than starting a detached drain.
+  static func finishDownloadAndExtraction(
+    download: () async throws -> Void,
+    extract: @Sendable () async throws -> Void
+  ) async throws {
+    async let extraction: Void = extract()
+    do {
+      try await download()
+    } catch {
+      let downloadError = error
+      // Do not turn caller cancellation into a normal transfer-failure drain.
+      try Task.checkCancellation()
+      _ = try? await extraction
+      try Task.checkCancellation()
+      throw downloadError
+    }
+    try await extraction
   }
 
   /// Extracts a zip as it arrives, then applies what only the central directory
