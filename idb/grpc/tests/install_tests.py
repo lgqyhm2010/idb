@@ -43,7 +43,13 @@ def _zip_bytes(
     with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
         archive.writestr(zipfile.ZipInfo("Payload/"), b"")
         archive.writestr(zipfile.ZipInfo("Payload/App.app/"), b"")
-        archive.writestr("Payload/App.app/App", b"binary " * 1000)
+        # ZipInfo uses a fixed default timestamp; a filename alone uses the
+        # wall clock and makes repeated byte-for-byte fixtures differ.
+        archive.writestr(
+            zipfile.ZipInfo("Payload/App.app/App"),
+            b"binary " * 1000,
+            compress_type=compression,
+        )
     return buffer.getvalue()
 
 
@@ -51,6 +57,26 @@ def _zstd_decompress(stream: bytes) -> bytes:
     return subprocess.run(
         ["zstd", "-dc"], input=stream, capture_output=True, check=True
     ).stdout
+
+
+class ZipFixtureTests(unittest.TestCase):
+    def test_fixture_is_clock_independent_and_keeps_requested_compression(self) -> None:
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                with patch(
+                    "zipfile.time.localtime", return_value=(2020, 1, 1, 0, 0, 0)
+                ):
+                    first = _zip_bytes(compression)
+                with patch(
+                    "zipfile.time.localtime", return_value=(2030, 2, 2, 2, 2, 2)
+                ):
+                    second = _zip_bytes(compression)
+                self.assertEqual(first, second)
+                with zipfile.ZipFile(io.BytesIO(first)) as archive:
+                    info = archive.getinfo("Payload/App.app/App")
+                    self.assertEqual(info.compress_type, compression)
+                    self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+                    self.assertEqual(archive.read(info), b"binary " * 1000)
 
 
 class BinaryChunkTests(TestCase):
