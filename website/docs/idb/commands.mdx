@@ -49,12 +49,20 @@ idb list-displays
 idb list-displays --json
 ```
 
-Coordinate touches go to the main display unless `--display` names another. `idb ui tap`, `swipe`, `multi-tap` and `pinch` accept `--display ID`, with an identity from `list-displays`, or `--display active` for whichever integrated display is lit. The coordinates are in that display's current interface orientation, the same space a screenshot of it is in. A display that is unknown, not lit, or has no touchscreen fails the command rather than delivering the touch to the main display, and so does a companion that predates display routing.
+`list-displays` uses the current runtime's identified display inventory and reports its activity, geometry and touchscreen mappings. Runtimes that expose only legacy geometry without display identities cannot provide this inventory; the command reports that display inventory is unsupported rather than inventing UUIDs. That limitation does not disable the legacy fallback used by ordinary ACTIVE touches.
+
+Coordinate touches use upstream ACTIVE routing by default. `idb ui tap`, `swipe`, `drag`, `multi-tap` and `pinch` accept `--display active`, which is equivalent to omitting `--display`: it selects the active integrated display when supported, and retains upstream sole-display and legacy/main-display fallback behavior when the runtime cannot identify one. It does not force UUID routing. `--display ID`, with an identity from `list-displays`, pins the gesture to that active integrated display and fails closed when the identity cannot be matched, is inactive, or cannot be routed. A named UUID never silently falls back to the main display. Older companions that do not understand the display-selection message reject it, including `--display active`. Coordinates use the selected display's current interface orientation, the same space as its screenshot.
 
 ```
 idb hinge 180
 idb ui tap --display active 334 896
 idb ui swipe --display active 80 500 600 500
+```
+
+`idb ui describe-point --display` hit-tests a point on a display, with the point in that display's interface orientation as a touch takes it. Without it the companion selects the active display. A read needs no touchscreen, so any lit display can be named, integrated or not. `--display active` uses the same default routing as omitting the option, including legacy fallback. A named UUID requires an identified display; runtimes reporting only legacy geometry cannot satisfy it. A named sole integrated display supports either backend and is checked again before its result is returned. Other explicitly named UUIDs are read by the default `ax` backend only; `--api axbridge` refuses them. A companion that predates the option may ignore it and use its default display, so the element returned may not be on the display you named.
+
+```
+idb ui describe-point --display active 334 896
 ```
 
 Buttons and keys are not display-specific: `idb ui button`, `text` and `key` reach whichever app is in front.
@@ -343,9 +351,11 @@ idb ui scroll down
 idb ui set-value MARKER --value VALUE
 # Synthesize input
 idb ui swipe X_START Y_START X_END Y_END
-idb ui button {APPLE_PAY,HOME,LOCK,SIDE_BUTTON,SIRI}
+idb ui button {APPLE_PAY,HOME,LOCK,SIDE_BUTTON,SIRI,PLAY_PAUSE,VOLUME_UP,VOLUME_DOWN,EJECT}
 idb ui text "some text"
 idb ui key 4
+# Wait up to 30 seconds for the UI to settle
+idb ui quiet 30
 ```
 
 
@@ -482,6 +492,14 @@ idb notification list --json com.apple.Maps
 Lists the notifications an app has had delivered to it and still holds on a simulator. Physical devices are not supported. The app does not have to be running, and nothing here launches or foregrounds it, so this can be read after a test has killed the app it pushed to.
 
 Each notification is reported with its bundle ID, identifier, title, subtitle, body, thread identifier, and delivery date. Without `--json` the text fields are quoted and escaped as JSON strings, so a title or body carrying a newline still reads as one record on one line; text outside ASCII is left as the app wrote it rather than escaped, and a field the app left empty reads as `""`. A ` | ` inside a field survives the quoting, so the quotes show where a field ends rather than making a naive split on ` | ` safe — use `--json` where fields have to be taken apart reliably. The date is seconds since the Unix epoch under `--json`, and an ISO 8601 UTC timestamp otherwise. A notification that carried no date reads as `null` and `no date` respectively, rather than being given an epoch timestamp. A finite date too far out for the host calendar remains numeric under `--json` and reads as `unreadable date` in the text form.
+
+### Clear delivered notifications
+
+```
+idb notification clear com.apple.Maps
+```
+
+Withdraws every notification an app has had delivered to it on a simulator, so they leave Notification Center and a later `idb notification list` reports none. Physical devices are not supported. As with listing, the app does not have to be running and nothing here launches or foregrounds it, which lets a test start from an empty inbox rather than whatever earlier runs left behind.
 
 ### Simulate a memory warning
 

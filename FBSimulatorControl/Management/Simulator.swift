@@ -268,16 +268,22 @@ extension Simulator {
   /// The simulator's CoreDevice features. One client per simulator, so the installed CoreDevice
   /// version is read once.
   var coreDevice: SimulatorCoreDeviceClient {
-    commandCache.resolve { SimulatorCoreDeviceClient(simulator: self) }
+    commandCache.resolve { SimulatorCoreDeviceClient(deviceID: udid, connector: xpc) }
+  }
+
+  /// Host connections to the simulator's guest services.
+  var xpc: SimulatorXPCConnector {
+    .simulator(self)
+  }
+
+  /// GSEvents over the PurpleWorkspacePort: lock, and rotation on a runtime without device motion. One
+  /// per simulator, so concurrent sends to the port queue behind one another.
+  var purpleHID: SimulatorPurpleHIDTransport {
+    commandCache.resolve { SimulatorPurpleHIDTransport(simulator: self) }
   }
 
   public var displays: SimulatorDisplayCommands {
-    SimulatorDisplayCommands.commands(with: self)
-  }
-
-  /// Which touchscreen covers which display, kept between touches until the simulator changes state.
-  var touchscreenTopology: SimulatorTouchscreenTopology {
-    commandCache.resolve { SimulatorTouchscreenTopology() }
+    commandCache.resolve { SimulatorDisplayCommands.commands(with: self) }
   }
 
   public var orientation: SimulatorOrientationCommands {
@@ -286,6 +292,10 @@ extension Simulator {
 
   public var hinge: SimulatorHingeCommands {
     SimulatorHingeCommands.commands(with: self)
+  }
+
+  public var hardware: SimulatorHardwareCommands {
+    SimulatorHardwareCommands.commands(with: self)
   }
 
   public var power: SimulatorPowerCommands {
@@ -350,12 +360,12 @@ extension Simulator {
       let transport: any AXBridgeTransport =
         switch persistence {
         case .oneShot: AXBridgeOneshotTransport(simulator: self)
-        case .shared: axBridgeTransport(scope: .shared)
-        case .exclusive: axBridgeTransport(scope: .exclusive)
+        case .shared: frameworkBridgeTransport(scope: .shared)
+        case .exclusive: frameworkBridgeTransport(scope: .exclusive)
         }
       return AXBridgeUIAutomation(
         simulator: self, transport: transport, persistence: persistence, frontmostMethod: frontmostMethod,
-        automationMode: automationMode
+        automationMode: automationMode, displays: displays
       )
     }
   }
@@ -392,6 +402,14 @@ extension Simulator {
 
   public func erase() async throws {
     try await SimulatorEraseStrategy.erase(self)
+  }
+
+  public func details(_ keys: Set<TargetDetailKey>) async throws -> TargetDetails {
+    var details = TargetDetails(unsupported: keys)
+    if keys.contains(.displays) {
+      details.displays = state == .booted ? try await displays.describedDisplays() : .read([])
+    }
+    return details
   }
 
   public func spawn(_ configuration: ProcessSpawnConfiguration) async throws -> FBSubprocess<AnyObject, AnyObject, AnyObject> {

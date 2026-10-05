@@ -10,6 +10,10 @@ import Foundation
 /// Thrown by the `Subprocess` entrypoints.
 public enum SubprocessError: Error, Equatable {
   case unacceptableTermination(status: TerminationStatus, policy: ExitPolicy, executable: String, processIdentifier: pid_t)
+  case launchFailed(executable: String, message: String)
+  case outputUnavailable(path: String, message: String)
+  case inputUnavailable(message: String)
+  case timedOut(seconds: TimeInterval, executable: String, processIdentifier: pid_t)
 }
 
 extension SubprocessError: LocalizedError {
@@ -18,10 +22,18 @@ extension SubprocessError: LocalizedError {
     case let .unacceptableTermination(status, _, executable, processIdentifier):
       switch status {
       case .exited(let code):
-        return "Process \(processIdentifier) (\(executable)) exited with code \(code), which is not an acceptable exit"
+        return "Process \(processIdentifier) (\(executable)) exited with code \(code), which is not acceptable"
       case .signalled(let signo):
-        return "Process \(processIdentifier) (\(executable)) terminated with signal \(signo), which is not an acceptable exit"
+        return "Process \(processIdentifier) (\(executable)) terminated with signal \(signo), which is not acceptable"
       }
+    case let .launchFailed(executable, message):
+      return "Failed to launch \(executable): \(message)"
+    case let .outputUnavailable(path, message):
+      return "Cannot create output for \(path): \(message)"
+    case let .inputUnavailable(message):
+      return "Cannot create input: \(message)"
+    case let .timedOut(seconds, executable, processIdentifier):
+      return "Process \(processIdentifier) (\(executable)) did not terminate within \(seconds) seconds"
     }
   }
 }
@@ -30,113 +42,87 @@ extension Subprocess {
 
   /// Launches the process on the host, waits for it to terminate, and
   /// returns its termination status alongside whatever the output captures
-  /// produced.
+  /// produced. Output is fully drained before termination is reported.
   ///
   /// Throws `SubprocessError.unacceptableTermination` when the termination
   /// does not satisfy `exitPolicy` — note that a signal never satisfies a
-  /// code-based policy.
+  /// code-based policy — and `SubprocessError.timedOut` when the process
+  /// outlives `timeout`.
   ///
-  /// Cancellation stops observation of the process but does not kill it,
-  /// matching the engine underneath; use `sendSignal` on a launched handle
-  /// to terminate a process.
+  /// Both cancellation and a timeout stop observation of the process without
+  /// killing it, and its exit is still reaped; scoped and escaping lifetimes
+  /// are the province of `withRunning` and `launch`. The drains are
+  /// deliberately left armed rather than torn down, so an abandoned child goes
+  /// on writing to a live pipe instead of taking a SIGPIPE it would never have
+  /// seen had the caller waited.
   public func run<Out: Sendable, Err: Sendable>(
     output: Output<Out>,
     error: Output<Err>,
+    input: Input = .closed,
     exitPolicy: ExitPolicy = .mustExitZero,
+    timeout: TimeInterval? = nil,
     logger: (any ControlCoreLogger)? = nil
   ) async throws -> Completed<Out, Err> {
-    let stdOut = output.resolve()
-    let stdErr = error.resolve()
-    let io = FBProcessIO<AnyObject, AnyObject, AnyObject>(stdIn: nil, stdOut: stdOut.output, stdErr: stdErr.output)
-    let configuration = ProcessSpawnConfiguration(
-      launchPath: executable,
-      arguments: arguments,
-      environment: environment.resolved(against: ProcessInfo.processInfo.environment),
-      io: io,
-      mode: mode.spawnMode)
+    var (stdOut, captureOut) = try output.resolveHost()
+    var (stdErr, captureErr): (HostSink, () -> Err)
+    do {
+      (stdErr, captureErr) = try error.resolveHost()
+    } catch let failure {
+      stdOut.dispose()
+      throw failure
+    }
+    let stdIn: Int32?
+    do {
+      stdIn = try input.resolveHost()
+    } catch let failure {
+      stdOut.dispose()
+      stdErr.dispose()
+      throw failure
+    }
 
-    let process = try await bridgeFBFuture(
-      FBSubprocess<AnyObject, AnyObject, AnyObject>.launchProcess(with: configuration, logger: logger))
-    // `statLoc` resolves only after the IO attachment has torn down, so the
-    // captures below are complete by the time it is readable. It also never
-    // errors on termination, unlike the `exitCode`/`signal` pair.
-    let statLoc = try await bridgeFBFuture(process.statLoc)
-
-    let status = TerminationStatus(statLoc: statLoc.int32Value)
+    let running = try await startOnHost(stdIn: stdIn, stdOut: &stdOut, stdErr: &stdErr, logger: logger)
+    let status: TerminationStatus
+    if let timeout {
+      guard let resolved = try await running.exit.status(within: timeout) else {
+        throw SubprocessError.timedOut(
+          seconds: timeout,
+          executable: executable,
+          processIdentifier: running.processIdentifier)
+      }
+      status = resolved
+    } else {
+      status = try await running.exit.status()
+    }
     guard exitPolicy.accepts(status) else {
       throw SubprocessError.unacceptableTermination(
         status: status,
         policy: exitPolicy,
         executable: executable,
-        processIdentifier: process.processIdentifier)
+        processIdentifier: running.processIdentifier)
     }
     return Completed(
       executable: executable,
-      processIdentifier: process.processIdentifier,
+      processIdentifier: running.processIdentifier,
       terminationStatus: status,
-      standardOutput: stdOut.capture(),
-      standardError: stdErr.capture())
+      standardOutput: captureOut(),
+      standardError: captureErr())
   }
 
   /// As `run(output:error:exitPolicy:logger:)`, capturing both streams in
   /// memory as strings — the same default an unconfigured `FBProcessBuilder`
   /// applies, made visible in the return type.
   public func run(
+    input: Input = .closed,
     exitPolicy: ExitPolicy = .mustExitZero,
+    timeout: TimeInterval? = nil,
     logger: (any ControlCoreLogger)? = nil
   ) async throws -> Completed<String, String> {
-    try await run(output: .string, error: .string, exitPolicy: exitPolicy, logger: logger)
-  }
-}
-
-extension Subprocess.LaunchMode {
-  var spawnMode: ProcessSpawnMode {
-    switch self {
-    case .default:
-      return .default
-    case .posixSpawn:
-      return .posixSpawn
-    case .launchd:
-      return .launchd
-    }
+    try await run(output: .string, error: .string, input: input, exitPolicy: exitPolicy, timeout: timeout, logger: logger)
   }
 }
 
 extension Subprocess.Output {
-
-  /// Translates the capture into the engine's sink object, paired with a
-  /// reader for the captured value once the process has terminated.
-  func resolve() -> (output: FBProcessOutput<AnyObject>?, capture: () -> Captured) {
-    switch kind {
-    case .closed:
-      return (nil, { Self.captured(()) })
-    case .nullDevice:
-      // `FBProcessOutput.outputForNullDevice` attaches descriptor -1, which
-      // the host engine cannot duplicate onto the child — an actually-open
-      // /dev/null only exists as a file-path output.
-      return (FBProcessOutput<AnyObject>(forFilePath: "/dev/null"), { Self.captured(()) })
-    case .consumer(let consumer):
-      return (FBProcessOutput<AnyObject>(for: consumer), { Self.captured(()) })
-    case .logger(let logger):
-      return (FBProcessOutput<AnyObject>(for: logger), { Self.captured(()) })
-    case .loggerCapturingErrorMessage(let logger):
-      let buffer = FBDataBuffer.accumulatingBuffer(withCapacity: FBProcessOutputErrorMessageLength)
-      return (FBProcessOutput<AnyObject>(for: buffer, logger: logger), { Self.captured(()) })
-    case .lines(let sink):
-      let consumer = FBBlockDataConsumer.asynchronousLineConsumer(sink)
-      return (FBProcessOutput<AnyObject>(for: consumer), { Self.captured(()) })
-    case .data:
-      let backing = NSMutableData()
-      return (FBProcessOutput<AnyObject>(to: backing), { Self.captured(backing as Data) })
-    case .string:
-      let contents = FBProcessOutput<AnyObject>(toStringBackedBy: NSMutableData())
-      return (contents, { Self.captured(contents.contents) })
-    case .file(let url):
-      return (FBProcessOutput<AnyObject>(forFilePath: url.path), { Self.captured(url) })
-    }
-  }
-
-  private static func captured(_ value: Any) -> Captured {
+  static func captured(_ value: Any) -> Captured {
     guard let captured = value as? Captured else {
       preconditionFailure("A \(Captured.self) capture was paired with a sink that produced \(type(of: value)); the factory initializers make this unreachable")
     }

@@ -44,9 +44,48 @@ public final class SimulatorScreenshotCommands: ScreenshotCommands {
     guard let simulator = self.simulator else {
       throw WeakTargetError.simulator
     }
-    if let display = try await simulator.displays.activeIntegratedDisplayIfSupported() {
-      return try await takeActiveDisplay(display, configuration: configuration, simulator: simulator)
+    return try await Self.capture(
+      resolveDisplay: { try await simulator.displays.currentDisplay() },
+      display: { try await self.takeActiveDisplay($0, configuration: configuration, simulator: simulator) },
+      mainScreen: { try await self.takeMainScreen(configuration: configuration, simulator: simulator) },
+      logger: simulator.logger)
+  }
+
+  /// The active display improves on the main screen but is never required: whatever stops it being
+  /// selected or captured, the screenshot captures the main screen instead.
+  static func capture<Result>(
+    resolveDisplay: () async throws -> SimulatorDisplayResolution,
+    display: (SimulatorDisplay) async throws -> Result,
+    mainScreen: () async throws -> Result,
+    logger: any ControlCoreLogger
+  ) async throws -> Result {
+    do {
+      let resolution = try await resolveDisplay()
+      if let active = activeDisplay(in: resolution) {
+        return try await display(active)
+      }
+      logger.log("Capturing the main screen, as no active display is identified: \(resolution)")
+    } catch let error as CancellationError {
+      throw error
+    } catch {
+      logger.log("Capturing the main screen, as the active display could not be captured: \(error)")
     }
+    return try await mainScreen()
+  }
+
+  /// Only an identified, active display has a framebuffer to capture. A transition is not waited out.
+  static func activeDisplay(in resolution: SimulatorDisplayResolution) -> SimulatorDisplay? {
+    switch resolution {
+    case let .target(.selected(display)):
+      return display
+    case let .target(.sole(.identified(display))):
+      return display.isActive ? display : nil
+    case .target(.sole(.legacy)), .fallback, .transitioning:
+      return nil
+    }
+  }
+
+  private func takeMainScreen(configuration: ScreenshotConfiguration, simulator: Simulator) async throws -> ScreenshotResult {
     let image = try await connectToImage()
     let screenScale = simulator.screenInfo.map { Double($0.scale) }
     guard let captured = try await image.image(configuration: configuration, screenScale: screenScale) else {
@@ -66,7 +105,7 @@ public final class SimulatorScreenshotCommands: ScreenshotCommands {
     guard let captured = try await image.image(configuration: configuration, screenScale: display.scale, display: display) else {
       throw SimulatorScreenshotError.captureFailed
     }
-    guard try await simulator.displays.activeIntegratedDisplay() == display else { throw SimulatorDisplayError.changed }
+    guard Self.activeDisplay(in: try await simulator.displays.currentDisplay()) == display else { throw SimulatorDisplayError.changed }
     return try ScreenshotRenderer.render(
       transformed: captured.image, sourceSize: captured.sourceSize,
       encoding: configuration.encoding, screenScale: display.scale)
@@ -79,7 +118,7 @@ public final class SimulatorScreenshotCommands: ScreenshotCommands {
     guard let simulator = self.simulator else {
       throw WeakTargetError.simulator
     }
-    let framebuffer = try simulator.framebuffer.connect()
+    let framebuffer = try await simulator.framebuffer.connect()
     let image = SimulatorImage(framebuffer: framebuffer, logger: simulator.logger)
     self.image = image
     return image

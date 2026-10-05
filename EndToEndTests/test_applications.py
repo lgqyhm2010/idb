@@ -7,19 +7,33 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import functools
+import http.server
 import json
+import shutil
+import threading
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
-from .harness import HarnessError, IdbEndToEndTestCase, NotReady, wait_until
+from .harness import (
+    FIXTURE_APP_BUNDLE_ID,
+    HarnessError,
+    IdbEndToEndTestCase,
+    INSTALL_TIMEOUT_SECONDS,
+    NotReady,
+    wait_until,
+)
 
 PID_REPORT_TIMEOUT_SECONDS = 120.0
 
+INSTALL_LOG_TIMEOUT_SECONDS = 10.0
+
+CANCEL_GRACE_SECONDS = 2.0
+
 APP_STOP_TIMEOUT_SECONDS = 60.0
-
-
-def _leading_json_object(data: bytes) -> tuple[Any, int]:
-    """Decode the first JSON value and return its end offset in the decoded text."""
-    return json.JSONDecoder().raw_decode(data.decode(errors="replace"))
 
 
 class ApplicationLifecycleTests(IdbEndToEndTestCase):
@@ -51,14 +65,181 @@ class ApplicationLifecycleTests(IdbEndToEndTestCase):
         self.assertNotIn(bundle_id, installed, "simctl still sees the uninstalled app")
 
     async def test_launching_an_unknown_bundle_fails(self) -> None:
-        completed = await self.idb_expect_failure(
+        await self.idb_expect_failure(
             "launch",
             "com.example.idb.not-installed",
             expected_error="isn't installed",
         )
-        self.assertTrue(
-            completed.error_text.strip(), "a failed launch should explain itself"
+
+
+@contextlib.contextmanager
+def _serving(directory: Path) -> Iterator[str]:
+    """Serve a directory over loopback HTTP, yielding its base URL."""
+    with _serving_with(
+        functools.partial(
+            http.server.SimpleHTTPRequestHandler, directory=str(directory)
         )
+    ) as base:
+        yield base
+
+
+@contextlib.contextmanager
+def _serving_with(handler: Any) -> Iterator[str]:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class _StalledDownload:
+    """Answers with the start of a zip, then sends nothing more until released."""
+
+    def __init__(self) -> None:
+        self.requested = threading.Event()
+        self.released = threading.Event()
+
+    def handler(self, *args: Any) -> http.server.BaseHTTPRequestHandler:
+        stalled = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(1 << 30))
+                self.end_headers()
+                self.wfile.write(b"PK\x03\x04" + bytes(64 * 1024))
+                self.wfile.flush()
+                stalled.requested.set()
+                stalled.released.wait(INSTALL_TIMEOUT_SECONDS)
+
+        return Handler(*args)
+
+
+class ArchiveInstallTests(IdbEndToEndTestCase):
+    def make_fixture_ipa(self, directory: Path) -> Path:
+        staging = self.make_temporary_directory()
+        fixture = self.environment.fixture_app
+        shutil.copytree(fixture, staging / "Payload" / fixture.name, symlinks=True)
+        archive = shutil.make_archive(
+            str(staging / "fixture"), "zip", staging, "Payload"
+        )
+        return Path(shutil.move(archive, directory / "fixture.ipa"))
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        # The companion outlives each test, so earlier tests' installs are in its log.
+        self.earlier_installs = len(self.install_completion_lines())
+
+    def install_completion_lines(self) -> list[str]:
+        log = self.companion.log_path.read_text(errors="replace")
+        return [line for line in log.splitlines() if "payload_kind=" in line]
+
+    async def install_columns(self) -> dict[str, str]:
+        """Return the columns on this test's install completion line."""
+
+        async def poll() -> dict[str, str]:
+            lines = self.install_completion_lines()[self.earlier_installs :]
+            if not lines:
+                raise NotReady("no install completion line in the companion log")
+            columns = lines[0].rsplit("{", 1)[1].rstrip().rstrip("}")
+            return dict(column.split("=", 1) for column in columns.split(", "))
+
+        return await wait_until(
+            "the install completion line", INSTALL_LOG_TIMEOUT_SECONDS, poll
+        )
+
+    def assert_timed(self, columns: dict[str, str], *keys: str) -> None:
+        for key in keys:
+            self.assertIn(key, columns)
+            self.assertGreaterEqual(int(columns[key]), 0)
+
+    async def test_installing_an_ipa(self) -> None:
+        ipa = self.make_fixture_ipa(self.make_temporary_directory())
+        self.addAsyncCleanup(self.uninstall_quietly, FIXTURE_APP_BUNDLE_ID)
+
+        await self.idb("install", str(ipa), timeout=INSTALL_TIMEOUT_SECONDS)
+
+        self.assertIn(FIXTURE_APP_BUNDLE_ID, await self.simctl.installed_bundle_ids())
+        # The companion shares the client's host, so it is handed the path, not the bytes.
+        columns = await self.install_columns()
+        self.assertEqual(columns["payload_kind"], "file_path")
+        self.assert_timed(columns, "extract_ms", "install_ms")
+        self.assertNotIn("receive_ms", columns)
+        self.assertNotIn("failure_stage", columns)
+
+    async def test_installing_an_ipa_keeps_the_app_for_debugging(self) -> None:
+        ipa = self.make_fixture_ipa(self.make_temporary_directory())
+        self.addAsyncCleanup(self.uninstall_quietly, FIXTURE_APP_BUNDLE_ID)
+
+        await self.idb("install", str(ipa), timeout=INSTALL_TIMEOUT_SECONDS)
+
+        # `debugserver start` and xctestrun placeholders resolve installed apps from here.
+        persisted = (
+            self.simctl.device_set_path
+            / self.simctl.udid
+            / "data/fbsimulatorcontrol/idb-applications"
+            / FIXTURE_APP_BUNDLE_ID
+            / self.environment.fixture_app.name
+        )
+        self.assertFalse(persisted.is_symlink())
+        self.assertTrue((persisted / "Info.plist").exists())
+
+    async def test_installing_an_ipa_from_a_url(self) -> None:
+        served = self.make_temporary_directory()
+        self.make_fixture_ipa(served)
+        self.addAsyncCleanup(self.uninstall_quietly, FIXTURE_APP_BUNDLE_ID)
+
+        with _serving(served) as base:
+            await self.idb(
+                "install", f"{base}/fixture.ipa", timeout=INSTALL_TIMEOUT_SECONDS
+            )
+
+        self.assertIn(FIXTURE_APP_BUNDLE_ID, await self.simctl.installed_bundle_ids())
+        columns = await self.install_columns()
+        self.assertEqual(columns["payload_kind"], "url")
+        self.assertEqual(int(columns["size"]), (served / "fixture.ipa").stat().st_size)
+        self.assert_timed(columns, "receive_ms", "extract_ms", "install_ms")
+        self.assertNotIn("failure_stage", columns)
+
+    async def test_installing_from_a_missing_url_reports_the_http_status(self) -> None:
+        with _serving(self.make_temporary_directory()) as base:
+            await self.idb_expect_failure(
+                "install",
+                f"{base}/missing.ipa",
+                expected_error="HTTP status 404",
+                timeout=INSTALL_TIMEOUT_SECONDS,
+            )
+
+        columns = await self.install_columns()
+        self.assertEqual(columns["payload_kind"], "url")
+        self.assertEqual(columns["failure_stage"], "download")
+        self.assertEqual(columns["failure_kind"], "http_status")
+        self.assertNotIn("install_ms", columns)
+
+    async def test_stopping_the_client_mid_download_reports_the_cancel(self) -> None:
+        stalled = _StalledDownload()
+        self.addCleanup(stalled.released.set)
+        with _serving_with(stalled.handler) as base:
+            async with self.idb_process("install", f"{base}/stalled.ipa"):
+                await asyncio.to_thread(stalled.requested.wait, INSTALL_TIMEOUT_SECONDS)
+            await asyncio.sleep(CANCEL_GRACE_SECONDS)
+            # BUG: the install outlives its client, waiting on a download nobody
+            # wants until the server drops the connection.
+            self.assertEqual(
+                self.install_completion_lines()[self.earlier_installs :], []
+            )
+            stalled.released.set()
+            columns = await self.install_columns()
+
+        self.assertEqual(columns["payload_kind"], "url")
+        self.assertEqual(columns["failure_stage"], "download")
+        self.assertEqual(columns["failure_kind"], "transfer_failed")
+        self.assertEqual(columns["cancel_source"], "client")
 
 
 class LaunchOutputTests(IdbEndToEndTestCase):
@@ -71,7 +252,9 @@ class LaunchOutputTests(IdbEndToEndTestCase):
     async def test_launch_wait_for_reports_pid_on_stdout(self) -> None:
         async with self.idb_process("launch", "--wait-for", self.bundle_id) as launch:
             chunk = await launch.read_some(PID_REPORT_TIMEOUT_SECONDS)
-            report, consumed = _leading_json_object(chunk)
+            report, consumed = json.JSONDecoder().raw_decode(
+                chunk.decode(errors="replace")
+            )
             self.assertIsInstance(report, dict)
             pid = report["pid"]
             self.assertGreater(pid, 0)
@@ -90,7 +273,7 @@ class LaunchOutputTests(IdbEndToEndTestCase):
             await self.idb("ui", "button", "HOME", check=False)
             self.assertIsNone(
                 launch.returncode,
-                "launch --wait-for should stay attached while the app runs",
+                "launch --wait-for exited while the app was still running",
             )
             self.assertEqual(
                 (await self.installed_apps())[self.bundle_id]["process_state"],
@@ -106,11 +289,8 @@ class LaunchOutputTests(IdbEndToEndTestCase):
             if app["process_state"] == "Running":
                 raise NotReady("list-apps still reports it running")
 
-        try:
-            await wait_until(
-                "App still running after launch --wait-for exited",
-                APP_STOP_TIMEOUT_SECONDS,
-                stopped,
-            )
-        except HarnessError as error:
-            self.fail(str(error))
+        await self.wait_or_fail(
+            "App still running after launch --wait-for exited",
+            APP_STOP_TIMEOUT_SECONDS,
+            stopped,
+        )

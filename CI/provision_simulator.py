@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from . import simulator_isolation
 
 IOS_RUNTIME_PREFIX = "com.apple.CoreSimulator.SimRuntime.iOS-"
 
@@ -88,8 +91,15 @@ def provision(
     name: str,
     device_set: Path | None = None,
     env_prefix: str = "",
+    isolation_directory: Path | None = None,
 ) -> list[str]:
     """Create a simulator and wait for bootstatus before returning its environment."""
+    if isolation_directory is not None:
+        if device_set is None:
+            raise simulator_isolation.IsolationError(
+                "Isolation needs a dedicated device set"
+            )
+        simulator_isolation.require_hosted_ci(device_set, os.environ)
     listing = json.loads(run(["xcrun", "simctl", "list", "--json", "runtimes"]))
     runtime = newest_runtime(listing.get("runtimes", []))
     device_type = newest_iphone(runtime)
@@ -104,8 +114,23 @@ def provision(
     ).strip()
     if not udid:
         raise NoSimulatorError(f"simctl create {name} returned no UDID")
-    run(simctl_argv(device_set, "boot", udid))
-    run(simctl_argv(device_set, "bootstatus", udid))
+    if isolation_directory is not None:
+        assert device_set is not None
+        simulator_isolation.save_target(isolation_directory, device_set, udid)
+        simulator_isolation.isolate(device_set, udid, isolation_directory)
+    booted = False
+    try:
+        run(simctl_argv(device_set, "boot", udid))
+        run(simctl_argv(device_set, "bootstatus", udid))
+        booted = True
+    finally:
+        if isolation_directory is not None:
+            assert device_set is not None
+            simulator_isolation.safe_snapshot(
+                isolation_directory,
+                "after-boot" if booted else "boot-failed",
+                device_set,
+            )
     return environment_lines(udid, device_set, env_prefix)
 
 
@@ -127,7 +152,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="prefix for output variable names, such as TEST_RUNNER_ for xcodebuild",
     )
+    parser.add_argument("--isolate-hosted-ci", action="store_true")
+    parser.add_argument("--diagnostics-dir", type=Path)
     arguments = parser.parse_args(argv)
+    if arguments.isolate_hosted_ci and arguments.diagnostics_dir is None:
+        parser.error("--isolate-hosted-ci requires --diagnostics-dir")
 
     if arguments.device_set is not None:
         arguments.device_set.mkdir(parents=True, exist_ok=True)
@@ -137,8 +166,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             name=arguments.name,
             device_set=arguments.device_set,
             env_prefix=arguments.env_prefix,
+            isolation_directory=(
+                arguments.diagnostics_dir if arguments.isolate_hosted_ci else None
+            ),
         )
-    except NoSimulatorError as error:
+    except (NoSimulatorError, simulator_isolation.IsolationError) as error:
         print(error, file=sys.stderr)
         return 1
     for line in lines:

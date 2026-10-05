@@ -19,6 +19,7 @@ final class FakeFramebufferSurface: FramebufferSurface {
 
   private(set) var ioSurfaceChanged: ((IOSurface?) -> Void)?
   private(set) var frameRendered: (() -> Void)?
+  private(set) var configurationChanged: ((SimulatorDisplayConfiguration) -> Void)?
   private(set) var registeredTokens: [UUID] = []
   private(set) var unregisteredTokens: [UUID] = []
 
@@ -29,7 +30,8 @@ final class FakeFramebufferSurface: FramebufferSurface {
   func registerCallbacks(
     token: UUID,
     ioSurfaceChanged: @escaping (IOSurface?) -> Void,
-    frameRendered: @escaping () -> Void
+    frameRendered: @escaping () -> Void,
+    configurationChanged: @escaping (SimulatorDisplayConfiguration) -> Void
   ) throws {
     if let registerError {
       throw registerError
@@ -37,6 +39,7 @@ final class FakeFramebufferSurface: FramebufferSurface {
     registeredTokens.append(token)
     self.ioSurfaceChanged = ioSurfaceChanged
     self.frameRendered = frameRendered
+    self.configurationChanged = configurationChanged
   }
 
   func unregisterCallbacks(token: UUID) {
@@ -49,6 +52,34 @@ final class FakeFramebufferSurface: FramebufferSurface {
   func releaseCallbacks() {
     ioSurfaceChanged = nil
     frameRendered = nil
+  }
+}
+
+/// Screens keyed by display UUID, recording which were asked for. A display without one fails to locate.
+// SAFETY: The requests are guarded by the lock; the screens are only read.
+// patternlint-disable-next-line unchecked-sendable
+final class FramebufferScreensDouble: FramebufferScreens, @unchecked Sendable {
+  struct NoScreen: Error {}
+
+  let main = FakeFramebufferSurface()
+  let screens: [String: FakeFramebufferSurface]
+  private let lock = NSLock()
+  private var requests: [String] = []
+
+  init(_ uniqueIDs: String...) {
+    screens = Dictionary(uniqueKeysWithValues: uniqueIDs.map { ($0, FakeFramebufferSurface()) })
+  }
+
+  var requested: [String] { lock.withLock { requests } }
+
+  func mainScreen() throws -> any FramebufferSurface {
+    main
+  }
+
+  func screen(uniqueID: String) async throws -> any FramebufferSurface {
+    lock.withLock { requests.append(uniqueID) }
+    guard let screen = screens[uniqueID] else { throw NoScreen() }
+    return screen
   }
 }
 

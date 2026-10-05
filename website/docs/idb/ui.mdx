@@ -48,7 +48,7 @@ The three read commands differ only in what they are asked about — they share 
 
 ### `idb ui describe-all`
 
-Describes every element of the frontmost application.
+Describes every element of the frontmost application. Pass `--bundle-id com.example.app` to read a specific running application instead, including another app sharing the screen in a split view. This does not launch or foreground it. An older companion may ignore the option; check the root element's pid before relying on the result.
 
 ```
 idb ui describe-all
@@ -121,6 +121,7 @@ idb ui describe com.apple.settings.general --match-key AXUniqueId
 | `--collect-frame-coverage` | all three | Collect screen-coverage ratios for the read's element frames, reported in the `complete` format |
 | `--match-key KEY` | `describe` | Attribute the marker is matched against, default `AXLabel` |
 | `--depth N` | `describe` | Maximum tree depth searched for the marker, default `10` |
+| `--display ID` | `describe-point` | Hit-test the point on this display, in its interface orientation. See [Simulator displays](commands.mdx#simulator-displays) |
 
 ## Waiting for an element
 
@@ -136,6 +137,27 @@ A match exits successfully and prints `{"found": true}` with `--json`. A timeout
 With either `--api axbridge` (the default) or `--api ax`, timeout `diagnostics.unmatched_values` contains only nonmatching values of the searched key from the final poll: labels for a label search, identifiers for an identifier search. It contains no other element attributes and requires no additional tree read. The sample holds at most 50 values, each limited to 200 characters; `diagnostics.truncated` indicates omitted text. Older companions and backends that do not supply diagnostics omit the field.
 
 For `axbridge`, `diagnostics.truncated` also records a truncated tree read. If its final poll ended in a retryable read failure, `diagnostics.read_error` explains why and the values are empty. The `ax` backend propagates read failures as errors instead.
+
+## Waiting for the UI to settle
+
+`idb ui quiet` reports whether the frontmost app's UI is quiet: its main run loop is idle and it has no animations in flight. It exits successfully when quiet and with status 1 when busy.
+
+```
+idb ui quiet
+idb ui quiet 30
+idb ui quiet 0
+idb ui quiet 30 --watch
+idb ui quiet 30 --bundle-id com.apple.Preferences --json
+```
+
+With a timeout, the command waits up to that many seconds and exits successfully as soon as the UI is quiet, or with status 1 if the timeout elapses first. A timeout of `0` waits for as long as it takes. With `--watch`, the command keeps reporting events once the UI is quiet, until the timeout elapses (or, with `0`, until interrupted), then exits successfully if the last state was quiet and with status 1 otherwise. The companion streams state changes as they happen; the CLI does not poll. Each event is printed as it arrives, one JSON object per line with `--json`: `state` (with `busy`, `settling` or `quiet`, and the busy signals), `touches_completed`, `target_changed` when the frontmost app changes, `target_exited`, and `timed_out`.
+
+| Option | Description |
+| --- | --- |
+| `--watch` | Keep reporting events once the UI is quiet, until the timeout elapses. Requires a timeout |
+| `--pid PID` / `--bundle-id ID` | Watch this app instead of following the frontmost app. The command fails if it exits |
+| `--busy-threshold-ms MS` | How long a busy signal must persist before it counts, default `20` |
+| `--quiet-window-ms MS` | How long the UI must stay idle before it is quiet, default `250`. When reporting the current state it defaults to `0`, so the answer is immediate |
 
 ## Acting on elements
 
@@ -246,6 +268,20 @@ idb ui swipe 100 500 100 100
 
 The touch is moved in steps; `--delta` sets the distance in points between successive touch points along the line, and `--duration` sets how long the whole gesture takes.
 
+### `idb ui drag X1 Y1 X2 Y2 [X3 Y3 ...]`
+
+Holds one contact down along a path of at least two points, including its corners, then lifts at the last point. `--duration` is the total gesture time in seconds (default `1.0`); `--delta` is the maximum distance between samples in points (default `10.0`). Coordinates and durations must be finite; duration can be zero and delta must be positive.
+
+```
+idb ui drag 100 600 100 300 400 300 --duration 2
+```
+
+Both `swipe` and `drag` accept `--edge top|left|bottom|right` to identify a system gesture starting at that screen edge, such as the home indicator or Notification Centre. Put the first coordinate on the selected edge. An older companion rejects an unsupported edge selector rather than silently delivering an ordinary gesture.
+
+```
+idb ui drag 236 668 236 600 700 330 --edge bottom --display active
+```
+
 ### `idb ui pinch X Y SCALE`
 
 A two-finger pinch centred on a point. A scale above `1.0` zooms in, below `1.0` zooms out.
@@ -261,13 +297,15 @@ idb ui pinch 201 437 0.5 --duration 1.0 --radius 150
 
 ### `idb ui button BUTTON`
 
-Presses a hardware button: one of `APPLE_PAY`, `HOME`, `LOCK`, `SIDE_BUTTON` or `SIRI`.
+Presses a hardware button: one of `APPLE_PAY`, `HOME`, `LOCK`, `SIDE_BUTTON`, `SIRI`, `PLAY_PAUSE`, `VOLUME_UP`, `VOLUME_DOWN` or `EJECT`. `EJECT` on a focused text field hides or re-shows the software keyboard without ending editing.
 
 ```
 # Send the target to the lock screen
 idb ui button LOCK
 # Hold the side button
 idb ui button SIDE_BUTTON --duration 2
+# Toggle the software keyboard
+idb ui button EJECT
 ```
 
 ### `idb ui remote ACTION`

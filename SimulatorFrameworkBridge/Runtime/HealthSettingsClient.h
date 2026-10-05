@@ -9,11 +9,20 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/** Callback state remains live after the wait, including late completions. */
+/** Resolves HealthKit classes through `lookup` instead of the runtime, or restores the runtime with nil. */
+void FBHealthSetClassLookupForTesting(Class _Nullable (^_Nullable lookup)(NSString *name));
+
+typedef NS_ENUM(NSUInteger, FBHealthCompletionStatus) {
+  FBHealthCompletionStatusCompleted,
+  FBHealthCompletionStatusTimedOut,
+};
+
+/** A fixed result of waiting for one operation; late callbacks cannot update it. */
 @interface FBHealthOperationResult : NSObject
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @property (nonatomic, readonly) BOOL success;
+@property (nonatomic, readonly) FBHealthCompletionStatus status;
 @property (nonatomic, readonly) BOOL hasError;
 /** Returns NSNull for no callback error, its localized description otherwise, or nil if reading it raises. */
 - (nullable id)readErrorValueWithError:(NSError **)error;

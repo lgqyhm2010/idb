@@ -65,6 +65,27 @@ final class PhotoLibraryMutationTests: XCTestCase {
     }
   }
 
+  func testWorkerTransactionFinishesBeforeReturningItsSaveResult() {
+    for succeeds in [true, false] {
+      let runtime = FBPhotosTestRuntime()
+      runtime.runTransactionsOnWorkerQueue = true
+      runtime.saveSucceeds = succeeds
+
+      XCTAssertEqual(runtime.run(), succeeds ? 0 : 1)
+
+      XCTAssertTrue(runtime.transactionRanOnWorkerThread)
+      XCTAssertTrue(runtime.allMutationsInsideTransaction)
+      XCTAssertNil(runtime.escapedTransactionException)
+      XCTAssertEqual(
+        runtime.operations as NSArray,
+        [
+          "value:_lazyPhotoLibrary", "unwrap", "transactionBegin", "context",
+          "id:asset0", "lookup:asset0", "delete:asset0", "id:asset1", "lookup:asset1", "delete:asset1",
+          "save", "transactionEnd",
+        ] as NSArray)
+    }
+  }
+
   func testMissingObjectsAndExceptionsStopTheTransactionWithoutSaving() {
     let prefix = ["value:_lazyPhotoLibrary", "unwrap", "transactionBegin", "context"]
     for (failure, body) in [
@@ -81,11 +102,30 @@ final class PhotoLibraryMutationTests: XCTestCase {
       XCTAssertTrue(runtime.allMutationsInsideTransaction)
     }
   }
-  func testPrivateExceptionsAtCommandBoundary() {
+  func testPrivateExceptionsReturnCommandFailure() {
     for failure in ["transactionException", "idException", "saveException"] {
       let runtime = FBPhotosTestRuntime()
       runtime.failure = failure
       XCTAssertEqual(runtime.runCatchingException() as NSDictionary, ["status": 1] as NSDictionary)
+    }
+  }
+
+  func testPrivateExceptionsStayInsideTheWorkerTransaction() {
+    for failure in ["contextException", "idException", "lookupException", "deleteException", "saveException"] {
+      let runtime = FBPhotosTestRuntime()
+      runtime.runTransactionsOnWorkerQueue = true
+      runtime.failure = failure
+
+      XCTAssertEqual(runtime.run(), 1, failure)
+
+      XCTAssertTrue(runtime.transactionRanOnWorkerThread, failure)
+      XCTAssertNil(runtime.escapedTransactionException, failure)
+      XCTAssertEqual((runtime.operations as? [String])?.last, "transactionEnd", failure)
+      if failure != "saveException" {
+        XCTAssertFalse(runtime.operations.contains("save"), failure)
+      } else {
+        XCTAssertTrue(runtime.operations.contains("save"), failure)
+      }
     }
   }
 }

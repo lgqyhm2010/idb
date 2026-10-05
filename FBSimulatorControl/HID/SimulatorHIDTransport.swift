@@ -6,6 +6,7 @@
  */
 
 import CoreGraphics
+@preconcurrency import FBControlCore
 import Foundation
 
 /// Selects which transport a `SimulatorHID` uses for the touch / button / keyboard primitives.
@@ -20,23 +21,88 @@ public enum SimulatorHIDTransportType: Equatable, Sendable {
 /// two-finger touch, button and keyboard — and, where a target needs both, the Indigo transport
 /// running alongside it.
 ///
-/// A closed enum rather than a protocol so each capability lives only on the transport that has it
-/// (`flush` on DTUHID, `sendTrackpad` on Indigo) and callers switch for the rest.
+/// An enum over the concrete transports rather than an existential, so each capability lives only on
+/// the transport that has it (`flush` on DTUHID, `sendTrackpad` on Indigo). What both carry is
+/// `SimulatorHIDPrimitives`, reached through `primitives`.
 ///
-/// Device orientation, lock, shake and the in-call status bar are not carried here at all. They are not
-/// transport-switchable and go out over Purple mach messages and Darwin notifications.
+/// Device orientation, the hinge, lock, shake and the in-call status bar are not carried here at all:
+/// they are commands on the `Simulator` (`orientation`, `hinge`, `hardware`, `statusBar`).
 ///
 /// A target can need both at once, which is `mixed`. `dtuhidd` exposes no trackpad, so an Apple TV
-/// driven over DTUHID still reaches its Siri Remote trackpad over Indigo. Mixing is otherwise unsafe —
-/// both claim `mainTouchscreen` and whichever sends first on a boot keeps it — so the case exists for
-/// the one family with no touchscreen to contend over.
+/// driven over DTUHID still reaches its Siri Remote trackpad over Indigo. Mixing is otherwise pointless:
+/// on a toolchain that ships `dtuhidd` the guest does not reliably deliver Indigo touch, button or
+/// keyboard input, so the trackpad is all Indigo can be relied on for there.
 enum SimulatorHIDTransport: Sendable {
   /// Indigo alone, carrying the primitives and the trackpad.
   case indigo(SimulatorIndigoHIDTransport)
   /// DTUHID alone, carrying the primitives. No trackpad is reachable.
-  case dtuhid(SimulatorDTUHIDTransport)
+  case dtuhid(SimulatorDigitizerHIDTransport)
   /// Both, mixed on one target: DTUHID carrying the primitives, Indigo carrying only the trackpad.
-  case mixed(dtuhid: SimulatorDTUHIDTransport, indigo: SimulatorIndigoHIDTransport)
+  case mixed(dtuhid: SimulatorDigitizerHIDTransport, indigo: SimulatorIndigoHIDTransport)
+
+  // MARK: - Negotiation
+
+  /// A requested transport is never substituted — it is established or the error surfaces. With no
+  /// request, `defaultHIDTransport` is established, and its errors surface the same way. There is no
+  /// fallback: the default is DTUHID exactly on the toolchains whose guest does not reliably deliver
+  /// Indigo touch, button or keyboard input, so an unreachable `dtuhidd` is reported rather than traded
+  /// for a transport that silently loses input. Reachability is settled where it is observable, by
+  /// `SimulatorDTUHIDConnection.connect(using:serviceName:)` round-tripping a barrier past its retries,
+  /// since `dtuhidd` is demand-launched.
+  static func negotiate(
+    for simulator: Simulator, requested: SimulatorHIDTransportType?
+  ) async throws -> SimulatorHIDTransport {
+    try await negotiate(requested: requested, preferred: simulator.defaultHIDTransport) {
+      try await establish($0, for: simulator)
+    }
+  }
+
+  /// The policy of `negotiate(for:requested:)`, apart from the `Simulator` the transports are
+  /// established against.
+  static func negotiate<Transport>(
+    requested: SimulatorHIDTransportType?,
+    preferred: SimulatorHIDTransportType,
+    establish: (SimulatorHIDTransportType) async throws -> Transport
+  ) async throws -> Transport {
+    if let requested {
+      return try await establish(requested)
+    }
+    let transport = try await establish(preferred)
+    ControlCoreGlobalConfiguration.defaultLogger.log("Negotiated the \(preferred) HID transport")
+    return transport
+  }
+
+  private static func establish(
+    _ type: SimulatorHIDTransportType, for simulator: Simulator
+  ) async throws -> SimulatorHIDTransport {
+    switch type {
+    case .indigo:
+      return .indigo(try SimulatorIndigoHIDTransport.indigo(for: simulator))
+    case .dtuhid:
+      let dtuhid = try await SimulatorDigitizerHIDTransport.connect(to: simulator)
+      guard let indigo = indigoAlongsideDTUHID(for: simulator) else {
+        return .dtuhid(dtuhid)
+      }
+      return .mixed(dtuhid: dtuhid, indigo: indigo)
+    }
+  }
+
+  /// The Indigo transport to run alongside DTUHID, for a target that needs both.
+  ///
+  /// Only Apple TV does. It is the only family with a trackpad, which `dtuhidd` does not expose and the
+  /// guest still honours over Indigo; every other Indigo input is unreliable on toolchains that ship
+  /// `dtuhidd`.
+  ///
+  /// Absent rather than fatal when it cannot be registered, since it carries the trackpad alone — a
+  /// failure should cost a pan, not every other input on the target.
+  private static func indigoAlongsideDTUHID(for simulator: Simulator) -> SimulatorIndigoHIDTransport? {
+    guard simulator.productFamily == .appleTV else {
+      return nil
+    }
+    return try? SimulatorIndigoHIDTransport.indigo(for: simulator)
+  }
+
+  // MARK: - Capabilities
 
   /// The Indigo transport in play, if any.
   var indigo: SimulatorIndigoHIDTransport? {
@@ -48,7 +114,7 @@ enum SimulatorHIDTransport: Sendable {
   }
 
   /// The DTUHID transport in play, if any.
-  var dtuhid: SimulatorDTUHIDTransport? {
+  var dtuhid: SimulatorDigitizerHIDTransport? {
     switch self {
     case .indigo: return nil
     case let .dtuhid(dtuhid): return dtuhid
@@ -69,66 +135,42 @@ enum SimulatorHIDTransport: Sendable {
     }
   }
 
-  /// Sends a single-finger touch at the given point (in points). `edge` tags the contact as
-  /// originating at a screen edge, which is how the guest recognises a system edge gesture.
-  ///
-  /// `target` routes the touch to one display's touchscreen. Only DTUHID can address one; Indigo
-  /// refuses rather than delivering it to the main screen.
-  func sendTouch(
-    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge,
-    target: SimulatorTouchTarget? = nil
-  ) async throws {
+  /// The transport carrying the primitives: DTUHID wherever it is in play.
+  var primitives: any SimulatorHIDPrimitives {
     switch self {
-    case let .indigo(indigo):
-      try Self.requireMainScreen(target)
-      try await indigo.sendTouch(direction: direction, x: x, y: y, edge: edge)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _):
-      try await dtuhid.sendTouch(direction: direction, x: x, y: y, edge: edge, target: target)
+    case let .indigo(indigo): return indigo
+    case let .dtuhid(dtuhid), let .mixed(dtuhid, _): return dtuhid
     }
   }
 
-  /// Sends a two-finger touch (for multi-touch gestures) at the given points (in points).
-  func sendTwoFingerTouch(
-    direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint, target: SimulatorTouchTarget? = nil
-  ) async throws {
-    switch self {
-    case let .indigo(indigo):
-      try Self.requireMainScreen(target)
-      try await indigo.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _):
-      try await dtuhid.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2, target: target)
-    }
+  /// Only DTUHID has anything to drain; Indigo's client is synchronous.
+  func flush() async throws {
+    try await dtuhid?.flush()
   }
 
-  /// Indigo's digitizer target is fixed to the main screen, so a touch aimed elsewhere cannot be sent on it.
-  static func requireMainScreen(_ target: SimulatorTouchTarget?) throws {
-    if let target {
-      throw SimulatorHIDError.touchTargetUnsupportedOnIndigoTransport(displayUniqueID: target.displayUniqueID)
+  /// Indigo only: the tvOS trackpad rides a dedicated Indigo service that `dtuhidd` does not expose (its
+  /// digitizer targets are displays and its scroll targets rotary devices).
+  func sendTrackpad(point: SimulatorTrackpadPoint, phase: SimulatorTrackpadPhase) async throws {
+    guard let indigo else {
+      throw SimulatorHIDError.notImplementedOnDTUHIDTransport(
+        operation: "trackpad pan — the tvOS Siri Remote trackpad is not exposed by dtuhidd")
     }
-  }
-
-  /// Sends a hardware button event.
-  func sendButton(direction: SimulatorHIDDirection, button: SimulatorHIDButton) async throws {
-    switch self {
-    case let .indigo(indigo): try await indigo.sendButton(direction: direction, button: button)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _): try await dtuhid.sendButton(direction: direction, button: button)
-    }
-  }
-
-  /// Sends a keyboard key event.
-  func sendKeyboard(direction: SimulatorHIDDirection, keyCode: UInt32) async throws {
-    switch self {
-    case let .indigo(indigo): try await indigo.sendKeyboard(direction: direction, keyCode: keyCode)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _): try await dtuhid.sendKeyboard(direction: direction, keyCode: keyCode)
-    }
-  }
-
-  /// Sends a tvOS Siri Remote focus action.
-  func sendRemoteButton(direction: SimulatorHIDDirection, button: SimulatorHIDRemoteButton) async throws {
-    switch self {
-    case let .indigo(indigo): try await indigo.sendRemoteButton(direction: direction, button: button)
-    case let .dtuhid(dtuhid), let .mixed(dtuhid, _):
-      try await dtuhid.sendRemoteButton(direction: direction, button: button)
-    }
+    try await indigo.sendTrackpad(point: point, phase: phase)
   }
 }
+
+/// The Indigo-family HID primitives, which both transports carry.
+protocol SimulatorHIDPrimitives: Actor {
+  /// Sends a single-finger touch at the given point (in points). `edge` tags the contact as
+  /// originating at a screen edge, which is how the guest recognises a system edge gesture.
+  func sendTouch(direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge, display: SimulatorHIDDisplay?) async throws
+  /// Sends a two-finger touch (for multi-touch gestures) at the given points (in points).
+  func sendTwoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint, display: SimulatorHIDDisplay?) async throws
+  func sendButton(direction: SimulatorHIDDirection, button: SimulatorHIDButton) async throws
+  func sendKeyboard(direction: SimulatorHIDDirection, keyCode: UInt32) async throws
+  /// Sends a tvOS Siri Remote focus action.
+  func sendRemoteButton(direction: SimulatorHIDDirection, button: SimulatorHIDRemoteButton) async throws
+}
+
+extension SimulatorIndigoHIDTransport: SimulatorHIDPrimitives {}
+extension SimulatorDigitizerHIDTransport: SimulatorHIDPrimitives {}

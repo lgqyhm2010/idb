@@ -3,19 +3,48 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Verify guest service commands against the leased simulator's backing stores."""
+"""Read and write the simulator's backing stores through guest services."""
 
 from __future__ import annotations
 
+import base64
 import json
 import plistlib
+import uuid
 from typing import Any
 
-from .harness import IdbEndToEndTestCase, NotReady, run, wait_until
+from .harness import GuestRPC, IdbEndToEndTestCase, NotReady, run, wait_until
+
+NEWS_BUNDLE_ID = "com.apple.news"
+NOTIFICATION_TITLE = "Breaking"
+NOTIFICATION_PAYLOAD = json.dumps(
+    {
+        "aps": {
+            "alert": {
+                "title": NOTIFICATION_TITLE,
+                "body": "idb delivered this without the app running.",
+            }
+        }
+    }
+)
+NOTIFICATION_STORE_TIMEOUT_SECONDS = 300.0
+# A list can take over 30s, when the system doesn't answer idb and it reads
+# the store instead, so a wait for the list to change allows for a few.
+NOTIFICATION_LIST_TIMEOUT_SECONDS = 120.0
 
 
-class ServiceMutationTests(IdbEndToEndTestCase):
-    async def test_health_list_for_installed_application(self) -> None:
+def _retained_notifications(text: str) -> list[tuple[str, str]]:
+    """The identifier and title of each notification the system still holds."""
+    held = []
+    for line in text.splitlines():
+        fields = [field.strip().strip('"') for field in line.split("|")]
+        if len(fields) >= 3:
+            held.append((fields[1], fields[2]))
+    return held
+
+
+class ServiceTests(IdbEndToEndTestCase):
+    async def test_guest_health_list_reports_no_records_for_a_new_app(self) -> None:
         bundle_id = await self.install_fixture_app()
         listed = json.loads((await self.guest("health", "list", bundle_id)).stdout)
         self.assertEqual(
@@ -29,6 +58,136 @@ class ServiceMutationTests(IdbEndToEndTestCase):
             },
         )
         self.assertIs(type(listed["ok"]), int)
+
+    async def test_guest_rpc_answers_reads_as_the_verbs_do(self) -> None:
+        bundle_id = await self.install_fixture_app()
+        cases = [
+            (
+                {"health": {"_0": {"list": {"bundleID": bundle_id}}}},
+                ("health", "list", bundle_id),
+            ),
+            ({"dns": {"_0": {"list": {}}}}, ("dns", "list")),
+            ({"proxy": {"_0": {"list": {}}}}, ("proxy", "list")),
+            (
+                {
+                    "accessibility": {
+                        "_0": {"verb": "settings-get", "setting": "reduce-motion"}
+                    }
+                },
+                ("accessibility", "settings-get", "--setting", "reduce-motion"),
+            ),
+        ]
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                async with GuestRPC(self, persistent=persistent) as rpc:
+                    for command, arguments in cases:
+                        with self.subTest(command=command):
+                            expected = json.loads((await self.guest(*arguments)).stdout)
+                            # Compared as JSON, where `1` and `true` differ.
+                            self.assertEqual(
+                                json.dumps(await rpc.send(command), sort_keys=True),
+                                json.dumps([expected], sort_keys=True),
+                            )
+
+    async def test_guest_rpc_writes_network_and_notification_state(self) -> None:
+        for service in ("dns", "proxy"):
+            snapshot = await self.store_data("snapshot", service)
+            self.addAsyncCleanup(self.restore_network, service, snapshot)
+        bundle_id = await self.install_fixture_app()
+        self.addAsyncCleanup(self.guest, "notifications", "revoke", bundle_id)
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                async with GuestRPC(self, persistent=persistent) as rpc:
+                    self.assertEqual(
+                        await rpc.send(
+                            {"dns": {"_0": {"set": {"servers": ["192.0.2.10"]}}}}
+                        ),
+                        [],
+                    )
+                    await self.assert_network(
+                        "dns", {"ServerAddresses": ["192.0.2.10"]}
+                    )
+                    self.assertEqual(await rpc.send({"dns": {"_0": {"clear": {}}}}), [])
+                    await self.assert_network("dns", {})
+                    self.assertEqual(
+                        await rpc.send(
+                            {
+                                "proxy": {
+                                    "_0": {
+                                        "set": {
+                                            "host": "192.0.2.11",
+                                            "port": 1080,
+                                            "kind": "socks",
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        [],
+                    )
+                    await self.assert_network(
+                        "proxy",
+                        {
+                            "SOCKSEnable": 1,
+                            "SOCKSProxy": "192.0.2.11",
+                            "SOCKSPort": 1080,
+                            "FTPPassive": 1,
+                            "ExceptionsList": ["*.local", "169.254/16"],
+                        },
+                    )
+                    self.assertEqual(
+                        await rpc.send({"proxy": {"_0": {"clear": {}}}}), []
+                    )
+                    await self.assert_network("proxy", {"FTPPassive": 1})
+                    for action, enabled, status in (
+                        ("approve", True, 2),
+                        ("revoke", False, 0),
+                    ):
+                        self.assertEqual(
+                            await rpc.send(
+                                {
+                                    "notifications": {
+                                        "_0": {action: {"bundleID": bundle_id}}
+                                    }
+                                }
+                            ),
+                            [],
+                        )
+                        await self.assert_notifications(bundle_id, enabled, status)
+
+    async def test_guest_rpc_restores_dynamic_store_snapshots_losslessly(self) -> None:
+        key = f"State:/idb-tests/{uuid.uuid4()}"
+        original = await self.store_data("snapshot", key)
+        self.addAsyncCleanup(self.restore_network, key, original)
+        snapshots = [
+            {
+                "present": True,
+                "value": {"bytes": b"\x00\xff", "items": [True, 1, "text"]},
+            },
+            {"present": False},
+        ]
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                async with GuestRPC(self, persistent=persistent) as rpc:
+                    for snapshot in snapshots:
+                        data = base64.b64encode(plistlib.dumps(snapshot)).decode()
+                        commands = [
+                            {"restore": {"key": key, "snapshot": data}},
+                            {"snapshot": {"key": key}},
+                        ]
+                        for command in commands:
+                            result = await rpc.send_result(
+                                {"dynamicStore": {"_0": command}}
+                            )
+                            self.assertEqual(result["values"], [])
+                            encoded = base64.b64decode(
+                                result["propertyList"], validate=True
+                            )
+                            self.assertTrue(encoded.startswith(b"bplist00"))
+                            self.assertEqual(plistlib.loads(encoded), snapshot)
+                            self.assertEqual(
+                                await self.store("snapshot", key), snapshot
+                            )
 
     async def store_data(self, *arguments: str, stdin: bytes | None = None) -> bytes:
         completed = await run(
@@ -78,19 +237,7 @@ class ServiceMutationTests(IdbEndToEndTestCase):
         )
         self.assertEqual(json.loads((await self.guest(service, "list")).text), expected)
 
-    async def test_dns_set_and_clear_update_the_dynamic_store(self) -> None:
-        snapshot = await self.store_data("snapshot", "dns")
-        self.addAsyncCleanup(self.restore_network, "dns", snapshot)
-
-        await self.guest("dns", "set", "192.0.2.1", "192.0.2.2")
-
-        await self.assert_network(
-            "dns", {"ServerAddresses": ["192.0.2.1", "192.0.2.2"]}
-        )
-        await self.guest("dns", "clear")
-        await self.assert_network("dns", {})
-
-    async def test_proxy_set_replaces_the_previous_type_and_clear_disables_it(
+    async def test_guest_proxy_set_replaces_the_previous_type(
         self,
     ) -> None:
         snapshot = await self.store_data("snapshot", "proxy")
@@ -125,17 +272,9 @@ class ServiceMutationTests(IdbEndToEndTestCase):
         await self.guest("proxy", "clear")
         await self.assert_network("proxy", {"FTPPassive": 1})
 
-    async def test_notification_approval_and_revocation_persist(self) -> None:
-        bundle_id = await self.install_fixture_app()
-        self.addAsyncCleanup(self.guest, "notifications", "revoke", bundle_id)
-
-        await self.guest("notifications", "approve", bundle_id)
-
-        await self.assert_notifications(bundle_id, True, 2)
-        await self.guest("notifications", "revoke", bundle_id)
-        await self.assert_notifications(bundle_id, False, 0)
-
-    async def test_idb_notification_permissions_update_guest_settings(self) -> None:
+    async def test_approve_and_revoke_notification_update_the_app_settings(
+        self,
+    ) -> None:
         bundle_id = await self.install_fixture_app()
         self.addAsyncCleanup(self.idb, "revoke", bundle_id, "notification")
 
@@ -147,7 +286,46 @@ class ServiceMutationTests(IdbEndToEndTestCase):
         self.assertEqual(revoked.stdout, b"")
         await self.assert_notifications(bundle_id, False, 0)
 
-    async def test_guest_accessibility_setting_write_reads_back(self) -> None:
+    async def test_send_notification_is_held_for_an_app_that_is_not_running(
+        self,
+    ) -> None:
+        self.addAsyncCleanup(self.setup_terminate_quietly, NEWS_BUNDLE_ID)
+        self.addAsyncCleanup(
+            self.setup_idb, "notification", "clear", NEWS_BUNDLE_ID, check=False
+        )
+        await self.setup_terminate_quietly(NEWS_BUNDLE_ID)
+        # The first push after an erase waits, for minutes at worst, on the
+        # system building its notification store. Sent before the permission
+        # is granted, this one is refused and stores nothing.
+        await self.setup_idb(
+            "send-notification",
+            NEWS_BUNDLE_ID,
+            NOTIFICATION_PAYLOAD,
+            check=False,
+            timeout=NOTIFICATION_STORE_TIMEOUT_SECONDS,
+        )
+        await self.setup_idb("approve", NEWS_BUNDLE_ID, "notification")
+        listed = await self.setup_idb("notification", "list", NEWS_BUNDLE_ID)
+        before = {identifier for identifier, _ in _retained_notifications(listed.text)}
+
+        await self.idb("send-notification", NEWS_BUNDLE_ID, NOTIFICATION_PAYLOAD)
+
+        async def held() -> None:
+            completed = await self.idb("notification", "list", NEWS_BUNDLE_ID)
+            if not [
+                identifier
+                for identifier, title in _retained_notifications(completed.text)
+                if title == NOTIFICATION_TITLE and identifier not in before
+            ]:
+                raise NotReady(f"{NOTIFICATION_TITLE!r} is not held yet")
+
+        await self.wait_or_fail(
+            f"The system did not hold {NOTIFICATION_TITLE!r} for {NEWS_BUNDLE_ID}",
+            NOTIFICATION_LIST_TIMEOUT_SECONDS,
+            held,
+        )
+
+    async def test_guest_accessibility_settings_set_reads_back(self) -> None:
         arguments = ("--setting", "reduce-motion")
         before = json.loads(
             (await self.guest("accessibility", "settings-get", *arguments)).text

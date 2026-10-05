@@ -28,6 +28,8 @@ service CompanionService {
       returns (AccessibilityInfoResponse) {}
   rpc accessibility_action(AccessibilityActionRequest)
       returns (AccessibilityActionResponse) {}
+  rpc accessibility_quiescence(AccessibilityQuiescenceRequest)
+      returns (stream AccessibilityQuiescenceResponse) {}
   rpc focus(FocusRequest) returns (FocusResponse) {}
   rpc get_orientation(GetOrientationRequest) returns (GetOrientationResponse) {}
   rpc set_orientation(SetOrientationRequest) returns (SetOrientationResponse) {}
@@ -40,6 +42,8 @@ service CompanionService {
       returns (SendNotificationResponse) {}
   rpc delivered_notifications(DeliveredNotificationsRequest)
       returns (DeliveredNotificationsResponse) {}
+  rpc clear_delivered_notifications(ClearDeliveredNotificationsRequest)
+      returns (ClearDeliveredNotificationsResponse) {}
   rpc simulate_memory_warning(SimulateMemoryWarningRequest)
       returns (SimulateMemoryWarningResponse) {}
   // Settings
@@ -165,6 +169,14 @@ message CompanionInfo {
   string udid = 1;
   bool is_local = 4;
   bytes metadata = 6;
+  // The compressions the companion can extract an app stream from. Companions
+  // that predate this field leave it empty, and only extract GZIP.
+  repeated Payload.Compression supported_compressions = 7;
+  // Whether the companion can install a zstd compressed zip app stream. The
+  // stream starts with a zstd skippable frame whose magic is 0x184D2A5E and
+  // whose 8 byte content is "idb-zip\0", which tells it apart from a
+  // compressed tar. Companions without this must be sent the zip as is.
+  bool zstd_zip_streams = 8;
 }
 
 enum Setting {
@@ -419,6 +431,21 @@ message AccessibilityInfoRequest {
   // Compare match — and, on a marker read, marker — case-insensitively.
   bool ignore_case = 12;
   Filter filter = 13;
+  // Describe this running application's whole tree instead of the frontmost
+  // one's. When two apps share the screen, as on iPadOS windows or a split
+  // foldable, "frontmost" names only one of them. Cannot be combined with
+  // point or marker. An older server ignores this field and describes the
+  // frontmost application, so a caller must check the root element's pid.
+  string bundle_id = 14;
+  // Hit-test the point on this display instead of the default active one; the point is
+  // in the display's interface orientation, as a touch aimed at it is. Any lit
+  // display can be named, integrated or not; an empty unique_id selects the
+  // active integrated display. Naming a device's only integrated display reads
+  // the point exactly as without a display; any other display is read by the
+  // AX backend only, which an unset backend selects. Setting it without a
+  // point, or beside a marker, is INVALID_ARGUMENT. An older server may ignore
+  // this option and use its default display instead.
+  HIDEvent.HIDDisplay display = 15;
 }
 
 message AccessibilityInfoResponse {
@@ -542,6 +569,63 @@ message AccessibilityActionResponse {
   }
 }
 
+// Streams an application's quiescence until the client cancels or the
+// application exits. Simulator targets on the AXBRIDGE backend only.
+message AccessibilityQuiescenceRequest {
+  // No target follows the frontmost application.
+  oneof target {
+    uint64 pid = 1;
+    string bundle_id = 2;
+  }
+  // Each tunable is in its own oneof for presence, since zero is a meaningful
+  // value: unset takes the companion's default.
+  oneof busy_threshold {
+    // How long a signal may go unanswered before the application is busy.
+    uint32 busy_threshold_ms = 3;
+  }
+  oneof quiet_window {
+    // How long every signal must stay answered before the application is
+    // quiet.
+    uint32 quiet_window_ms = 4;
+  }
+}
+
+message AccessibilityQuiescenceResponse {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    BUSY = 1;
+    SETTLING = 2;
+    QUIET = 3;
+  }
+  enum Signal {
+    SIGNAL_UNSPECIFIED = 0;
+    RUN_LOOP_IDLE = 1;
+    ANIMATIONS_INACTIVE = 2;
+  }
+  // Sent once the state is known and then on every change.
+  message StateChanged {
+    State state = 1;
+    // The signals that have gone unanswered; set only when BUSY.
+    repeated Signal busy_signals = 2;
+  }
+  // A touch sequence finished. Informational: it does not change the state.
+  message TouchesCompleted {}
+  // A stream following the frontmost application moved to pid. Its state
+  // starts over.
+  message TargetChanged {}
+  // The application exited. The last response of the stream.
+  message TargetExited {}
+
+  // The application the event is about.
+  uint64 pid = 1;
+  oneof event {
+    StateChanged state = 2;
+    TouchesCompleted touches_completed = 3;
+    TargetChanged target_changed = 4;
+    TargetExited target_exited = 5;
+  }
+}
+
 message ApproveRequest {
   enum Permission {
     PHOTOS = 0;
@@ -648,6 +732,10 @@ message HIDEvent {
     LOCK = 2;
     SIDE_BUTTON = 3;
     SIRI = 4;
+    PLAY_PAUSE = 5;
+    VOLUME_UP = 6;
+    VOLUME_DOWN = 7;
+    EJECT = 8;
   }
 
   message HIDButton {
@@ -709,13 +797,31 @@ message HIDEvent {
 
   // Routes the touch events that follow it in the same `hid` stream to one
   // display's touchscreen, until the stream ends or another HIDDisplay arrives.
-  // Buttons and keys are unaffected. Selecting a display that is unknown,
-  // inactive or has no touchscreen fails the stream rather than falling back
-  // to the main screen.
+  // Buttons and keys are unaffected. A nonempty UUID pins touches to the active
+  // integrated display and fails closed if it cannot be matched or routed.
+  // An empty UUID uses the same ACTIVE routing as an omitted selection,
+  // including upstream sole-display and legacy/main-display fallback behavior.
   message HIDDisplay {
-    // A `ListDisplaysResponse.Display.unique_id`. Empty selects the active
-    // integrated display.
+    // A `ListDisplaysResponse.Display.unique_id`, or empty for default ACTIVE
+    // routing. Empty does not require an identified display or force UUID routing.
     string unique_id = 1;
+  }
+
+  enum HIDEdgeType {
+    EDGE_NONE = 0;
+    EDGE_TOP = 1;
+    EDGE_LEFT = 2;
+    EDGE_BOTTOM = 3;
+    EDGE_RIGHT = 4;
+  }
+
+  // Tags the touches that follow it in the same `hid` stream, swipes included,
+  // as starting at a screen edge, until the stream ends or another HIDEdge
+  // arrives. The edge flag is what the guest reads to hand a drag to a system
+  // gesture (the home indicator, Notification Centre) instead of to the app
+  // under it. Buttons and keys are unaffected. EDGE_NONE clears it.
+  message HIDEdge {
+    HIDEdgeType edge = 1;
   }
 
   // Experimental display-selection clients used field 7.
@@ -734,6 +840,10 @@ message HIDEvent {
     // instead of reading it as some later event, and touches never silently
     // land on the main screen.
     HIDDisplay display = 100;
+    // Numbered beside display for the same reason: a companion that predates
+    // it must reject the stream, not deliver the drag as an ordinary one that
+    // reports success and triggers no system gesture.
+    HIDEdge edge = 101;
   }
 }
 
@@ -766,6 +876,25 @@ message TargetDescription {
   string architecture = 7;
   bytes extended = 9;
   bytes diagnostics = 10;
+  // Every display a booted simulator reports. Empty for any other target, and
+  // from a companion that predates this field.
+  repeated Display displays = 11;
+}
+
+message Display {
+  // Names this display in a video request.
+  string unique_id = 1;
+  // The runtime's name, which need not be readable: an iPhone Duo reports
+  // "LCD" for its cover display and "LCD-1" for its inner one.
+  string name = 2;
+  // Whether the guest is presenting on this display.
+  bool active = 3;
+  // Built into the device, rather than external or wireless.
+  bool integrated = 4;
+  // Pixels, in the current interface orientation.
+  uint64 width = 5;
+  uint64 height = 6;
+  double density = 7;
 }
 
 message LogRequest {
@@ -1411,6 +1540,12 @@ message DeliveredNotification {
 message DeliveredNotificationsResponse {
   repeated DeliveredNotification notifications = 1;
 }
+
+message ClearDeliveredNotificationsRequest {
+  string bundle_id = 1;
+}
+
+message ClearDeliveredNotificationsResponse {}
 
 message DapRequest {
   message Start {

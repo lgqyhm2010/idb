@@ -51,6 +51,12 @@ public enum FramebufferEvent: Sendable {
   /// A new frame was rendered into the current surface. A bare per-frame signal — modern
   /// CoreSimulator reports no changed-region geometry (see `FramebufferSurface`).
   case frameRendered
+  /// The simulator's displays are now in this configuration. Delivered first with the configuration at
+  /// attachment, once it has been read, then for each change. A framebuffer following the active display
+  /// delivers it ahead of the `surfaceChanged` that moves to the new display, so no frame of that display
+  /// precedes it; frames of the outgoing display may arrive in between. Only framebuffers connected to
+  /// `.active` or a named display deliver it.
+  case configurationChanged(SimulatorDisplayConfiguration)
 }
 
 /// Tracks the surface an attachment last reported and refuses re-reports of it. Compared by
@@ -132,6 +138,22 @@ public final class Framebuffer: @unchecked Sendable {
 
     let (events, continuation) = AsyncStream.makeStream(of: FramebufferEvent.self, bufferingPolicy: .unbounded)
 
+    do {
+      try register(token: token, filter: filter, continuation: continuation)
+    } catch {
+      surface.unregisterCallbacks(token: token)
+      throw error
+    }
+
+    return FramebufferAttachment(
+      framebuffer: self,
+      token: token,
+      initialSurface: immediateSurface,
+      events: events,
+      continuation: continuation)
+  }
+
+  private func register(token: UUID, filter: SurfaceChangeFilter, continuation: AsyncStream<FramebufferEvent>.Continuation) throws {
     try surface.registerCallbacks(
       token: token,
       ioSurfaceChanged: { [statsRecorder, logger] surface in
@@ -145,14 +167,8 @@ public final class Framebuffer: @unchecked Sendable {
       frameRendered: { [statsRecorder] in
         statsRecorder.recordFrameRendered()
         continuation.yield(.frameRendered)
-      })
-
-    return FramebufferAttachment(
-      framebuffer: self,
-      token: token,
-      initialSurface: immediateSurface,
-      events: events,
-      continuation: continuation)
+      },
+      configurationChanged: { continuation.yield(.configurationChanged($0)) })
   }
 }
 
@@ -168,7 +184,12 @@ public final class FramebufferAttachment: @unchecked Sendable {
   public let events: AsyncStream<FramebufferEvent>
 
   private let token: UUID
-  private weak var framebuffer: Framebuffer?
+  /// Strong on purpose: the registration outlives the `Framebuffer` that made it — the display
+  /// surface holds the callbacks, not the framebuffer — so a weak reference here lets `cancel()`
+  /// silently skip `detach` whenever the caller did not keep the framebuffer alive itself, leaving
+  /// the surface calling into a finished stream. Nothing the framebuffer owns refers back to the
+  /// attachment, so there is no cycle to break.
+  private let framebuffer: Framebuffer
   private let continuation: AsyncStream<FramebufferEvent>.Continuation
   private let lock = NSLock()
   private var isCancelled = false
@@ -196,7 +217,7 @@ public final class FramebufferAttachment: @unchecked Sendable {
     }
     isCancelled = true
     lock.unlock()
-    framebuffer?.detach(token: token)
+    framebuffer.detach(token: token)
     continuation.finish()
   }
 

@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import asyncio
 import json
 import logging
 import os
+import sys
 import tempfile
 from argparse import ArgumentParser, Namespace
 from collections.abc import AsyncIterator
@@ -22,6 +24,7 @@ from idb.cli.main import gen_main as cli_main, get_default_companion_path
 from idb.common import plugin
 from idb.common.command import Command, CommandGroup
 from idb.common.types import (
+    AccessibilityApplication,
     AccessibilityBackend,
     AccessibilityDragOptions,
     AccessibilityElementFilter,
@@ -44,12 +47,19 @@ from idb.common.types import (
     HIDButtonType,
     HIDDelay,
     HIDDirection,
+    HIDEdgeType,
     HIDOrientationType,
     IdbException,
     InstalledArtifact,
     InstrumentsTimings,
     LoggingMetadata,
     Permission,
+    QuiescenceEvent,
+    QuiescenceState,
+    QuiescenceStateChanged,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+    QuiescenceTouchesCompleted,
     Screenshot,
     ScreenshotCrop,
     ScreenshotFormat,
@@ -316,6 +326,25 @@ class TestParser(TestCase):
             override_modification_time=None,
         )
 
+    async def test_install_from_stdin(self) -> None:
+        self.client_mock.install = MagicMock(
+            return_value=AsyncGeneratorMock(
+                (
+                    InstalledArtifact(
+                        name="com.example.app", uuid="app-uuid", progress=None
+                    ),
+                )
+            )
+        )
+        with redirect_stdout(StringIO()):
+            self.assertEqual(await cli_main(cmd_input=["install", "-"]), 0)
+        self.client_mock.install.assert_called_once_with(
+            bundle=sys.stdin.buffer,
+            make_debuggable=None,
+            compression=None,
+            override_modification_time=None,
+        )
+
     async def test_install_with_mtime_override(self) -> None:
         self.client_mock.install = MagicMock(
             return_value=AsyncGeneratorMock(
@@ -400,7 +429,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\nInstalled: Symbols.dSYM\n",
+            "Installed 50.0%\nInstalled: Symbols.dSYM\n",
         )
         self.client_mock.install_dsym.assert_called_once_with(
             "Symbols.dSYM",
@@ -429,8 +458,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: libExample.dylib dylib-uuid\n",
+            "Installed 50.0%\nInstalled: libExample.dylib dylib-uuid\n",
         )
         self.client_mock.install_dylib.assert_called_once_with("libExample.dylib")
 
@@ -456,8 +484,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: Example.framework framework-uuid\n",
+            "Installed 50.0%\nInstalled: Example.framework framework-uuid\n",
         )
         self.client_mock.install_framework.assert_called_once_with("Example.framework")
 
@@ -789,8 +816,7 @@ class TestParser(TestCase):
             self.assertEqual(await cli_main(cmd_input=command), 0)
         self.assertEqual(
             output.getvalue(),
-            "Installed {install_response.progress}%\n"
-            "Installed: com.example.tests xctest-uuid\n",
+            "Installed 50.0%\nInstalled: com.example.tests xctest-uuid\n",
         )
         self.client_mock.install_xctest.assert_called_once_with(test_bundle_path, True)
 
@@ -1555,6 +1581,193 @@ class TestParser(TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(output.getvalue(), "")
 
+    def _stream_quiescence(
+        self, *events: QuiescenceEvent, then_block: bool = False
+    ) -> tuple[list[dict[str, Any]], list[bool]]:
+        calls: list[dict[str, Any]] = []
+        closed: list[bool] = []
+
+        async def stream(**kwargs: Any) -> AsyncIterator[QuiescenceEvent]:
+            calls.append(kwargs)
+            try:
+                for event in events:
+                    yield event
+                if then_block:
+                    await asyncio.Event().wait()
+            finally:
+                closed.append(True)
+
+        self.client_mock.accessibility_quiescence = stream
+        return calls, closed
+
+    async def test_quiet_now_answers_with_the_first_busy_or_quiet_state(
+        self,
+    ) -> None:
+        calls, closed = self._stream_quiescence(
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.SETTLING),
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+            QuiescenceStateChanged(
+                pid=42, state=QuiescenceState.BUSY, busy_signals=("run_loop_idle",)
+            ),
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(cmd_input=["ui", "quiet"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.getvalue(), "settling (pid 42)\nquiet (pid 42)\n")
+        # Reporting now, the quiet window defaults to zero.
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "pid": None,
+                    "bundle_id": None,
+                    "busy_threshold_ms": None,
+                    "quiet_window_ms": 0,
+                }
+            ],
+        )
+        self.assertEqual(closed, [True])
+
+    async def test_quiet_now_exits_1_when_busy(self) -> None:
+        calls, _ = self._stream_quiescence(
+            QuiescenceStateChanged(
+                pid=42,
+                state=QuiescenceState.BUSY,
+                busy_signals=("run_loop_idle", "animations_inactive"),
+            ),
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(
+                cmd_input=["ui", "quiet", "--pid", "42", "--quiet-window-ms", "5"]
+            )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue(), "busy (animations_inactive, run_loop_idle) (pid 42)\n"
+        )
+        self.assertEqual(calls[0]["pid"], 42)
+        self.assertEqual(calls[0]["quiet_window_ms"], 5)
+
+    async def test_quiet_with_a_timeout_waits_for_quiet(self) -> None:
+        # A timeout of 0 waits for as long as it takes. A watch that ends quiet
+        # reports every event and answers the same way.
+        for timeout in (["30"], ["0"], ["0.01", "--watch"]):
+            with self.subTest(timeout=timeout):
+                calls, closed = self._stream_quiescence(
+                    QuiescenceStateChanged(
+                        pid=42,
+                        state=QuiescenceState.BUSY,
+                        busy_signals=("run_loop_idle",),
+                    ),
+                    QuiescenceTouchesCompleted(pid=42),
+                    QuiescenceTargetChanged(pid=43),
+                    QuiescenceStateChanged(pid=43, state=QuiescenceState.QUIET),
+                    then_block=True,
+                )
+                with redirect_stdout(StringIO()) as output:
+                    exit_code = await cli_main(
+                        cmd_input=[
+                            "ui",
+                            "quiet",
+                            *timeout,
+                            "--bundle-id",
+                            "com.example.app",
+                            "--busy-threshold-ms",
+                            "100",
+                            "--json",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(
+                    [json.loads(line) for line in output.getvalue().splitlines()],
+                    [
+                        {
+                            "event": "state",
+                            "state": "busy",
+                            "signals": ["run_loop_idle"],
+                            "pid": 42,
+                        },
+                        {"event": "touches_completed", "pid": 42},
+                        {"event": "target_changed", "pid": 43},
+                        {"event": "state", "state": "quiet", "pid": 43},
+                    ],
+                )
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "pid": None,
+                            "bundle_id": "com.example.app",
+                            "busy_threshold_ms": 100,
+                            "quiet_window_ms": None,
+                        }
+                    ],
+                )
+                self.assertEqual(closed, [True])
+
+    async def test_quiet_exits_1_when_the_timeout_elapses(self) -> None:
+        _, closed = self._stream_quiescence(
+            QuiescenceStateChanged(pid=42, state=QuiescenceState.SETTLING),
+            then_block=True,
+        )
+        with redirect_stdout(StringIO()) as output:
+            exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01"])
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            output.getvalue(), "settling (pid 42)\nnot quiet within 0.01s\n"
+        )
+        self.assertEqual(closed, [True])
+
+        with self.subTest("a watch keeps reporting past quiet"):
+            _, closed = self._stream_quiescence(
+                QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+                QuiescenceStateChanged(
+                    pid=42, state=QuiescenceState.BUSY, busy_signals=("run_loop_idle",)
+                ),
+                then_block=True,
+            )
+            with redirect_stdout(StringIO()) as output:
+                exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01", "--watch"])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                output.getvalue(), "quiet (pid 42)\nbusy (run_loop_idle) (pid 42)\n"
+            )
+            self.assertEqual(closed, [True])
+
+        with self.subTest("a watch that ends after the target changes is not quiet"):
+            self._stream_quiescence(
+                QuiescenceStateChanged(pid=42, state=QuiescenceState.QUIET),
+                QuiescenceTargetChanged(pid=43),
+                then_block=True,
+            )
+            with redirect_stdout(StringIO()) as output:
+                exit_code = await cli_main(cmd_input=["ui", "quiet", "0.01", "--watch"])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                output.getvalue(), "quiet (pid 42)\nnow following pid 43\n"
+            )
+
+    async def test_quiet_target_exit_is_an_error(self) -> None:
+        for arguments in [["5"], ["5", "--watch"]]:
+            with self.subTest(arguments=arguments):
+                self._stream_quiescence(QuiescenceTargetExited(pid=42))
+                with (
+                    redirect_stdout(StringIO()) as output,
+                    redirect_stderr(StringIO()) as error,
+                ):
+                    exit_code = await cli_main(cmd_input=["ui", "quiet", *arguments])
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(output.getvalue(), "pid 42 exited\n")
+                self.assertIn("The application with pid 42 exited", error.getvalue())
+
+    async def test_quiet_rejects_negative_values(self) -> None:
+        for arguments in [["-1"], ["--busy-threshold-ms", "-1"], ["--watch"]]:
+            with self.subTest(arguments=arguments):
+                calls, _ = self._stream_quiescence()
+                with redirect_stderr(StringIO()):
+                    exit_code = await cli_main(cmd_input=["ui", "quiet", *arguments])
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(calls, [])
+
     async def test_scroll_frontmost(self) -> None:
         # No target is not a reason to fall back: the guest addresses the
         # application by pid rather than by point.
@@ -2300,6 +2513,79 @@ class TestParser(TestCase):
             p_start=(1, 2), p_end=(3, 4), duration=None, delta=None
         )
 
+    async def test_swipe_from_an_edge(self) -> None:
+        self.client_mock.swipe = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=["ui", "swipe", "1", "2", "3", "4", "--edge", "bottom"]
+        )
+        self.client_mock.swipe.assert_called_once_with(
+            p_start=(1, 2),
+            p_end=(3, 4),
+            duration=None,
+            delta=None,
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_passes_its_path_display_and_edge(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        await cli_main(
+            cmd_input=[
+                "ui",
+                "drag",
+                "236",
+                "668",
+                "236",
+                "600",
+                "700",
+                "330",
+                "--duration",
+                "2",
+                "--display",
+                "active",
+                "--edge",
+                "bottom",
+            ]
+        )
+        self.client_mock.drag.assert_called_once_with(
+            points=[(236.0, 668.0), (236.0, 600.0), (700.0, 330.0)],
+            duration=2.0,
+            delta=None,
+            display="active",
+            edge=HIDEdgeType.BOTTOM,
+        )
+
+    async def test_drag_needs_whole_pairs_of_at_least_two_points(self) -> None:
+        self.client_mock.drag = AsyncMock(return_value=[])
+        for coordinates in [["1", "2"], ["1", "2", "3"]]:
+            with self.subTest(coordinates=coordinates):
+                exit_code = await cli_main(cmd_input=["ui", "drag", *coordinates])
+                self.assertEqual(exit_code, 1)
+        self.client_mock.drag.assert_not_called()
+
+    async def test_invalid_drag_reports_clean_error_without_sending_events(self) -> None:
+        from idb.grpc.client import Client as GrpcClient
+
+        client = GrpcClient.__new__(GrpcClient)
+        client.logger = MagicMock()
+        client.send_events = AsyncMock()
+        self.client_mock.drag = client.drag
+        for coordinates, delta in [
+            (["0", "0", "1000", "0"], "1e-6"),
+            (["0", "0", "1", "0"], "1e-320"),
+            (["0", "0", "nan", "0"], "1"),
+        ]:
+            with self.subTest(coordinates=coordinates, delta=delta):
+                error = StringIO()
+                with redirect_stderr(error):
+                    exit_code = await cli_main(
+                        cmd_input=["ui", "drag", *coordinates, "--delta", delta]
+                    )
+                self.assertEqual(exit_code, 1)
+                self.assertIn("drag", error.getvalue().lower())
+                self.assertNotIn("Traceback", error.getvalue())
+                self.assertNotIn("Exception thrown in main", error.getvalue())
+        client.send_events.assert_not_called()
+
     async def test_contacts_update(self) -> None:
         self.client_mock.contacts_update = AsyncMock(return_value=[])
         await cli_main(cmd_input=["contacts", "update", "/dev/null"])
@@ -2500,6 +2786,14 @@ class TestParser(TestCase):
             options=AccessibilityInfoOptions(nested=False),
         )
 
+    async def test_accessibility_info_all_of_a_named_app(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(cmd_input=["ui", "describe-all", "--bundle-id", "com.a.b"])
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityApplication(bundle_id="com.a.b"),
+            options=AccessibilityInfoOptions(nested=False),
+        )
+
     async def test_accessibility_info_all_nested(self) -> None:
         self.client_mock.accessibility_info = AsyncMock()
         await cli_main(cmd_input=["ui", "describe-all", "--nested"])
@@ -2514,6 +2808,16 @@ class TestParser(TestCase):
         self.client_mock.accessibility_info.assert_called_once_with(
             target=AccessibilityPoint(x=10, y=20),
             options=AccessibilityInfoOptions(nested=False),
+        )
+
+    async def test_accessibility_info_at_point_on_a_display(self) -> None:
+        self.client_mock.accessibility_info = AsyncMock()
+        await cli_main(
+            cmd_input=["ui", "describe-point", "--display", "active", "10", "20"]
+        )
+        self.client_mock.accessibility_info.assert_called_once_with(
+            target=AccessibilityPoint(x=10, y=20),
+            options=AccessibilityInfoOptions(nested=False, display="active"),
         )
 
     async def test_accessibility_info_at_point_nested(self) -> None:
@@ -3135,6 +3439,16 @@ class TestParser(TestCase):
         # arrived is the one thing that cannot be done: it is not JSON.
         self.assertIsNone(records[2]["date"])
         self.assertIsNone(records[3]["date"])
+
+    async def test_notification_clear(self) -> None:
+        self.client_mock.clear_delivered_notifications = AsyncMock()
+        output = StringIO()
+        with redirect_stdout(output):
+            await cli_main(cmd_input=["notification", "clear", "com.foo.bar"])
+        self.client_mock.clear_delivered_notifications.assert_called_once_with(
+            "com.foo.bar"
+        )
+        self.assertEqual(output.getvalue(), "")
 
     async def test_debugserver_start(self) -> None:
         self.client_mock.debugserver_start = AsyncMock(return_value=["aaa", "bbb"])

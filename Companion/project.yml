@@ -231,6 +231,65 @@ targets:
       - sdk: CoreGraphics.framework
       - sdk: Foundation.framework
 
+  # Focused, hostless regression bundle. Do not glob CompanionTests: that directory
+  # also contains legacy suites whose test support is not part of this project.
+  CompanionRoutingTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "15.0"
+    scheme:
+      testTargets:
+        - CompanionRoutingTests
+    sources:
+      - path: ../CompanionTests/Tests/Unit/SwiftServer/MethodHandlers/AccessibilityInfoMethodHandlerTests.swift
+      - path: ../CompanionTests/Tests/Unit/SwiftServer/MethodHandlers/HidRequestTranslationTests.swift
+      - path: ../CompanionTests/Tests/Unit/SwiftServer/ValueTransformers/AccessibilityInfoRequestTranslationTests.swift
+      - path: ../CompanionTests/Tests/Unit/SwiftServer/ValueTransformers/DisplayErrorTranslationTests.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.facebook.CompanionRoutingTests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        SYSTEM_HEADER_SEARCH_PATHS: $(inherited) $(SRCROOT)/../PrivateHeaders
+        FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/../Build/Products/Release
+        SWIFT_INCLUDE_PATHS: $(inherited) $(SRCROOT)/../Build/Products/Release
+        OTHER_LDFLAGS: $(inherited) -ObjC -weak_library $(SRCROOT)/../PrivateHeaders/CoreSimulator/CoreSimulator.tbd -weak_library $(SRCROOT)/../PrivateHeaders/AccessibilityPlatformTranslation/AccessibilityPlatformTranslation.tbd
+        LD_RUNPATH_SEARCH_PATHS: $(inherited) @loader_path/Frameworks @loader_path/../Frameworks
+    dependencies:
+      - target: CompanionLib
+        embed: false
+      - target: IDBGRPCSwift
+        embed: false
+      - target: ReplProtocol
+        embed: false
+      - package: grpc-swift-2
+        product: GRPCCore
+        link: false
+      # Match idb_companion's generated static-link closure in project-deps.yml.
+      # tests/build-test.sh checks parity so a dependency change cannot silently
+      # leave this final link behind. Production archives remain Release; the
+      # companion test invocation sets ENABLE_TESTABILITY=YES for its Release build.
+      - framework: ../Build/Products/Release/libCompanionUtilities.a
+        embed: false
+      - framework: ../Build/Products/Release/FBControlCore.framework
+        embed: false
+      - framework: ../Build/Products/Release/libFBDeviceControl.a
+        embed: false
+      - framework: ../Build/Products/Release/libFBSimulatorControl.a
+        embed: false
+      - framework: ../Build/Products/Release/libSimulatorFrameworkBridgeProtocol.a
+        embed: false
+      - framework: ../Build/Products/Release/libSimulatorIPC.a
+        embed: false
+      - framework: ../Build/Products/Release/libSimulatorXCTest.a
+        embed: false
+      - framework: ../Build/Products/Release/XCTestBootstrap.framework
+        embed: false
+      - sdk: Foundation.framework
+      - sdk: XCTest.framework
+
   idb_companion:
     type: tool
     platform: macOS

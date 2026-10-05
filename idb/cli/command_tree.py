@@ -36,6 +36,7 @@ from idb.cli.commands.accessibility import (
     AccessibilityDragAndDropCommand,
     AccessibilityInfoAllCommand,
     AccessibilityInfoAtPointCommand,
+    AccessibilityQuietCommand,
     AccessibilityScrollCommand,
     AccessibilitySetValueCommand,
     AccessibilityWaitCommand,
@@ -59,6 +60,7 @@ from idb.cli.commands.debugserver import (
     DebugServerStatusCommand,
     DebugServerStopCommand,
 )
+from idb.cli.commands.displays import ListDisplaysCommand
 from idb.cli.commands.dsym import DsymInstallCommand
 from idb.cli.commands.dylib import DylibInstallCommand
 from idb.cli.commands.file import (
@@ -77,6 +79,7 @@ from idb.cli.commands.framework import FrameworkInstallCommand
 from idb.cli.commands.help import HelpCommand
 from idb.cli.commands.hid import (
     ButtonCommand,
+    DragCommand,
     KeyCommand,
     KeySequenceCommand,
     MultiTapCommand,
@@ -87,7 +90,6 @@ from idb.cli.commands.hid import (
     SwipeCommand,
     TextCommand,
 )
-from idb.cli.commands.displays import ListDisplaysCommand
 from idb.cli.commands.hinge import HingeCommand
 from idb.cli.commands.instruments import InstrumentsCommand
 from idb.cli.commands.keychain import KeychainClearCommand
@@ -98,6 +100,7 @@ from idb.cli.commands.log import CompanionLogCommand, LogCommand
 from idb.cli.commands.media import MediaAddCommand
 from idb.cli.commands.memory import SimulateMemoryWarningCommand
 from idb.cli.commands.notification import (
+    NotificationClearCommand,
     NotificationListCommand,
     NotificationSendCommand,
     SendNotificationCommand,
@@ -286,7 +289,11 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
         CommandGroup(
             name="notification",
             description="Notification operations on target",
-            commands=[NotificationListCommand(), NotificationSendCommand()],
+            commands=[
+                NotificationListCommand(),
+                NotificationSendCommand(),
+                NotificationClearCommand(),
+            ],
         ),
         ApproveCommand(),
         RevokeCommand(),
@@ -313,6 +320,7 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
                 AccessibilityInfoAtPointCommand(),
                 AccessibilityDescribeMarkerCommand(),
                 AccessibilityWaitCommand(),
+                AccessibilityQuietCommand(),
                 AccessibilityScrollCommand(),
                 AccessibilitySetValueCommand(),
                 AccessibilityDragAndDropCommand(),
@@ -325,6 +333,7 @@ def build_builtin_commands(shell_command: ShellCommand) -> list[Command]:
                 KeyCommand(),
                 KeySequenceCommand(),
                 SwipeCommand(),
+                DragCommand(),
                 RotateCommand(),
                 ShakeCommand(),
             ],

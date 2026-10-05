@@ -11,12 +11,13 @@ import Foundation
 // MARK: - Transport selection policy
 
 /// Decides which HID transport a caller that did not request one gets, and whether the legacy Indigo
-/// keyboard path is functional.
+/// path is functional.
 ///
 /// Deliberately not a probe of whether `dtuhidd` is *resident*: it is a demand-launched,
 /// pressured-exit job, so it is normally not running even on a simulator that routes all HID through
 /// it. This decides only what to *prefer*; whether `dtuhidd` can actually be reached is settled where
-/// it is observable, by `SimulatorDTUHIDTransport.dtuhid(for:)` looking the service up.
+/// it is observable, by `SimulatorDTUHIDConnection.connect(using:serviceName:)` round-tripping a
+/// liveness barrier, since the service lookup succeeds whether or not the daemon can run.
 enum SimulatorHIDTransportSelection {
 
   /// The first CoreSimulator version to inject `dtuhidd` into the guest. Older toolchains have no
@@ -32,11 +33,14 @@ enum SimulatorHIDTransportSelection {
     return coreSimulatorVersion.compare(firstDTUHIDCoreSimulatorVersion, options: .numeric) != .orderedAscending
   }
 
-  /// Whether the guest has handed its legacy keyboard service over to `dtuhidd`.
+  /// Whether the guest drops legacy Indigo input.
   ///
-  /// A property of the CoreSimulator version alone: from 1155.4 the handover happens for the lifetime
-  /// of the boot, whether or not the daemon is resident at the moment it is asked.
-  static func isLegacyKeyboardSuppressed(coreSimulatorVersion: String?) -> Bool {
+  /// A property of the CoreSimulator version alone. From 1155.4 the guest drops it for the whole boot,
+  /// independent of `dtuhidd` residency and of which other HID clients (Device Hub included) are
+  /// attached; restarting `backboardd` does not restore it. Button and keyboard events are always
+  /// dropped. Touch is unreliable: dropped on some boots and intermittently within one. The tvOS
+  /// trackpad is the exception.
+  static func isLegacyInputSuppressed(coreSimulatorVersion: String?) -> Bool {
     shipsDTUHID(coreSimulatorVersion: coreSimulatorVersion)
   }
 
@@ -50,24 +54,21 @@ enum SimulatorHIDTransportSelection {
   }
 }
 
-// MARK: - Legacy keyboard suppression
+// MARK: - Legacy input suppression
 
 extension Simulator {
 
-  /// Whether this simulator's guest has handed its legacy keyboard service over to `dtuhidd`.
-  ///
-  /// On Xcode 27 (CoreSimulator-1155.4) and later Indigo keyboard events are delivered byte-correctly
-  /// and then dropped. Indigo button events remain functional. The authoritative guest notify state
-  /// `com.apple.coredevice.dtuhidd.active` is not host-bridged, so this follows the CoreSimulator
-  /// version rather than trying to observe the guest.
-  var isLegacyKeyboardSuppressed: Bool {
-    SimulatorHIDTransportSelection.isLegacyKeyboardSuppressed(
+  /// Whether this simulator's guest drops legacy Indigo input: on Xcode 27 (CoreSimulator-1155.4) and
+  /// later it is delivered byte-correctly and has no effect. See
+  /// `SimulatorHIDTransportSelection.isLegacyInputSuppressed(coreSimulatorVersion:)`.
+  var isLegacyInputSuppressed: Bool {
+    SimulatorHIDTransportSelection.isLegacyInputSuppressed(
       coreSimulatorVersion: SimulatorControlFrameworkLoader.loadedCoreSimulatorVersion)
   }
 
   /// The HID transport to prefer when a caller does not request one: DTUHID once the toolchain ships
-  /// `dtuhidd`, the legacy Indigo path otherwise. A preference, not a guarantee — `SimulatorHID`
-  /// falls back to Indigo if `dtuhidd` turns out to be unreachable.
+  /// `dtuhidd`, the legacy Indigo path otherwise. `SimulatorHIDTransport.negotiate(for:requested:)`
+  /// reports an unreachable `dtuhidd` rather than falling back to Indigo.
   var defaultHIDTransport: SimulatorHIDTransportType {
     SimulatorHIDTransportSelection.defaultTransport(
       coreSimulatorVersion: SimulatorControlFrameworkLoader.loadedCoreSimulatorVersion)

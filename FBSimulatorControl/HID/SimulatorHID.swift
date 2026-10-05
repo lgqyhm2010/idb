@@ -11,297 +11,190 @@ import Darwin
 import Foundation
 
 /**
- The HID abstraction layer for a Simulator.
+ Input for a Simulator: `SimulatorHIDEvent`s (touch, two-finger touch, button, remote button, keyboard,
+ trackpad, delays and composites of them), delivered through a pluggable `SimulatorHIDTransport`
+ (`dtuhidd` or the legacy Indigo client, whichever the toolchain supports).
 
- Touch, button, and keyboard events are delivered through a pluggable `SimulatorHIDTransport`
- (the legacy Indigo `SimDeviceLegacyHIDClient` path by default). The remaining event families are
- not transport-switchable and are sent directly from here:
+ Device actions — rotation, the hinge, lock, shake, the in-call status bar — are not input and are
+ commands on the `Simulator` (`orientation`, `hinge`, `hardware`, `statusBar`).
 
- 1. PurpleWorkspacePort — for GSEvent-based events (e.g., device orientation changes).
-    Payloads are constructed by `SimulatorPurpleHID` and sent via raw `mach_msg`.
-    Guest-side: `GraphicsServices._PurpleEventCallback` → backboardd.
-
- 2. Darwin notifications — e.g. shake, in-call status bar — posted via the SimDevice.
-
- 3. Vendor-defined DTUHID reports — hinge and orientation controls on supported simulators.
-
- See `Indigo.h` and `GSEvent.h` for wire format documentation.
-
- Indigo-family sends are serialized by the transport, so the type is `@unchecked Sendable`.
+ See `Indigo.h` for wire format documentation.
  */
-public final class SimulatorHID: CustomStringConvertible, @unchecked Sendable {
+public final class SimulatorHID: CustomStringConvertible, Sendable {
 
   // MARK: - Properties
 
   /// The transport for the touch / button / keyboard primitives.
   private let transport: SimulatorHIDTransport
-  /// The transport for GSEvents (orientation, lock).
-  private let purple: SimulatorPurpleHIDTransport
-  /// The transport for the Darwin-notification inputs (shake, in-call status bar).
-  private let notification: SimulatorDarwinNotificationTransport
-
-  private weak var simulator: Simulator?
-
-  /// Whether `send(event:logger:)` flushes after every event. Streaming callers can disable this
-  /// and call `flush()` before releasing the HID.
-  public var flushesAfterEachEvent = true
+  private let operationLease: SimulatorHIDOperationLease
+  private let displays: (any DisplayCommands)?
+  private let logging: SimulatorHIDEventLogging
 
   // MARK: - Initializers
 
-  /// `transport` forces a HID path; `nil` negotiates one (see `transport(for:requested:)`). Throws if the
+  /// `transport` forces a HID path; `nil` negotiates one (see `SimulatorHIDTransport.negotiate(for:requested:)`). Throws if the
   /// transport cannot be established (registration may need to occur prior to booting).
-  public convenience init(
+  convenience init(
     for simulator: Simulator, transport transportType: SimulatorHIDTransportType? = nil
   ) async throws {
     self.init(
-      transport: try await Self.transport(for: simulator, requested: transportType),
-      purple: SimulatorPurpleHIDTransport(simulator: simulator),
-      notification: SimulatorDarwinNotificationTransport(simulator: simulator),
-      simulator: simulator)
+      transport: try await SimulatorHIDTransport.negotiate(for: simulator, requested: transportType),
+      operationLease: simulator.commandCache.resolve { SimulatorHIDOperationLease() },
+      displays: simulator.displays,
+      logging: simulator.set?.configuration.hidEventLogging ?? .redacted)
   }
 
-  /// A requested transport is never substituted — it is established or the error surfaces. With no request,
-  /// `defaultHIDTransport` is tried and only an `isDTUHIDUnreachable` failure falls back to Indigo; a fault
-  /// in an established transport is a real error. Reachability is settled where it is observable, by
-  /// `SimulatorDTUHIDTransport.dtuhid(for:)` round-tripping a barrier past its retries: `dtuhidd` is
-  /// demand-launched, so neither the toolchain version nor the service lookup can tell whether one is
-  /// there. Falling back costs the keyboard, which the guest has already handed to `dtuhidd`, so it is
-  /// reached only after that probe has given the daemon every chance to come up.
-  private static func transport(
-    for simulator: Simulator, requested: SimulatorHIDTransportType?
-  ) async throws -> SimulatorHIDTransport {
-    if let requested {
-      return try await transport(requested, for: simulator)
-    }
-    let logger = ControlCoreGlobalConfiguration.defaultLogger
-    let preferred = simulator.defaultHIDTransport
-    do {
-      let transport = try await transport(preferred, for: simulator)
-      logger.log("Negotiated the \(preferred) HID transport")
-      return transport
-    } catch let error as SimulatorHIDError where error.isDTUHIDUnreachable {
-      logger.log(
-        "dtuhidd is unreachable (\(error.localizedDescription)), falling back to the legacy Indigo HID transport")
-      return .indigo(try SimulatorIndigoHIDTransport.indigo(for: simulator))
-    }
-  }
-
-  private static func transport(
-    _ type: SimulatorHIDTransportType, for simulator: Simulator
-  ) async throws -> SimulatorHIDTransport {
-    switch type {
-    case .indigo:
-      return .indigo(try SimulatorIndigoHIDTransport.indigo(for: simulator))
-    case .dtuhid:
-      let dtuhid = try await SimulatorDTUHIDTransport.dtuhid(for: simulator)
-      guard let indigo = indigoAlongsideDTUHID(for: simulator) else {
-        return .dtuhid(dtuhid)
-      }
-      return .mixed(dtuhid: dtuhid, indigo: indigo)
-    }
-  }
-
-  /// The Indigo transport to run alongside DTUHID, for a target that needs both.
-  ///
-  /// Only Apple TV does. It is the only family with a trackpad, which `dtuhidd` does not expose, and the
-  /// only one where a second client is safe: Indigo and DTUHID both claim `mainTouchscreen` and
-  /// whichever sends first on a boot keeps it, and tvOS has none for them to contend over.
-  ///
-  /// Absent rather than fatal when it cannot be registered, since it carries the trackpad alone — a
-  /// failure should cost a pan, not every other input on the target.
-  private static func indigoAlongsideDTUHID(for simulator: Simulator) -> SimulatorIndigoHIDTransport? {
-    guard simulator.productFamily == .appleTV else {
-      return nil
-    }
-    return try? SimulatorIndigoHIDTransport.indigo(for: simulator)
-  }
-
-  /// `simulator` is weak and may be absent: the Purple and Darwin paths need it and throw
-  /// `WeakTargetError.simulator` without one; the transport primitives never touch it.
+  /// Instances sharing `operationLease` never interleave operations.
   init(
     transport: SimulatorHIDTransport,
-    purple: SimulatorPurpleHIDTransport,
-    notification: SimulatorDarwinNotificationTransport,
-    simulator: Simulator?
+    operationLease: SimulatorHIDOperationLease = SimulatorHIDOperationLease(),
+    displays: (any DisplayCommands)? = nil,
+    logging: SimulatorHIDEventLogging = .redacted
   ) {
     self.transport = transport
-    self.purple = purple
-    self.notification = notification
-    self.simulator = simulator
+    self.operationLease = operationLease
+    self.displays = displays
+    self.logging = logging
   }
 
   /// Drains pending events before disconnecting, even when the caller is cancelled.
   /// Drain errors do not prevent disconnection.
-  public func close() async {
-    let drain = Task { try await flush() }
-    try? await drain.value
-    transport.disconnect()
-  }
-
-  // MARK: - Indigo Event Send Primitives
-
-  /// Sends a single-finger touch at the given point (in points), optionally tagged as originating at
-  /// a screen edge.
-  func sendTouch(
-    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge
-  ) async throws {
-    try await transport.sendTouch(direction: direction, x: x, y: y, edge: edge)
-  }
-
-  /// Sends a two-finger touch (for multi-touch gestures) at the given points (in points).
-  func sendTwoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint) async throws {
-    try await transport.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2)
-  }
-
-  /// Sends a hardware button event.
-  func sendButton(direction: SimulatorHIDDirection, button: SimulatorHIDButton) async throws {
-    try await transport.sendButton(direction: direction, button: button)
-  }
-
-  /// Sends a tvOS Siri Remote focus action.
-  func sendRemoteButton(direction: SimulatorHIDDirection, button: SimulatorHIDRemoteButton) async throws {
-    try await transport.sendRemoteButton(direction: direction, button: button)
-  }
-
-  /// Sends a keyboard key event.
-  func sendKeyboard(direction: SimulatorHIDDirection, keyCode: UInt32) async throws {
-    try await transport.sendKeyboard(direction: direction, keyCode: keyCode)
-  }
-
-  /// Drains the transport so `dtuhidd` consumes a gesture before the connection is torn down. Only DTUHID
-  /// has anything to drain; Indigo's client is synchronous. `send(event:logger:)` calls this per event
-  /// unless `flushesAfterEachEvent` is `false`.
-  public func flush() async throws {
-    try await transport.dtuhid?.flush()
-  }
-
-  /// Indigo only: the tvOS trackpad rides a dedicated Indigo service that `dtuhidd` does not expose (its
-  /// digitizer targets are displays and its scroll targets rotary devices).
-  func sendTrackpad(point: SimulatorTrackpadPoint, phase: SimulatorTrackpadPhase) async throws {
-    guard let indigo = transport.indigo else {
-      throw SimulatorHIDError.notImplementedOnDTUHIDTransport(
-        operation: "trackpad pan — the tvOS Siri Remote trackpad is not exposed by dtuhidd")
+  func close() async {
+    let close = Task {
+      try? await operationLease.withLease {
+        try? await flush()
+        transport.disconnect()
+      }
     }
-    try await indigo.sendTrackpad(point: point, phase: phase)
+    await close.value
   }
 
-  // MARK: - Purple / GSEvents
+  // MARK: - Input transport
 
-  /// Rotates through vendor HID when device motion is supported, otherwise through Purple.
-  func sendOrientation(_ orientation: SimulatorHIDDeviceOrientation, legacyPurpleEncoding: Bool = true) async throws {
-    guard let simulator else { throw WeakTargetError.simulator }
-    do {
-      try await SimulatorMotionCapability.deviceMotionState.requireSupported(on: simulator)
-    } catch SimulatorCoreDeviceError.unsupported {
-      try await purple.sendOrientation(legacyPurpleEncoding ? orientation : orientation.physicalPurpleOrientation)
-      return
-    }
-    try await sendVendorEvent(orientation.vendorEvent(), on: simulator)
-  }
-
-  private func sendVendorEvent(_ event: IndigoVendorDefinedEvent, on simulator: Simulator) async throws {
-    let vendor = try await SimulatorDTUHIDTransport.dtuhid(
-      for: simulator, serviceName: SimulatorDTUHIDTransport.vendorDefinedServiceName)
-    defer { vendor.disconnect() }
-    try await vendor.send(messageType: "IndigoVendorDefinedEvent", payload: event)
-    try await vendor.flush()
-  }
-
-  /// Locks the device. Delivered as a GSEvent over Purple, not through the HID transport.
-  func sendLockDevice() async throws {
-    try await purple.sendLockDevice()
-  }
-
-  // MARK: - Darwin Notifications
-
-  /// Shakes the device. Posted as a Darwin notification, not through the HID transport.
-  func sendShake() async throws {
-    try await notification.sendShake()
-  }
-
-  /// Toggles the in-call status bar. Posted as a Darwin notification, not through the HID transport.
-  func sendToggleInCallStatusBar() async throws {
-    try await notification.sendToggleInCallStatusBar()
+  /// Drains the transport so `dtuhidd` consumes a gesture before the connection is torn down.
+  func flush() async throws {
+    try await transport.flush()
   }
 
   // MARK: - Dispatch
 
-  /// Sends a (possibly composite) event, logging each sub-event, then drains once if any sub-event reached
-  /// the HID transport — so a tap or typed string settles once, not per primitive. `target` routes its
-  /// touches to one display's touchscreen; nil sends them to the main screen.
-  public func send(event: SimulatorHIDEvent, target: SimulatorTouchTarget? = nil, logger: ControlCoreLogger) async throws {
-    var wroteToTransport = false
-    for subEvent in event.subEvents ?? [event] {
-      switch subEvent {
-      case let .delay(duration):
-        logger.log("Delay \(duration)s")
-      case .touch, .button, .remoteButton, .keyboard, .twoFingerTouch, .trackpad,
-        .deviceOrientation, .hinge, .lockDevice, .shake, .toggleInCallStatusBar, .composite:
-        logger.log("Sending \(subEvent)")
-      }
-      if try await deliver(subEvent, target: target) {
-        wroteToTransport = true
-      }
+  /// Sends one complete gesture whose touches land on `binding`. With `.perEvent` it then drains once —
+  /// so a tap or typed string settles once, not per primitive. The transport skips the drain when
+  /// nothing reached it.
+  public func send(
+    event: SimulatorHIDEvent,
+    logger: ControlCoreLogger,
+    drain: SimulatorHIDDrain = .perEvent,
+    on binding: SimulatorHIDDisplayBinding = .active
+  ) async throws {
+    let events = AsyncStream<SimulatorHIDEvent> { continuation in
+      continuation.yield(event)
+      continuation.finish()
     }
-    if wroteToTransport, flushesAfterEachEvent {
-      try await flush()
+    try await send(events: events, logger: logger, flushing: drain == .perEvent, binding: binding)
+  }
+
+  /// Sends a stream as one operation whose touches land on `binding`. Touch coordinates use the display resolved
+  /// at the first touch. An observed display change fails the operation; cancellation releases contacts on the
+  /// original display.
+  public func send<S: AsyncSequence>(
+    events: S, logger: ControlCoreLogger, on binding: SimulatorHIDDisplayBinding = .active
+  ) async throws where S.Element == SimulatorHIDEvent {
+    try await send(events: events, logger: logger, flushing: true, binding: binding)
+  }
+
+  private func send<S: AsyncSequence>(
+    events: S, logger: ControlCoreLogger, flushing: Bool, binding: SimulatorHIDDisplayBinding
+  ) async throws where S.Element == SimulatorHIDEvent {
+    try await send(stream: events.map { SimulatorHIDStreamEvent.input($0) }, logger: logger, flushing: flushing, binding: binding)
+  }
+
+  /// Display selections are operation-local and may only occur after all contacts have lifted.
+  public func send<S: AsyncSequence>(stream: S, logger: ControlCoreLogger) async throws where S.Element == SimulatorHIDStreamEvent {
+    try await send(stream: stream, logger: logger, flushing: true, binding: .active)
+  }
+
+  private func send<S: AsyncSequence>(
+    stream: S, logger: ControlCoreLogger, flushing: Bool, binding: SimulatorHIDDisplayBinding
+  ) async throws where S.Element == SimulatorHIDStreamEvent {
+    try await operationLease.withLease {
+      var operation = SimulatorHIDOperation(
+        displays: displays,
+        binding: binding,
+        sink: LoggingSink(hid: self, logger: logger, logging: logging))
+      do {
+        for try await request in stream {
+          switch request {
+          case let .display(binding):
+            try await operation.select(binding)
+          case let .input(event):
+            for delivery in try await operation.send(event) {
+              if case .clamped = delivery { logger.log(delivery.logDescription(logging)) }
+            }
+          }
+        }
+        try await operation.finish(flushing: flushing)
+      } catch {
+        for failure in await operation.cleanup() { logger.log("HID cleanup failed: \(failure)") }
+        throw error
+      }
     }
   }
 
-  /// Routes one event to its transport; returns whether it went to the HID transport (which decides the drain).
-  /// `target` applies to touches only: buttons and keys have no display.
-  func deliver(_ event: SimulatorHIDEvent, target: SimulatorTouchTarget? = nil) async throws -> Bool {
+  /// Routes one event to its transport.
+  func deliver(_ event: SimulatorHIDEvent, display: SimulatorHIDDisplay? = nil) async throws {
     switch event {
     case let .touch(direction, x, y, edge):
-      try await transport.sendTouch(direction: direction, x: x, y: y, edge: edge, target: target)
-      return true
+      try await transport.primitives.sendTouch(direction: direction, x: x, y: y, edge: edge, display: display)
     case let .button(direction, button):
-      try await transport.sendButton(direction: direction, button: button)
-      return true
+      try await transport.primitives.sendButton(direction: direction, button: button)
     case let .remoteButton(direction, button):
-      try await transport.sendRemoteButton(direction: direction, button: button)
-      return true
+      try await transport.primitives.sendRemoteButton(direction: direction, button: button)
     case let .keyboard(direction, keyCode):
-      try await transport.sendKeyboard(direction: direction, keyCode: keyCode)
-      return true
+      try await transport.primitives.sendKeyboard(direction: direction, keyCode: keyCode)
     case let .twoFingerTouch(direction, finger1, finger2):
-      try await transport.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2, target: target)
-      return true
+      try await transport.primitives.sendTwoFingerTouch(direction: direction, finger1: finger1, finger2: finger2, display: display)
     case let .trackpad(phase, point):
-      try await sendTrackpad(point: point, phase: phase)
-      // The trackpad rides Indigo, and only DTUHID has a drain, so this wrote to the drained transport
-      // only on a target that has no DTUHID transport at all.
-      return transport.dtuhid == nil
-    case let .deviceOrientation(orientation):
-      try await sendOrientation(orientation)
-      return false
-    case .lockDevice:
-      try await sendLockDevice()
-      return false
-    case let .hinge(angle):
-      guard let simulator else { throw WeakTargetError.simulator }
-      try await SimulatorMotionCapability.hingeAngle.requireSupported(on: simulator)
-      try await sendVendorEvent(angle.vendorEvent(), on: simulator)
-      return false
-    case .shake:
-      try await sendShake()
-      return false
-    case .toggleInCallStatusBar:
-      try await sendToggleInCallStatusBar()
-      return false
+      try await transport.sendTrackpad(point: point, phase: phase)
     case let .delay(duration):
       try await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
-      return false
     case let .composite(events):
-      var wrote = false
-      for event in events where try await deliver(event, target: target) {
-        wrote = true
+      for event in events {
+        try await deliver(event, display: display)
       }
-      return wrote
     }
   }
 
   public var description: String {
     "SimulatorKit HID"
   }
+}
+
+/// One operation's view of the HID, logging each event before it is delivered.
+private struct LoggingSink: SimulatorHIDOperationSink {
+  let hid: SimulatorHID
+  let logger: ControlCoreLogger
+  let logging: SimulatorHIDEventLogging
+
+  func deliver(_ event: SimulatorHIDEvent, display: SimulatorHIDDisplay?) async throws {
+    if case let .delay(duration) = event {
+      logger.log("Delay \(duration)s")
+    } else {
+      logger.log("Sending \(event.logDescription(logging))")
+    }
+    try await hid.deliver(event, display: display)
+  }
+
+  func flush() async throws {
+    try await hid.flush()
+  }
+}
+
+/// When `SimulatorHID.send(event:logger:drain:)` waits for `dtuhidd` to consume what it sent.
+public enum SimulatorHIDDrain: Sendable {
+  /// Before returning, so the guest has acted on the event by the time the caller observes it.
+  case perEvent
+  /// Only when the HID is closed, which always drains. For a stream of events the caller does not
+  /// observe between, where a per-event drain is pure latency.
+  case onClose
 }

@@ -17,46 +17,68 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NoReturn, Sequence
 from unittest import mock
 
-from . import harness, recording as recording_module
+from . import harness, notification_banner, recording as recording_module, test_demos
 from .documentation import Transcript
 from .harness import (
     _optional_binary_from_environment,
     _prepare_artifact_file,
+    AccessibilityApi,
+    AppState,
+    attested_process,
     client_argv,
+    CommandTimedOut,
     Companion,
     CompanionDied,
     Completed,
     Deadline,
+    expected_implementation,
     EXPECTED_IMPLEMENTATION_ENV,
     HarnessError,
+    HostLoad,
+    IDB_E2E_REPL_PATH_ENV,
     IDB_SETUP_BIN_ENV,
     IdbEndToEndTestCase,
     IdbProcess,
     IdbProcessConfig,
+    last_top_sample,
+    MatchKey,
     NotReady,
     ProcessStream,
+    Query,
+    require_route_attestation,
     ROUTE_ATTESTATION_ENV,
+    run_attested_client,
     run_with_registered_cleanup,
     running_bundle_ids_from_listing,
+    sample_top,
     select_tests_for_capability,
     shared_companion,
     Simctl,
+    stop_push_service,
     STRICT_ENV,
     suite_capability,
     SUITE_CAPABILITY_ENV,
     suite_supports,
     SuiteCapability,
+    UiWait,
+    Until,
+    verify_route_attestation,
     wait_for_accessibility,
+    wait_for_route_attestation,
     wait_until,
 )
 from .recording import Recording
@@ -122,6 +144,7 @@ class HarnessCaseStub:
         self._result = unittest.TestResult()
 
     _stop_suite = IdbEndToEndTestCase._stop_suite
+    wait_or_fail = IdbEndToEndTestCase.wait_or_fail
 
     def fail(self, message: str) -> NoReturn:
         raise Failed(message)
@@ -244,28 +267,125 @@ class ClientArgumentTests(unittest.TestCase):
 
         self.assertEqual(selected, Path(executable.name))
 
+    def test_idb_process_builds_an_attested_alternate_client_command(self) -> None:
+        case = IdbEndToEndTestCase()
+        case.environment = SimpleNamespace(
+            idb_bin=Path("/default-client"),
+            idb_args=("--backend-argument",),
+        )
+        case.companion = SimpleNamespace(address="default.sock")
+        case.recording = mock.sentinel.recording
+        case.requires_route_attestation = True
+        case.resolve_process_executable = True
+        case.route_attestation_timeout_seconds = 30.0
+        companion = SimpleNamespace(address="alternate.sock")
+        config = IdbProcessConfig(read_chunk_bytes=1024)
+        context = mock.sentinel.context
+
+        with mock.patch.object(
+            harness,
+            "attested_process",
+            return_value=context,
+        ) as construct:
+            actual = case.idb_process(
+                "video-stream",
+                "--format=h264",
+                idb_bin=Path("/alternate-client"),
+                process_config=config,
+                companion=companion,
+                cwd=Path("/work"),
+                env={"CUSTOM": "value"},
+            )
+
+        self.assertIs(actual, context)
+        construct.assert_called_once_with(
+            [
+                "/alternate-client",
+                "--backend-argument",
+                "--companion",
+                "alternate.sock",
+                "video-stream",
+                "--format=h264",
+            ],
+            "video-stream --format=h264",
+            display_argv=["idb", "video-stream", "--format=h264"],
+            failure=case.fail,
+            recording=mock.sentinel.recording,
+            config=config,
+            env={"CUSTOM": "value"},
+            cwd=Path("/work"),
+            required=True,
+            attestation_timeout=30.0,
+        )
+
 
 class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
-    def case(self) -> IdbEndToEndTestCase:
-        case = IdbEndToEndTestCase()
-        self.addCleanup(case.doCleanups)
-        return case
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_expected_implementation_is_optional_or_required(self) -> None:
+        self.assertIsNone(expected_implementation())
+        with self.assertRaisesRegex(HarnessError, "attestation is mandatory"):
+            expected_implementation(required=True)
+
+    def test_expected_implementation_accepts_only_exact_route_names(self) -> None:
+        for expected in ("python", "rust"):
+            with (
+                self.subTest(expected=expected),
+                mock.patch.dict(
+                    os.environ,
+                    {EXPECTED_IMPLEMENTATION_ENV: expected},
+                    clear=True,
+                ),
+            ):
+                self.assertEqual(expected_implementation(required=True), expected)
+        with mock.patch.dict(
+            os.environ,
+            {EXPECTED_IMPLEMENTATION_ENV: "unexpected"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(HarnessError, "not 'python' or 'rust'"):
+                expected_implementation()
+
+    def test_route_attestation_distinguishes_pending_wrong_and_exact_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "selected"
+            with self.assertRaises(NotReady):
+                verify_route_attestation(attestation, "rust")
+            with self.assertRaisesRegex(
+                HarnessError,
+                "did not complete route attestation",
+            ):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("")
+            with self.assertRaises(NotReady):
+                verify_route_attestation(attestation, "rust")
+            with self.assertRaisesRegex(
+                HarnessError,
+                "did not complete route attestation",
+            ):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("python\n")
+            with self.assertRaisesRegex(HarnessError, "executed the python sidecar"):
+                require_route_attestation(attestation, "rust")
+            attestation.write_text("rust\n")
+            require_route_attestation(attestation, "rust")
 
     @mock.patch.dict(
         os.environ,
         {EXPECTED_IMPLEMENTATION_ENV: "rust"},
         clear=True,
     )
-    async def test_run_client_supplies_and_verifies_a_fresh_path(self) -> None:
+    async def test_run_attested_client_supplies_and_verifies_a_fresh_path(self) -> None:
         paths: list[Path] = []
 
-        async def run_attested(
+        async def execute(
             argv: Sequence[str],
             timeout: float,
             stdin: bytes | None = None,
             env: dict[str, str] | None = None,
         ) -> Completed:
-            self.assertEqual(argv, ["idb", "describe"])
+            self.assertEqual(argv, ["client", "describe"])
             self.assertEqual(timeout, 1.0)
             self.assertIsNone(stdin)
             self.assertIsNotNone(env)
@@ -275,22 +395,59 @@ class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
             path.write_text("rust\n")
             return Completed(0, b"ok", b"")
 
-        with mock.patch.object(harness, "run", side_effect=run_attested):
-            case = self.case()
-            first = await case.run_client(["idb", "describe"], timeout=1.0)
-            second = await case.run_client(["idb", "describe"], timeout=1.0)
+        with mock.patch.object(harness, "run", side_effect=execute):
+            first = await run_attested_client(["client", "describe"], timeout=1.0)
+            second = await run_attested_client(["client", "describe"], timeout=1.0)
 
         self.assertEqual(first.stdout, b"ok")
         self.assertEqual(second.stdout, b"ok")
         self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(not path.parent.exists() for path in paths))
 
     @mock.patch.dict(
         os.environ,
         {EXPECTED_IMPLEMENTATION_ENV: "rust"},
         clear=True,
     )
-    async def test_run_client_rejects_the_wrong_route(self) -> None:
-        async def run_wrong_route(
+    async def test_run_attested_client_accepts_an_explicit_mixed_route_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "python-selected"
+
+            async def execute(
+                argv: Sequence[str],
+                timeout: float,
+                stdin: bytes | None = None,
+                env: dict[str, str] | None = None,
+            ) -> Completed:
+                self.assertEqual(argv, ["client", "disconnect"])
+                self.assertEqual(timeout, 1.0)
+                self.assertIsNone(stdin)
+                assert env is not None
+                self.assertEqual(Path(env[ROUTE_ATTESTATION_ENV]), attestation)
+                attestation.write_bytes(b"python\n")
+                return Completed(0, b"", b"")
+
+            with mock.patch.object(harness, "run", side_effect=execute):
+                completed = await run_attested_client(
+                    ["client", "disconnect"],
+                    timeout=1.0,
+                    expected="python",
+                    attestation_path=attestation,
+                    required=True,
+                )
+
+            self.assertEqual(completed, Completed(0, b"", b""))
+            self.assertEqual(attestation.read_bytes(), b"python\n")
+
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_run_attested_client_rejects_the_wrong_route(self) -> None:
+        async def execute(
             argv: Sequence[str],
             timeout: float,
             stdin: bytes | None = None,
@@ -301,59 +458,117 @@ class RouteAttestationTests(unittest.IsolatedAsyncioTestCase):
             return Completed(0, b"", b"")
 
         with (
-            mock.patch.object(harness, "run", side_effect=run_wrong_route),
+            mock.patch.object(harness, "run", side_effect=execute),
             self.assertRaisesRegex(HarnessError, "executed the python sidecar"),
         ):
-            await self.case().run_client(["idb", "describe"], timeout=1.0)
+            await run_attested_client(["client", "describe"], timeout=1.0)
 
-    async def test_streaming_process_attests_before_it_is_yielded(self) -> None:
+    @mock.patch.dict(os.environ, {}, clear=True)
+    async def test_required_route_fails_before_running_a_command(self) -> None:
+        execute = mock.AsyncMock()
+        with (
+            mock.patch.object(harness, "run", new=execute),
+            self.assertRaisesRegex(HarnessError, "attestation is mandatory"),
+        ):
+            await run_attested_client(
+                ["client", "describe"],
+                timeout=1.0,
+                required=True,
+            )
+        execute.assert_not_awaited()
+
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_attested_process_is_command_neutral_and_uses_fresh_paths(
+        self,
+    ) -> None:
+        paths: list[Path] = []
         with tempfile.TemporaryDirectory() as directory:
-            attestation = Path(directory) / "selected"
-            environment = dict(os.environ)
-            environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+            working_directory = Path(directory)
             script = (
                 "import os, time; from pathlib import Path; "
                 f"p=Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]); "
-                "p.write_text(''); time.sleep(0.1); "
+                "p.write_text(''); time.sleep(0.05); "
                 "p.with_suffix('.tmp').write_text('rust\\n'); "
                 "p.with_suffix('.tmp').replace(p); "
-                "print('ready', flush=True); time.sleep(60)"
+                "print(os.getcwd() + '|' + os.environ['CUSTOM'] + '|' + str(p), "
+                "flush=True); time.sleep(60)"
             )
-            async with IdbProcess(
-                [sys.executable, "-u", "-c", script],
-                "log",
-                env=environment,
-                route_attestation=(attestation, "rust"),
-                config=IdbProcessConfig(
-                    graceful_stop_seconds=0.1,
-                    kill_wait_seconds=1.0,
-                ),
-            ) as process:
-                self.assertEqual(attestation.read_text(), "rust\n")
-                self.assertEqual((await process.read_some(1.0)).strip(), b"ready")
+            for value in ("first", "second"):
+                async with attested_process(
+                    [sys.executable, "-u", "-c", script],
+                    "management probe",
+                    cwd=working_directory,
+                    env={"CUSTOM": value},
+                    required=True,
+                    config=IdbProcessConfig(
+                        graceful_stop_seconds=0.1,
+                        kill_wait_seconds=1.0,
+                    ),
+                ) as process:
+                    report = (await process.read_some(1.0)).decode().strip()
+                    cwd, actual, raw_path = report.split("|", 2)
+                    path = Path(raw_path)
+                    paths.append(path)
+                    self.assertEqual(cwd, str(working_directory))
+                    self.assertEqual(actual, value)
+                    self.assertEqual(path.read_text(), "rust\n")
+                self.assertTrue(process.closed)
+                self.assertFalse(path.parent.exists())
+        self.assertEqual(len(set(paths)), 2)
 
-    async def test_streaming_process_rejects_the_wrong_route_before_yield(self) -> None:
+    @mock.patch.dict(
+        os.environ,
+        {EXPECTED_IMPLEMENTATION_ENV: "rust"},
+        clear=True,
+    )
+    async def test_attestation_failure_reaps_process_and_removes_fresh_path(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            attestation = Path(directory) / "selected"
-            environment = dict(os.environ)
-            environment[ROUTE_ATTESTATION_ENV] = str(attestation)
+            capture = Path(directory) / "capture"
             script = (
                 "import os, time; from pathlib import Path; "
-                f"Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]).write_text('python\\n'); "
-                "time.sleep(60)"
+                f"p=Path(os.environ[{ROUTE_ATTESTATION_ENV!r}]); "
+                "Path(os.environ['CAPTURE']).write_text(str(os.getpid()) + '\\n' + str(p)); "
+                "p.write_text('python\\n'); time.sleep(60)"
             )
             with self.assertRaisesRegex(HarnessError, "executed the python sidecar"):
-                async with IdbProcess(
+                async with attested_process(
                     [sys.executable, "-u", "-c", script],
-                    "log",
-                    env=environment,
-                    route_attestation=(attestation, "rust"),
+                    "management probe",
+                    env={"CAPTURE": str(capture)},
+                    required=True,
                     config=IdbProcessConfig(
                         graceful_stop_seconds=0.1,
                         kill_wait_seconds=1.0,
                     ),
                 ):
-                    self.fail("the process was yielded before route attestation")
+                    self.fail("a wrong route must not yield the process")
+            raw_pid, raw_path = capture.read_text().splitlines()
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(raw_pid), 0)
+            self.assertFalse(Path(raw_path).parent.exists())
+
+    async def test_wait_rejects_a_process_that_exited_after_attesting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            attestation = Path(directory) / "selected"
+            attestation.write_text("rust\n")
+            process = mock.Mock(returncode=7)
+            process.stderr_capture.tail = b"broken pipe"
+            with self.assertRaisesRegex(
+                HarnessError,
+                "exited with 7 immediately after route attestation.*broken pipe",
+            ):
+                await wait_for_route_attestation(
+                    attestation,
+                    "rust",
+                    process,
+                    timeout=0,
+                )
 
 
 class IdbProcessTests(unittest.IsolatedAsyncioTestCase):
@@ -536,6 +751,20 @@ os.write(1, b'stdin:' + data)
                 await running.send(b"too late")
             await running.close_stdin()
             await running.close_stdin()
+
+    async def test_close_stdin_tolerates_a_broken_pipe_and_is_idempotent(
+        self,
+    ) -> None:
+        process = self.process("")
+        stdin = mock.Mock()
+        stdin.wait_closed = mock.AsyncMock(side_effect=BrokenPipeError)
+        process._process = mock.Mock(stdin=stdin)
+
+        await process.close_stdin()
+        await process.close_stdin()
+
+        stdin.close.assert_called_once_with()
+        stdin.wait_closed.assert_awaited_once_with()
 
     async def test_broken_reader_fails_and_reaps_the_producer(self) -> None:
         async def broken_consumer(stream: ProcessStream) -> None:
@@ -735,21 +964,11 @@ class SuiteCapabilityTests(unittest.TestCase):
         "test_process_liveness": SuiteCapability.COMPANION_PROCESS,
         "test_publishes_artifact": SuiteCapability.ARTIFACT_PUBLICATION,
         "test_streams_output": SuiteCapability.LONG_LIVED_STREAM,
-        "test_ui_describe_all_reads_both_backends_and_honours_its_options": (
-            SuiteCapability.ACCESSIBILITY_READ
-        ),
-        "test_ui_describe_resolves_a_point_and_a_marker": (
-            SuiteCapability.ACCESSIBILITY_READ
-        ),
-        "test_ui_scroll_moves_settings_rows_down_and_up": (
-            SuiteCapability.ACCESSIBILITY_INTERACTION
-        ),
-        "test_ui_tap_opens_general_by_point": (
-            SuiteCapability.ACCESSIBILITY_INTERACTION
-        ),
-        "test_ui_wait_returns_after_general_opens": (
-            SuiteCapability.ACCESSIBILITY_INTERACTION
-        ),
+        "test_reads_accessibility": SuiteCapability.ACCESSIBILITY_READ,
+        "test_reads_accessibility_at_a_point": SuiteCapability.ACCESSIBILITY_READ,
+        "test_scrolls": SuiteCapability.ACCESSIBILITY_INTERACTION,
+        "test_taps": SuiteCapability.ACCESSIBILITY_INTERACTION,
+        "test_waits": SuiteCapability.ACCESSIBILITY_INTERACTION,
     }
     ALL_TESTS = sorted(REQUIREMENTS)
 
@@ -869,6 +1088,65 @@ class SuiteCapabilityTests(unittest.TestCase):
                 self.assertRaisesRegex(HarnessError, "not one of"),
             ):
                 suite_capability()
+
+
+class CapabilityCheckTests(unittest.TestCase):
+    class Suite(IdbEndToEndTestCase):
+        capabilities = {"case_reads": SuiteCapability.ACCESSIBILITY_READ}
+
+        async def case_reads(self) -> None:
+            pass
+
+        async def case_unowned(self) -> None:
+            pass
+
+    class Unrestricted(IdbEndToEndTestCase):
+        async def case_any(self) -> None:
+            pass
+
+    @staticmethod
+    def at(capability: SuiteCapability) -> mock._patch_dict:
+        return mock.patch.dict(os.environ, {SUITE_CAPABILITY_ENV: capability.value})
+
+    def test_a_test_the_suite_supports_runs(self) -> None:
+        with self.at(SuiteCapability.ACCESSIBILITY_READ):
+            self.Suite("case_reads").skip_without_capability()
+
+    def test_a_test_the_suite_does_not_support_is_skipped(self) -> None:
+        with (
+            self.at(SuiteCapability.COMPANION_PROCESS),
+            self.assertRaisesRegex(
+                unittest.SkipTest, "case_reads requires accessibility-read capability"
+            ),
+        ):
+            self.Suite("case_reads").skip_without_capability()
+
+    def test_a_test_missing_from_its_classs_table_is_an_error(self) -> None:
+        with self.assertRaisesRegex(
+            HarnessError, "No suite capability owns Suite.case_unowned"
+        ):
+            self.Suite("case_unowned").skip_without_capability()
+
+    def test_a_class_without_a_table_runs_at_any_capability(self) -> None:
+        with self.at(SuiteCapability.COMPANION_PROCESS):
+            self.Unrestricted("case_any").skip_without_capability()
+
+
+class WaitOrFailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_wait_that_ends_returns_what_the_poll_returned(self) -> None:
+        async def ready() -> str:
+            return "found"
+
+        self.assertEqual(
+            await HarnessCaseStub().wait_or_fail("Nothing", 1.0, ready), "found"
+        )
+
+    async def test_a_wait_that_runs_out_fails_the_test(self) -> None:
+        async def never() -> None:
+            raise NotReady("still waiting")
+
+        with self.assertRaisesRegex(Failed, "Nothing within 0s: still waiting"):
+            await HarnessCaseStub().wait_or_fail("Nothing", 0.0, never)
 
 
 class SharedCompanionReadinessTests(unittest.IsolatedAsyncioTestCase):
@@ -1114,10 +1392,13 @@ class FailureReportingTests(unittest.TestCase):
 
 class CommandTestCaseStub(HarnessCaseStub):
     idb = IdbEndToEndTestCase.idb
+    _run_once = IdbEndToEndTestCase._run_once
     idb_expect_failure = IdbEndToEndTestCase.idb_expect_failure
     fail_or_skip_for = IdbEndToEndTestCase.fail_or_skip_for
     run_client = IdbEndToEndTestCase.run_client
     _command_fields = IdbEndToEndTestCase._command_fields
+    _run_traced = IdbEndToEndTestCase._run_traced
+    idb_repl = IdbEndToEndTestCase.idb_repl
 
 
 class ExpectedFailureTest(unittest.IsolatedAsyncioTestCase):
@@ -1205,6 +1486,10 @@ class DeadlineAfter:
         return self
 
     @property
+    def remaining(self) -> float:
+        return 1.0 if self.checks >= 0 else 0.0
+
+    @property
     def passed(self) -> bool:
         self.checks -= 1
         return self.checks < 0
@@ -1252,6 +1537,23 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, SUCCEEDED)
         self.assertEqual(run.await_count, 2)
 
+    async def test_one_attempt_disables_even_nothing_written_retries(self) -> None:
+        for args in (
+            ("ui", "tap", "200", "90"),
+            ("send-notification", "com.apple.news", "{}"),
+        ):
+            with self.subTest(args=args):
+                outcome, run, recording = await self.attempt(
+                    args,
+                    [ELEMENT_MOVED, SUCCEEDED],
+                    retry_transient_answers=False,
+                    step="One attempt",
+                )
+                self.assertIsInstance(outcome, Failed)
+                self.assertIn("nothing was written", str(outcome))
+                run.assert_awaited_once()
+                self.assertEqual(recording.command.call_count, 1)
+
     async def test_a_tap_the_application_did_not_answer_is_not_repeated(
         self,
     ) -> None:
@@ -1265,12 +1567,8 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_read_before_the_tree_was_ready(self) -> None:
         outcome, run, _ = await self.attempt(DESCRIBE_ALL, [NOT_READY, SUCCEEDED])
 
-        # BUG: a read that found no translation object fails on its first
-        # attempt, though nothing ran and the next read answers. Flipped in
-        # the following commit.
-        self.assertIsInstance(outcome, Failed)
-        self.assertIn("No translation object", str(outcome))
-        self.assertEqual(run.await_count, 1)
+        self.assertEqual(outcome, SUCCEEDED)
+        self.assertEqual(run.await_count, 2)
 
     async def test_a_tap_before_the_tree_was_ready_is_not_repeated(self) -> None:
         outcome, run, _ = await self.attempt(TAP, [NOT_READY, SUCCEEDED])
@@ -1308,6 +1606,476 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(outcome, SUCCEEDED)
         self.assertEqual(steps, [None, "Set the search field's value"])
+
+
+class ReplStepTests(unittest.IsolatedAsyncioTestCase):
+    def case(self, repl_path: Path | None) -> CommandTestCaseStub:
+        case = CommandTestCaseStub()
+        case.environment.repl_path = repl_path
+        case.recording = mock.Mock(spec=Recording)
+        case.transcript = Transcript(rules=())
+        return case
+
+    async def test_a_repl_step_runs_against_the_companion_and_publishes_without_it(
+        self,
+    ) -> None:
+        case = self.case(Path("/tmp/idb-repl"))
+        run = mock.AsyncMock(return_value=SUCCEEDED)
+
+        with mock.patch.object(harness, "run", new=run):
+            await case.idb_repl("app", "print(1)", step="Print from the app")
+
+        self.assertEqual(
+            run.await_args.args[0],
+            ["/tmp/idb-repl", "app", "--companion", "/tmp/companion.sock", "print(1)"],
+        )
+        finished = [
+            call.kwargs
+            for call in case.recording.event.call_args_list
+            if call.args == ("command_finished",)
+        ]
+        self.assertEqual(finished[0]["argv"], ["idb-repl", "app", "print(1)"])
+        self.assertEqual(finished[0]["step"], "Print from the app")
+
+    async def test_a_failed_repl_step_fails_the_test(self) -> None:
+        case = self.case(Path("/tmp/idb-repl"))
+
+        with mock.patch.object(harness, "run", new=mock.AsyncMock(return_value=FAILED)):
+            with self.assertRaises(Failed):
+                await case.idb_repl("app", "print(1)")
+
+    async def test_a_repl_step_without_a_repl_is_an_error(self) -> None:
+        case = self.case(None)
+
+        with self.assertRaisesRegex(HarnessError, IDB_E2E_REPL_PATH_ENV):
+            await case.idb_repl("app", "print(1)")
+
+
+BANNER = Query("ShortLook.Platter.Content.Seamless")
+SCREEN = {"width": 402.0, "height": 874.0}
+
+
+def read(*ys: float, identifier: str = BANNER.value) -> Completed:
+    """A complete read of the banner, with one element at each y given."""
+    return Completed(
+        0,
+        json.dumps(
+            {
+                "backend": "axbridge-exclusive",
+                "screen": SCREEN,
+                "elements": [
+                    {
+                        "identifier": identifier,
+                        "type": "Other",
+                        "label": "Breaking",
+                        "frame": {"x": 9.0, "y": y, "width": 384.0, "height": 88.0},
+                    }
+                    for y in ys
+                ],
+            }
+        ).encode(),
+        b"",
+    )
+
+
+NOT_REPORTED = Completed(
+    1,
+    b"",
+    b'found no element whose AXUniqueId contains "ShortLook.Platter.Content.Seamless"\n',
+)
+
+
+class WaitCaseStub(CommandTestCaseStub):
+    wait_for = IdbEndToEndTestCase.wait_for
+    tap_when_settled = IdbEndToEndTestCase.tap_when_settled
+    setup_idb = IdbEndToEndTestCase.setup_idb
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.environment.setup_idb_bin = Path("/tmp/setup-idb")
+
+
+class ElementWaitTests(unittest.IsolatedAsyncioTestCase):
+    """Waiting for an element through reads of it, and tapping where it settled."""
+
+    async def wait(
+        self,
+        answers: Sequence[Completed],
+        operation: Callable[[WaitCaseStub], Awaitable[object]],
+        deadline: DeadlineAfter | None = None,
+    ) -> tuple[object, mock.AsyncMock, mock.Mock]:
+        case = WaitCaseStub()
+        recording = mock.Mock(spec=Recording)
+        case.recording = recording
+        case.transcript = Transcript(rules=())
+        run = mock.AsyncMock(side_effect=answers)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(harness, "run", new=run))
+            stack.enter_context(
+                mock.patch.object(harness, "POLL_INTERVAL_SECONDS", new=0)
+            )
+            if deadline is not None:
+                stack.enter_context(
+                    mock.patch.object(harness, "Deadline", new=deadline)
+                )
+            try:
+                outcome = await operation(case)
+            except Failed as failed:
+                outcome = failed
+        return outcome, run, recording
+
+    def api(self, run: mock.AsyncMock, index: int) -> str:
+        """The accessibility api the command run at `index` asked for."""
+        argv = run.await_args_list[index].args[0]
+        return argv[argv.index("--api") + 1]
+
+    def commands(self, run: mock.AsyncMock) -> list[tuple[str, ...]]:
+        """The subcommand of every idb command run, after the companion address."""
+        return [
+            tuple(call.args[0][call.args[0].index("ui") :][:2])
+            for call in run.await_args_list
+        ]
+
+    async def test_an_element_that_is_not_there_yet_is_waited_for(self) -> None:
+        outcome, run, _ = await self.wait(
+            [NOT_REPORTED, read(92)], lambda case: case.wait_for(BANNER)
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_a_substring_match_sends_the_wait_to_the_whole_screen(
+        self,
+    ) -> None:
+        outcome, run, _ = await self.wait(
+            [
+                read(92, identifier=BANNER.value + ".Title"),
+                read(92, identifier=BANNER.value + ".Title"),
+                read(92),
+            ],
+            lambda case: case.wait_for(BANNER),
+        )
+
+        self.assertEqual(outcome.element["identifier"], BANNER.value)
+        # `ui describe` would keep answering with the element that shadows it.
+        self.assertEqual(
+            self.commands(run),
+            [("ui", "describe"), ("ui", "describe-all"), ("ui", "describe-all")],
+        )
+        self.assertEqual(self.api(run, 1), "axbridge")
+
+    async def test_a_match_on_a_label(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(Query("Breaking", MatchKey.LABEL)),
+        )
+
+        self.assertEqual(outcome.element["label"], "Breaking")
+        self.assertEqual(outcome.document["screen"], SCREEN)
+
+    async def test_an_element_partly_off_screen_is_not_on_screen(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_an_element_is_settled_once_reads_agree_on_its_frame(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(40), read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 4)
+
+    async def test_an_element_reported_twice_settles(self) -> None:
+        # The accessibility tree can report one element under two parents.
+        outcome, run, _ = await self.wait(
+            [read(92, 92), read(92, 92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 2)
+
+    async def test_an_element_that_leaves_between_reads_starts_settling_again(
+        self,
+    ) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92), NOT_REPORTED, read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(run.await_count, 4)
+
+    async def test_transient_answers_are_waited_through(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92), UNANSWERED, NOT_READY, read(92), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        # The reads either side of the transient answers are not two in a row.
+        self.assertEqual(run.await_count, 5)
+
+    async def test_an_unrelated_failure_fails_at_once(self) -> None:
+        outcome, run, _ = await self.wait(
+            [FAILED, read(92)], lambda case: case.wait_for(BANNER)
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertEqual(run.await_count, 1)
+
+    async def test_an_element_that_never_settles_fails_the_wait(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(-66), read(40), read(92)],
+            lambda case: case.wait_for(BANNER, until=Until.SETTLED),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn(f"{BANNER} was not settled on screen within", str(outcome))
+        self.assertIn("still moving", str(outcome))
+        self.assertEqual(run.await_count, 3)
+
+    async def test_a_single_match_off_screen_names_only_its_frame(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(900)] * 3,
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn("'y': 900", str(outcome))
+        self.assertNotIn("matching element", str(outcome))
+
+    async def test_several_matches_off_screen_are_told_apart(self) -> None:
+        outcome, _, _ = await self.wait(
+            [read(900, 1000)] * 3,
+            lambda case: case.wait_for(BANNER, until=Until.ON_SCREEN),
+            deadline=DeadlineAfter(2),
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertIn("not wholly on the screen", str(outcome))
+        self.assertIn("2 matching elements:", str(outcome))
+        self.assertIn(
+            '  frame: [1] {"height": 88.0, "width": 384.0, "x": 9.0, "y": 900}'
+            ' [2] {"height": 88.0, "width": 384.0, "x": 9.0, "y": 1000}',
+            str(outcome),
+        )
+
+    async def test_only_the_read_that_ends_the_wait_is_published(self) -> None:
+        _, _, recording = await self.wait(
+            [read(-66), read(92), read(92)],
+            lambda case: case.wait_for(
+                BANNER, until=Until.SETTLED, step="Read the banner"
+            ),
+        )
+
+        steps = [
+            call.kwargs.get("step")
+            for call in recording.event.call_args_list
+            if call.args == ("command_finished",)
+        ]
+        self.assertEqual(steps, [None, None, "Read the banner"])
+
+    async def test_each_read_describes_the_element_with_the_keys_asked_for_and_matched_on(
+        self,
+    ) -> None:
+        _, run, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(BANNER, keys=("AXLabel", "AXFrame")),
+        )
+
+        argv = run.await_args_list[0].args[0]
+        self.assertEqual(
+            argv[argv.index("ui") :],
+            [
+                "ui",
+                "describe",
+                BANNER.value,
+                "--match-key",
+                "AXUniqueId",
+                "--api",
+                "axbridge",
+                "--format",
+                "complete",
+                "--key",
+                "AXLabel",
+                "--key",
+                "AXFrame",
+                "--key",
+                "AXUniqueId",
+                "--key",
+                "frame",
+                "--json",
+            ],
+        )
+
+    async def test_a_narrowed_read_of_a_typed_query_reports_the_type(self) -> None:
+        outcome, run, _ = await self.wait(
+            [read(92)],
+            lambda case: case.wait_for(
+                Query("Breaking", MatchKey.LABEL, element_type="Other"),
+                keys=("AXLabel",),
+            ),
+        )
+
+        argv = run.await_args_list[0].args[0]
+        keys = [argv[i + 1] for i, argument in enumerate(argv) if argument == "--key"]
+        self.assertEqual(keys, ["AXLabel", "frame", "type"])
+        self.assertEqual(outcome.element["label"], "Breaking")
+
+    async def test_each_command_is_bounded_by_what_is_left_of_the_wait(
+        self,
+    ) -> None:
+        _, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait(), timeout=0),
+        )
+
+        timeouts = [call.kwargs["timeout"] for call in run.await_args_list]
+        self.assertEqual(
+            timeouts,
+            [1.0 + harness.MIN_READ_TIMEOUT_SECONDS, harness.MIN_READ_TIMEOUT_SECONDS],
+        )
+
+    async def test_ui_wait_finds_the_element_before_it_is_read(self) -> None:
+        outcome, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait()),
+        )
+
+        self.assertEqual(outcome.element["frame"]["y"], 92)
+        self.assertEqual(self.commands(run), [("ui", "wait"), ("ui", "describe")])
+        self.assertEqual(run.await_args_list[0].args[0][0], "/tmp/setup-idb")
+        self.assertEqual(self.api(run, 0), "axbridge")
+
+    async def test_ui_wait_can_find_the_element_through_another_api(self) -> None:
+        _, run, _ = await self.wait(
+            [SUCCEEDED, read(92)],
+            lambda case: case.wait_for(BANNER, lookup=UiWait(AccessibilityApi.AX)),
+        )
+
+        self.assertEqual(self.commands(run), [("ui", "wait"), ("ui", "describe")])
+        self.assertEqual(self.api(run, 0), "ax")
+        self.assertEqual(self.api(run, 1), "axbridge")
+
+    async def test_a_tap_goes_to_the_centre_of_the_settled_frame(self) -> None:
+        _, run, _ = await self.wait(
+            [read(-66), read(92), read(92), SUCCEEDED],
+            lambda case: case.tap_when_settled(BANNER, "--reason", "it is there"),
+        )
+
+        argv = run.await_args_list[-1].args[0]
+        self.assertEqual(
+            argv[argv.index("ui") :],
+            ["ui", "tap", "201", "136", "--reason", "it is there"],
+        )
+
+
+def screen(*elements: tuple[str, str, float]) -> Completed:
+    """A flat `ui describe-all` answer of (role, label, y) elements."""
+    return Completed(
+        0,
+        json.dumps(
+            [
+                {
+                    "role": role,
+                    "AXLabel": label,
+                    "frame": {"x": 63, "y": y, "width": 288, "height": 48},
+                }
+                for role, label, y in elements
+            ]
+        ).encode(),
+        b"",
+    )
+
+
+FIXTURE_SCREEN = screen(("AXButton", "General", 120))
+CAMERA_PROMPT = screen(
+    ("AXStaticText", "“ReplHost” would like to access the Camera.", 265),
+    ("AXButton", "Don’t Allow", 582),
+    ("AXButton", "Allow", 630),
+)
+PHOTOS_PROMPT = screen(
+    (
+        "AXStaticText",
+        "“WATestsHost” would like full access to your Photo Library.",
+        265,
+    ),
+    ("AXButton", "Limit Access…", 534),
+    ("AXButton", "Allow Full Access", 582),
+    ("AXButton", "Don’t Allow", 630),
+)
+
+
+class PromptCaseStub(CommandTestCaseStub):
+    setup_idb = IdbEndToEndTestCase.setup_idb
+    setup_deny_permission_prompts = IdbEndToEndTestCase.setup_deny_permission_prompts
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.environment.setup_idb_bin = Path("/tmp/setup-idb")
+
+
+class PermissionPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def deny(
+        self, answers: Sequence[Completed]
+    ) -> tuple[list[list[str]], mock.Mock]:
+        case = PromptCaseStub()
+        recording = mock.Mock(spec=Recording)
+        case.recording = recording
+        run = mock.AsyncMock(side_effect=answers)
+        with (
+            mock.patch.object(harness, "run", new=run),
+            mock.patch.object(harness, "POLL_INTERVAL_SECONDS", new=0),
+        ):
+            await case.setup_deny_permission_prompts()
+        commands = [
+            call.args[0][call.args[0].index("ui") :] for call in run.await_args_list
+        ]
+        return commands, recording
+
+    async def test_a_screen_without_a_prompt_is_left_alone(self) -> None:
+        commands, recording = await self.deny([FIXTURE_SCREEN])
+
+        self.assertEqual(commands, [["ui", "describe-all", "--json"]])
+        recording.event.assert_not_called()
+
+    async def test_a_prompt_is_denied_until_it_is_gone(self) -> None:
+        commands, recording = await self.deny(
+            [CAMERA_PROMPT, Completed(0, b"", b""), FIXTURE_SCREEN]
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                ["ui", "describe-all", "--json"],
+                ["ui", "tap", "207", "606"],
+                ["ui", "describe-all", "--json"],
+            ],
+        )
+        recording.event.assert_called_once_with(
+            "permission_prompt_denied",
+            labels=[
+                "“ReplHost” would like to access the Camera.",
+                "Don’t Allow",
+                "Allow",
+            ],
+        )
+
+    async def test_a_photos_prompt_is_denied_not_given_full_access(self) -> None:
+        commands, _ = await self.deny(
+            [PHOTOS_PROMPT, Completed(0, b"", b""), FIXTURE_SCREEN]
+        )
+
+        self.assertEqual(commands[1], ["ui", "tap", "207", "654"])
 
 
 class CompanionLifecycleTests(unittest.TestCase):
@@ -1429,19 +2197,25 @@ class DeadCompanionStopsTheSuiteTests(unittest.TestCase):
         self.assertTrue(result.shouldStop)
 
 
-def reading(listapps: Completed, plutil: Completed) -> Run:
-    """Return canned listapps and plutil responses."""
+def reading(listapps: Completed, plutil: Completed | Exception) -> Run:
+    """Return canned listapps and plutil responses, raising a plutil exception."""
 
     async def run(
         argv: Sequence[str], timeout: float, stdin: bytes | None = None
     ) -> Completed:
-        return plutil if argv[0] == "plutil" else listapps
+        if argv[0] != "plutil":
+            return listapps
+        if isinstance(plutil, Exception):
+            raise plutil
+        return plutil
 
     return run
 
 
 class InstalledBundleIdsTests(unittest.IsolatedAsyncioTestCase):
-    async def bundle_ids(self, listapps: Completed, plutil: Completed) -> set[str]:
+    async def bundle_ids(
+        self, listapps: Completed, plutil: Completed | Exception
+    ) -> set[str]:
         with mock.patch.object(harness, "run", reading(listapps, plutil)):
             return await Simctl("UDID", Path("/device-set")).installed_bundle_ids()
 
@@ -1463,6 +2237,15 @@ class InstalledBundleIdsTests(unittest.IsolatedAsyncioTestCase):
             await self.bundle_ids(Completed(0, LISTAPPS_PLIST, b""), FAILED)
 
         self.assertIn("could not be converted to JSON", str(raised.exception))
+
+    async def test_a_hung_plutil_is_an_error(self) -> None:
+        hung = CommandTimedOut("plutil -convert json -o - - did not finish within 60s")
+
+        with self.assertRaises(HarnessError) as raised:
+            await self.bundle_ids(Completed(0, LISTAPPS_PLIST, b""), hung)
+
+        self.assertEqual(str(raised.exception), str(hung))
+        self.assertNotIsInstance(raised.exception, CommandTimedOut)
 
 
 class RunningBundleIdsTests(unittest.TestCase):
@@ -1548,6 +2331,85 @@ class WaitUntilTests(unittest.IsolatedAsyncioTestCase):
             await wait_until("Never", 60.0, poll)
 
         self.assertEqual(str(raised.exception), "the companion is gone")
+
+
+class AppCaseStub(HarnessCaseStub):
+    wait_for_app = IdbEndToEndTestCase.wait_for_app
+
+    def __init__(
+        self,
+        running: Sequence[set[str] | Exception] = (),
+        installed: Sequence[set[str] | Exception] = (),
+    ) -> None:
+        super().__init__()
+        self.simctl = SimpleNamespace(
+            running_bundle_ids=mock.AsyncMock(side_effect=running),
+            installed_bundle_ids=mock.AsyncMock(side_effect=installed),
+        )
+
+
+@mock.patch.object(harness, "POLL_INTERVAL_SECONDS", 0.0)
+class AppWaitTests(unittest.IsolatedAsyncioTestCase):
+    """Waiting for an app to reach a state simctl reports."""
+
+    async def test_running_is_waited_for_until_launchctl_lists_it(self) -> None:
+        case = AppCaseStub(running=[set(), {"com.example.app"}])
+
+        await case.wait_for_app("com.example.app", AppState.RUNNING)
+
+        self.assertEqual(case.simctl.running_bundle_ids.await_count, 2)
+        case.simctl.installed_bundle_ids.assert_not_awaited()
+
+    async def test_stopped_is_waited_for_until_launchctl_no_longer_lists_it(
+        self,
+    ) -> None:
+        case = AppCaseStub(running=[{"com.example.app"}, {"com.example.other"}])
+
+        await case.wait_for_app("com.example.app", AppState.STOPPED)
+
+        self.assertEqual(case.simctl.running_bundle_ids.await_count, 2)
+
+    async def test_installed_and_absent_read_the_installed_apps(self) -> None:
+        case = AppCaseStub(installed=[set(), {"com.example.app"}, set()])
+
+        await case.wait_for_app("com.example.app", AppState.INSTALLED)
+        await case.wait_for_app("com.example.app", AppState.ABSENT)
+
+        self.assertEqual(case.simctl.installed_bundle_ids.await_count, 3)
+        case.simctl.running_bundle_ids.assert_not_awaited()
+
+    async def test_a_timeout_fails_the_test_with_what_simctl_last_reported(
+        self,
+    ) -> None:
+        case = AppCaseStub(running=[{"com.example.app"}])
+
+        with self.assertRaises(Failed) as failed:
+            await case.wait_for_app("com.example.app", AppState.STOPPED, timeout=0.0)
+
+        self.assertEqual(
+            str(failed.exception),
+            "com.example.app did not become stopped within 0s: "
+            "simctl reports it running",
+        )
+
+    async def test_a_simctl_failure_fails_the_test_at_once(self) -> None:
+        case = AppCaseStub(
+            installed=[HarnessError("simctl listapps failed (rc=1): boom"), set()]
+        )
+
+        with self.assertRaises(Failed) as failed:
+            await case.wait_for_app("com.example.app", AppState.INSTALLED)
+
+        self.assertEqual(str(failed.exception), "simctl listapps failed (rc=1): boom")
+        self.assertEqual(case.simctl.installed_bundle_ids.await_count, 1)
+
+    async def test_a_simctl_poll_that_timed_out(self) -> None:
+        timed_out = "xcrun simctl spawn UDID launchctl list did not finish within 60s"
+        case = AppCaseStub(running=[CommandTimedOut(timed_out), {"com.example.app"}])
+
+        await case.wait_for_app("com.example.app", AppState.RUNNING)
+
+        self.assertEqual(case.simctl.running_bundle_ids.await_count, 2)
 
 
 class EnvironmentSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -1671,7 +2533,7 @@ class UnavailableRecordingTests(unittest.IsolatedAsyncioTestCase):
                         for line in Path(recording.trace.name).read_text().splitlines()
                     ]
                 finally:
-                    recording.trace.close()
+                    recording.close_logs()
         self.assertFalse(recording.ready)
         self.assertIn("exited with 1", recording.error)
         command = next(event for event in events if event["event"] == "command_started")
@@ -1791,6 +2653,123 @@ class BinaryPathTests(unittest.IsolatedAsyncioTestCase):
             await self.resolve(absent)
 
 
+class GuestRPCLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.process = mock.Mock(spec=asyncio.subprocess.Process)
+        self.process.returncode = None
+        self.process.wait = mock.AsyncMock(side_effect=self.reap)
+
+        async def create_process(*args, **kwargs):
+            socket_path = Path(args[args.index("serve") + 1])
+            self.addCleanup(shutil.rmtree, socket_path.parent, ignore_errors=True)
+            self.addCleanup(kwargs["stdout"].close)
+            self.addCleanup(kwargs["stderr"].close)
+            return self.process
+
+        self.create = self.enterContext(
+            mock.patch.object(
+                asyncio, "create_subprocess_exec", side_effect=create_process
+            )
+        )
+        self.connect = self.enterContext(
+            mock.patch.object(asyncio, "open_unix_connection")
+        )
+        self.test = SimpleNamespace(
+            environment=SimpleNamespace(
+                guest_binary=Path("/package/Resources/SimulatorFrameworkBridge-iOS")
+            ),
+            simctl=Simctl("test-udid", Path("/simulators")),
+            udid="test-udid",
+            assertEqual=self.assertEqual,
+            assertGreater=self.assertGreater,
+            assertLessEqual=self.assertLessEqual,
+            assertFalse=self.assertFalse,
+        )
+
+    async def reap(self) -> int:
+        self.process.returncode = 0
+        return 0
+
+    def captured_resources(self) -> tuple[Path, io.BufferedRandom, io.BufferedRandom]:
+        arguments = self.create.call_args.args
+        socket_path = Path(arguments[arguments.index("serve") + 1])
+        stdout = self.create.call_args.kwargs["stdout"]
+        stderr = self.create.call_args.kwargs["stderr"]
+        return socket_path, stdout, stderr
+
+    def assert_no_signals(self) -> None:
+        self.process.kill.assert_not_called()
+        self.process.terminate.assert_not_called()
+        self.process.send_signal.assert_not_called()
+
+    async def test_startup_failure_reaps_without_a_connected_writer(self) -> None:
+        original = RuntimeError("socket setup failed")
+        self.connect.side_effect = original
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                self.fail("a failed startup must not enter the context")
+
+        self.assertIs(raised.exception, original)
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertFalse(socket_path.parent.exists())
+        self.assertTrue(stdout.closed)
+        self.assertTrue(stderr.closed)
+        arguments = self.create.call_args.args
+        self.assertEqual(arguments[arguments.index("--startup-timeout") + 1], "10")
+        self.assertEqual(arguments[arguments.index("--idle-timeout") + 1], "120")
+        self.assertEqual(arguments[arguments.index("--exit-on-disconnect") + 1], "1")
+
+    async def test_startup_failure_keeps_the_original_error_when_reaping_fails(
+        self,
+    ) -> None:
+        original = RuntimeError("socket setup failed")
+        self.connect.side_effect = original
+        self.process.wait.side_effect = asyncio.TimeoutError
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                self.fail("a failed startup must not enter the context")
+
+        self.assertIs(raised.exception, original)
+        self.assertIn("retaining its socket directory", " ".join(original.__notes__))
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertTrue(socket_path.parent.exists())
+        self.assertFalse(stdout.closed)
+        self.assertFalse(stderr.closed)
+
+    async def test_body_failure_survives_disconnect_cleanup_failure(self) -> None:
+        reader = asyncio.StreamReader()
+        payload = json.dumps(
+            {"version": 1, "id": "test-1", "result": {"exitCode": 0, "values": []}}
+        ).encode()
+        reader.feed_data(len(payload).to_bytes(4, "big") + payload)
+        writer = mock.Mock(spec=asyncio.StreamWriter)
+        writer.drain = mock.AsyncMock()
+        writer.wait_closed = mock.AsyncMock()
+        self.connect.return_value = reader, writer
+        self.process.wait.side_effect = asyncio.TimeoutError
+        original = RuntimeError("test assertion failed")
+
+        with self.assertRaises(RuntimeError) as raised:
+            async with harness.GuestRPC(self.test, persistent=True):
+                raise original
+
+        self.assertIs(raised.exception, original)
+        self.assertIn("retaining its socket directory", " ".join(original.__notes__))
+        writer.close.assert_called_once_with()
+        self.process.wait.assert_awaited_once_with()
+        self.assert_no_signals()
+        socket_path, stdout, stderr = self.captured_resources()
+        self.assertTrue(socket_path.parent.exists())
+        self.assertFalse(stdout.closed)
+        self.assertFalse(stderr.closed)
+
+
 class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_preserves_binary_output_input_environment_and_exit_code(
         self,
@@ -1861,7 +2840,7 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(leaked, [])
 
     async def test_reports_timeout_for_a_running_process(self) -> None:
-        with self.assertRaisesRegex(HarnessError, "did not finish within"):
+        with self.assertRaisesRegex(CommandTimedOut, "did not finish within"):
             await harness.run(
                 [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5
             )
@@ -1919,9 +2898,531 @@ class SubprocessTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 asyncio, "create_subprocess_exec", side_effect=create_ready_process
             )
         )
-        with self.assertRaisesRegex(HarnessError, "did not finish within"):
+        with self.assertRaisesRegex(CommandTimedOut, "did not finish within"):
             await asyncio.wait_for(
                 harness.run([sys.executable, "-c", parent], timeout=0.5), timeout=12
             )
         self.assertTrue(ready.is_file(), "Descendant must be spawned before timeout")
         await asyncio.wait_for(wait_for_file(exited), timeout=10)
+
+
+class HostLoadTests(unittest.TestCase):
+    def test_process_snapshots_are_opt_in_and_hosted_ci_only(self) -> None:
+        environment = {
+            "IDB_E2E_PROCESS_SNAPSHOTS": "1",
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": "macOS",
+        }
+        for missing in environment:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        key: value
+                        for key, value in environment.items()
+                        if key != missing
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(harness, "sample_top", return_value=b"top\n"),
+                mock.patch.object(harness.subprocess, "run") as run,
+            ):
+                self.assertEqual(harness.sample_host_load(), b"top\n")
+                run.assert_not_called()
+
+    def test_process_snapshot_fields_and_failures(self) -> None:
+        environment = {
+            "IDB_E2E_PROCESS_SNAPSHOTS": "1",
+            "GITHUB_ACTIONS": "true",
+            "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": "macOS",
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(harness, "sample_top", return_value=b"top\n"),
+            mock.patch.object(
+                harness.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=b"PID PPID COMM\n"
+                ),
+            ) as run,
+        ):
+            self.assertIn(b"PID PPID COMM", harness.sample_host_load())
+            run.assert_called_once_with(
+                ["ps", "-A", "-o", "pid,ppid,pcpu,pmem,rss,state,comm"],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
+            )
+            for error in (
+                OSError("private detail"),
+                subprocess.TimeoutExpired("ps", 5),
+            ):
+                run.side_effect = error
+                output = harness.sample_host_load()
+                self.assertIn(type(error).__name__.encode(), output)
+                self.assertNotIn(b"private detail", output)
+            run.side_effect = None
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout=b"", stderr=b"private detail"
+            )
+            self.assertIn(b"ps failed (rc=1)", harness.sample_host_load())
+            self.assertNotIn(b"private detail", harness.sample_host_load())
+
+    def test_keeps_the_second_of_tops_two_samples(self) -> None:
+        output = b"Processes: 1 total\nfirst\nProcesses: 2 total\nsecond\n"
+
+        self.assertEqual(last_top_sample(output), b"Processes: 2 total\nsecond\n")
+
+    def test_output_without_a_sample_is_kept_whole(self) -> None:
+        self.assertEqual(last_top_sample(b"unexpected\n"), b"unexpected\n")
+
+    def test_a_hung_top_is_recorded(self) -> None:
+        hung = subprocess.TimeoutExpired(["top"], 30.0)
+
+        with mock.patch.object(harness.subprocess, "run", side_effect=hung):
+            self.assertEqual(sample_top(), b"top did not finish within 30s\n")
+
+    def test_a_failing_top_is_recorded(self) -> None:
+        failed = subprocess.CompletedProcess(["top"], 1, b"", b"boom")
+
+        with mock.patch.object(harness.subprocess, "run", return_value=failed):
+            self.assertEqual(sample_top(), b"top failed (rc=1): boom\n")
+
+    def test_records_timestamped_samples_until_stopped(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "host-load.txt"
+        self.addCleanup(shutil.rmtree, path.parent)
+        taken = iter(range(1000))
+
+        host_load = HostLoad(
+            path, sample=lambda: f"sample {next(taken)}\n".encode(), interval=0.01
+        )
+        deadline = time.monotonic() + 10
+        while path.read_bytes().count(b"=== ") < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        host_load.stop()
+        recorded = path.read_bytes()
+        time.sleep(0.05)
+
+        self.assertEqual(path.read_bytes(), recorded)
+        lines = recorded.decode().splitlines()
+        self.assertGreaterEqual(len(lines), 4)
+        for index, line in enumerate(lines):
+            if index % 2 == 0:
+                self.assertRegex(line, r"^=== \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            else:
+                self.assertEqual(line, f"sample {index // 2}")
+
+    def test_keeps_sampling_after_a_write_fails(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "host-load.txt"
+        self.addCleanup(shutil.rmtree, path.parent)
+        taken = iter(range(1000))
+
+        def sample() -> bytes:
+            index = next(taken)
+            if index == 0:
+                path.unlink()
+                path.mkdir()
+            elif index == 1:
+                path.rmdir()
+            return f"sample {index}\n".encode()
+
+        def recorded_so_far() -> bytes:
+            try:
+                return path.read_bytes()
+            except OSError:
+                # The sampler can swap the file for a directory at any moment.
+                return b""
+
+        with self.assertLogs(harness._LOGGER, "WARNING") as logs:
+            host_load = HostLoad(path, sample=sample, interval=0.01)
+            deadline = time.monotonic() + 10
+            while b"sample 2" not in recorded_so_far() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            host_load.stop()
+
+        recorded = path.read_bytes()
+        self.assertNotIn(b"sample 0", recorded)
+        self.assertIn(b"sample 1\n", recorded)
+        self.assertIn(b"sample 2\n", recorded)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("Could not record host load", logs.output[0])
+
+
+class StopPushServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.simctl = Simctl("UDID", Path("/devices"))
+
+    async def test_boots_out_apsd_inside_the_simulator(self) -> None:
+        execute = mock.AsyncMock(return_value=Completed(0, b"", b""))
+
+        with mock.patch.object(harness, "run", new=execute):
+            await stop_push_service(self.simctl)
+
+        execute.assert_awaited_once_with(
+            [
+                "xcrun",
+                "simctl",
+                "--set",
+                "/devices",
+                "spawn",
+                "UDID",
+                "launchctl",
+                "bootout",
+                "system/com.apple.apsd",
+            ],
+            timeout=30.0,
+        )
+
+    async def test_a_failed_bootout_is_a_warning(self) -> None:
+        execute = mock.AsyncMock(return_value=Completed(3, b"", b"No such process"))
+
+        with (
+            mock.patch.object(harness, "run", new=execute),
+            self.assertLogs(harness._LOGGER, "WARNING") as logs,
+        ):
+            await stop_push_service(self.simctl)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("(rc=3): No such process", logs.output[0])
+
+    async def test_a_hung_bootout_is_a_warning(self) -> None:
+        execute = mock.AsyncMock(side_effect=CommandTimedOut("launchctl hung"))
+
+        with (
+            mock.patch.object(harness, "run", new=execute),
+            self.assertLogs(harness._LOGGER, "WARNING") as logs,
+        ):
+            await stop_push_service(self.simctl)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("launchctl hung", logs.output[0])
+
+
+class NotificationBannerTests(unittest.IsolatedAsyncioTestCase):
+    base = datetime(2026, 10, 5, 17, 9, 30)
+    digest = "B1B5-AEDC"
+    request_id = "0AE59510-20A1-45A9-A68B-B99078934C69"
+
+    def setUp(self) -> None:
+        self.elapsed = 0.0
+        self.chunks: list[tuple[float, bytes]] = []
+        self.read_bytes = 0
+        self.log = SimpleNamespace(
+            returncode=None,
+            stdout_capture=SimpleNamespace(total_bytes=0),
+            read_some=self.read_some,
+        )
+        self.banner = notification_banner.NotificationBanner(
+            self.log, "com.apple.news", now=self.now
+        )
+
+    def now(self) -> datetime:
+        return self.base + timedelta(seconds=self.elapsed)
+
+    def line(self, at: float, message: str) -> bytes:
+        date = self.base + timedelta(seconds=at)
+        return (
+            f"{date:%Y-%m-%d %H:%M:%S}.{date.microsecond // 1000:03d} "
+            f"Df SpringBoard[1871:12a43] {message}\n"
+        ).encode()
+
+    def adding(
+        self, at: float, digest: str = "B1B5-AEDC", bundle: str = "com.apple.news"
+    ) -> bytes:
+        return self.line(
+            at, f"[{bundle}] Adding notification request {digest} to destinations: Default"
+        )
+
+    def request(self, at: float, request_id: str | None = None) -> bytes:
+        return self.line(
+            at, f"attributedBody is empty for request {self.digest} "
+            "<UNNotificationRequest: 0x11726f2d0; "
+            f"identifier: {request_id or self.request_id}, content: <UNNotificationContent:>"
+        )
+
+    def appearance(
+        self, at: float, phase: str = "did appear", digest: str = "B1B5-AEDC",
+        request_id: str | None = None,
+    ) -> bytes:
+        return self.line(
+            at, f"Presentable {phase} as banner: "
+            "<SBNotificationPresentableViewController: 0x11aa48000; "
+            "requesterIdentifier: com.apple.UserNotificationsKit; "
+            f"requestIdentifier: {request_id or self.request_id}; "
+            f"viewController: self; bannerAppearState: appearing; logDigest: {digest}>"
+        )
+
+    async def read_some(self, timeout: float) -> bytes:
+        if not self.chunks:
+            raise HarnessError("log produced no further evidence")
+        at, data = self.chunks.pop(0)
+        self.elapsed = at
+        self.read_bytes += len(data)
+        self.log.stdout_capture.total_bytes = max(
+            self.log.stdout_capture.total_bytes, self.read_bytes
+        )
+        return data
+
+    def deadline(self, at: float = 16.0) -> object:
+        owner = self
+
+        class FakeDeadline:
+            @property
+            def remaining(self) -> float:
+                return at - owner.elapsed
+
+            @property
+            def passed(self) -> bool:
+                return self.remaining <= 0
+
+        return FakeDeadline()
+
+    async def test_delayed_presentation_and_split_chunks_share_deadline(self) -> None:
+        self.chunks = [
+            (0.1, self.line(0.1, "[com.apple.runningboard:monitor] Received state update"))
+        ]
+        await self.banner.wait_for_stream(15)
+        self.banner.begin_send()
+        adding = self.adding(0.2)
+        self.chunks = [
+            (0.2, adding[:40]), (0.2, adding[40:]),
+            (0.3, self.request(0.3)), (9.6, self.appearance(9.6)),
+        ]
+        deadline = self.deadline(16.1)
+        await self.banner.wait_for_presentation(deadline)
+        self.assertEqual(self.banner.request_id, self.request_id)
+        self.assertAlmostEqual(deadline.remaining, 6.5)
+
+    async def test_headers_and_stale_events_do_not_prove_stream_readiness(self) -> None:
+        self.chunks = [(0.1,
+            b"Filtering the log data using predicate\nTimestamp Ty Process[PID:TID]\n"
+            + self.line(-1, "old event")
+        )]
+        with self.assertRaisesRegex(HarnessError, "no further evidence"):
+            await self.banner.wait_for_stream(15)
+        self.assertFalse(self.banner.streaming)
+
+    async def test_stale_unrelated_and_will_appear_do_not_satisfy_readiness(self) -> None:
+        self.banner._feed(self.adding(0, "1111-2222"))
+        self.elapsed = 1
+        self.banner.begin_send()
+        self.chunks = [(2,
+            self.adding(0.5) + self.appearance(0.6)
+            + self.adding(1.1, bundle="com.other.app")
+            + self.appearance(1.2, digest="1111-2222")
+            + self.adding(1.5) + self.request(1.6)
+            + self.appearance(1.7, phase="will appear")
+        )]
+        with self.assertRaisesRegex(HarnessError, "no further evidence"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.assertIsNone(self.banner.appeared_at)
+
+    async def test_ambiguous_news_requests_fail_closed(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(1, self.adding(0.1) + self.adding(0.2, "1111-2222"))]
+        with self.assertRaisesRegex(HarnessError, "More than one"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_matching_digest_requires_matching_full_request_id(self) -> None:
+        for request in (b"", self.request(0.2, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")):
+            with self.subTest(request=request):
+                self.setUp()
+                self.banner.begin_send()
+                self.chunks = [(1, self.adding(0.1) + request + self.appearance(1))]
+                with self.assertRaisesRegex(HarnessError, "matching full request ID"):
+                    await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_buffered_dismissal_in_next_chunk_fails_before_returning(self) -> None:
+        self.banner.begin_send()
+        first = self.adding(0.1) + self.request(0.2) + self.appearance(1)
+        second = self.appearance(1.1, phase="will disappear")
+        self.chunks = [(1.2, first), (1.2, second)]
+        self.log.stdout_capture.total_bytes = len(first) + len(second)
+        with self.assertRaisesRegex(HarnessError, "dismissed"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_lost_events_and_terminated_stream_fail_closed(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(1, b"=== Messages dropped during live streaming ===\n")]
+        with self.assertRaisesRegex(HarnessError, "lost events"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.log.returncode = 1
+        self.chunks = [(1, self.adding(0.1) + self.request(0.2) + self.appearance(1))]
+        with self.assertRaisesRegex(HarnessError, "stopped streaming"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_backlogged_appearance_and_scheduler_delay_are_rejected(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(3, self.adding(0.1) + self.request(0.2) + self.appearance(1))]
+        with self.assertRaisesRegex(HarnessError, "stale"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.elapsed = 1.5
+        self.banner.require_current_presentation()
+        self.elapsed = 2.001
+        with self.assertRaisesRegex(HarnessError, "stale"):
+            self.banner.require_current_presentation()
+
+    async def test_expired_deadline_never_reads_more_events(self) -> None:
+        self.banner.begin_send()
+        self.elapsed = 16
+        self.chunks = [(16, self.adding(1))]
+        with self.assertRaisesRegex(HarnessError, "Timed out"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.assertEqual(len(self.chunks), 1)
+
+
+class NotificationDemoFlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.log_context = mock.MagicMock()
+        self.log_context.__aenter__ = mock.AsyncMock(return_value=object())
+        self.log_context.__aexit__ = mock.AsyncMock(return_value=False)
+        self.case = SimpleNamespace(
+            idb_process=mock.Mock(return_value=self.log_context),
+            idb=mock.AsyncMock(),
+            wait_for_app=mock.AsyncMock(),
+        )
+        self.banner = mock.Mock()
+        self.banner.wait_for_stream = mock.AsyncMock()
+        self.banner.wait_for_presentation = mock.AsyncMock()
+
+    async def run_demo(self) -> None:
+        with mock.patch.object(test_demos, "NotificationBanner", return_value=self.banner):
+            await test_demos.NotificationDemos.open_notification_banner(self.case, 200, 90)
+
+    async def test_single_coordinate_tap_and_exact_running_assertion(self) -> None:
+        await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.assertEqual(
+            self.case.idb.await_args_list[0].args[:2],
+            ("send-notification", "com.apple.news"),
+        )
+        tap = self.case.idb.await_args_list[1]
+        self.assertEqual(tap.args, ("ui", "tap", "200", "90"))
+        self.assertFalse(tap.kwargs["retry_transient_answers"])
+        self.assertFalse(
+            self.case.idb.await_args_list[0].kwargs["retry_transient_answers"]
+        )
+        self.assertGreater(tap.kwargs["timeout"], 0)
+        self.assertLessEqual(tap.kwargs["timeout"], 16)
+        self.case.wait_for_app.assert_awaited_once()
+        self.assertEqual(
+            self.case.wait_for_app.await_args.args, ("com.apple.news", AppState.RUNNING)
+        )
+        self.assertLessEqual(
+            self.case.wait_for_app.await_args.kwargs["timeout"], tap.kwargs["timeout"]
+        )
+        self.assertEqual(self.case.idb_process.call_args.kwargs["env"]["PYTHONUNBUFFERED"], "1")
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_missing_stream_evidence_does_not_send_or_tap(self) -> None:
+        self.banner.wait_for_stream.side_effect = HarnessError("no subscription evidence")
+        with self.assertRaisesRegex(HarnessError, "subscription"):
+            await self.run_demo()
+        self.case.idb.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_missing_presentation_fails_without_tap_and_closes_observer(self) -> None:
+        self.banner.wait_for_presentation.side_effect = HarnessError("never appeared")
+        with self.assertRaisesRegex(HarnessError, "never appeared"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 1)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_presentation_and_tap_consume_the_same_launch_budget(self) -> None:
+        elapsed = 0.0
+
+        class FakeDeadline:
+            def __init__(self, seconds: float) -> None:
+                self.at = elapsed + seconds
+
+            @property
+            def remaining(self) -> float:
+                return self.at - elapsed
+
+            @property
+            def passed(self) -> bool:
+                return self.remaining <= 0
+
+        async def present(deadline: Deadline) -> None:
+            nonlocal elapsed
+            elapsed = 9.6
+
+        async def command(*args: str, **kwargs: object) -> None:
+            nonlocal elapsed
+            if args[:2] == ("ui", "tap"):
+                elapsed += 1.0
+
+        self.banner.wait_for_presentation.side_effect = present
+        self.case.idb.side_effect = command
+        with mock.patch.object(test_demos, "Deadline", new=FakeDeadline):
+            await self.run_demo()
+        self.assertAlmostEqual(self.case.idb.await_args.kwargs["timeout"], 6.4)
+        self.assertAlmostEqual(
+            self.case.wait_for_app.await_args.kwargs["timeout"], 5.4
+        )
+
+    async def test_expired_budget_does_not_start_the_tap(self) -> None:
+        deadline = SimpleNamespace(remaining=16.0, passed=False)
+
+        async def present(*args: object) -> None:
+            deadline.remaining = -0.001
+            deadline.passed = True
+
+        self.banner.wait_for_presentation.side_effect = present
+        with mock.patch.object(test_demos, "Deadline", return_value=deadline):
+            with self.assertRaisesRegex(HarnessError, "expired before the tap"):
+                await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 1)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_tap_failure_is_not_retried_and_still_closes_observer(self) -> None:
+        self.case.idb.side_effect = [None, HarnessError("tap failed")]
+        with self.assertRaisesRegex(HarnessError, "tap failed"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_cleanup_failure_is_reported(self) -> None:
+        self.log_context.__aexit__.side_effect = HarnessError("cleanup failed")
+        with self.assertRaisesRegex(HarnessError, "cleanup failed"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+
+    async def test_outer_deadline_cancels_an_overlong_launch_poll(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stuck(*args: object, **kwargs: object) -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        async def expire(operation: Awaitable[None], *, timeout: float) -> None:
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 16)
+            task = asyncio.create_task(operation)
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            raise asyncio.TimeoutError
+
+        self.case.wait_for_app.side_effect = stuck
+        with mock.patch.object(test_demos.asyncio, "wait_for", new=expire):
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.run_demo()
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.log_context.__aexit__.assert_awaited_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

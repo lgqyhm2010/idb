@@ -41,6 +41,43 @@ class AccessibilityWaitResult:
         return self.found
 
 
+class QuiescenceState(Enum):
+    BUSY = "busy"
+    SETTLING = "settling"
+    QUIET = "quiet"
+
+
+@dataclass(frozen=True)
+class QuiescenceStateChanged:
+    pid: int
+    state: QuiescenceState
+    # Names of the signals left unanswered past the busy threshold; empty unless busy.
+    busy_signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuiescenceTouchesCompleted:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetChanged:
+    pid: int
+
+
+@dataclass(frozen=True)
+class QuiescenceTargetExited:
+    pid: int
+
+
+QuiescenceEvent = Union[
+    QuiescenceStateChanged,
+    QuiescenceTouchesCompleted,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+]
+
+
 class IdbException(Exception):
     pass
 
@@ -151,6 +188,10 @@ class HIDButtonType(Enum):
     LOCK = 3
     SIDE_BUTTON = 4
     SIRI = 5
+    PLAY_PAUSE = 6
+    VOLUME_UP = 7
+    VOLUME_DOWN = 8
+    EJECT = 9
 
 
 ConnectionDestination = Union[str, Address]
@@ -163,6 +204,8 @@ class CompanionInfo:
     pid: int | None
     address: Address
     metadata: LoggingMetadata = field(default_factory=dict)
+    supported_compressions: "frozenset[Compression]" = frozenset()
+    zstd_zip_streams: bool = False
 
 
 @dataclass(frozen=True)
@@ -331,6 +374,15 @@ class Screenshot(bytes):
 DeviceDetails = Mapping[str, Union[int, str]]
 
 
+def _json_default(value: object) -> object:
+    # asdict leaves sets and plain enums in place, and json encodes neither.
+    if isinstance(value, frozenset):
+        return sorted(value, key=str)
+    if isinstance(value, Enum):
+        return value.name
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 @dataclass(frozen=True)
 class TargetDescription:
     udid: str
@@ -349,7 +401,7 @@ class TargetDescription:
 
     @property
     def as_json(self) -> str:
-        return json.dumps(asdict(self))
+        return json.dumps(asdict(self), default=_json_default)
 
 
 @dataclass(frozen=True)
@@ -396,6 +448,22 @@ class AccessibilityMarker:
 # Selects an accessibility element to act on: a point or a marker (or None = the
 # whole screen / frontmost app). This union grows as accessibility commands land.
 AccessibilityTarget = Union[AccessibilityPoint, AccessibilityMarker]
+
+
+@dataclass(frozen=True)
+class AccessibilityApplication:
+    """A running application's whole tree, frontmost or not. When two apps
+    share the screen, "frontmost" names only one of them."""
+
+    bundle_id: str
+
+
+# What a read can target: an element to act on, or a whole named application.
+# Actions take AccessibilityTarget, since a whole application is not something
+# to tap.
+AccessibilityReadTarget = Union[
+    AccessibilityPoint, AccessibilityMarker, AccessibilityApplication
+]
 
 
 @dataclass(frozen=True)
@@ -494,6 +562,11 @@ class AccessibilityInfoOptions:
     # Compare `match` — and a marker, on a read — case-insensitively.
     ignore_case: bool = False
     filter: AccessibilityElementFilter | None = None
+    # Hit-test a point read on this display instead of the default active one: the unique
+    # id of any lit display from `idb list-displays`, or ACTIVE_DISPLAY for the
+    # lit integrated display. The point is in the display's interface
+    # orientation, as a touch aimed at it is. Only meaningful with a point target.
+    display: str | None = None
 
 
 class AccessibilityScrollDirection(Enum):
@@ -688,9 +761,27 @@ ACTIVE_DISPLAY = "active"
 @dataclass(frozen=True)
 class HIDDisplay:
     """Routes the touches after it in the same HID stream to one display's
-    touchscreen. An empty unique_id selects the active integrated display."""
+    touchscreen. A named display must be the active integrated display; an
+    empty unique_id selects it."""
 
     unique_id: str
+
+
+class HIDEdgeType(Enum):
+    NONE = 0
+    TOP = 1
+    LEFT = 2
+    BOTTOM = 3
+    RIGHT = 4
+
+
+@dataclass(frozen=True)
+class HIDEdge:
+    """Tags the touches after it in the same HID stream, swipes included, as
+    starting at a screen edge, which is what hands a drag to a system gesture
+    such as the home indicator. NONE clears it."""
+
+    edge: HIDEdgeType
 
 
 HIDEvent = Union[
@@ -702,6 +793,7 @@ HIDEvent = Union[
     HIDShake,
     HIDHinge,
     HIDDisplay,
+    HIDEdge,
 ]
 
 
@@ -998,6 +1090,10 @@ class Client(ABC):
         pass
 
     @abstractmethod
+    async def clear_delivered_notifications(self, bundle_id: str) -> None:
+        pass
+
+    @abstractmethod
     async def approve(
         self, bundle_id: str, permissions: set[Permission], scheme: str | None = None
     ) -> None:
@@ -1111,6 +1207,18 @@ class Client(ABC):
         duration: float | None = None,
         delta: int | None = None,
         display: str | None = None,
+        edge: HIDEdgeType | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def drag(
+        self,
+        points: list[tuple[float, float]],
+        duration: float = 1.0,
+        delta: float | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
     ) -> None:
         pass
 
@@ -1137,7 +1245,7 @@ class Client(ABC):
     @abstractmethod
     async def accessibility_info(
         self,
-        target: AccessibilityTarget | None,
+        target: AccessibilityReadTarget | None,
         options: AccessibilityInfoOptions,
     ) -> AccessibilityInfo:
         pass
@@ -1152,6 +1260,19 @@ class Client(ABC):
     ) -> bool:
         """Wait for a marker; return False on timeout and propagate other failures."""
         pass
+
+    @abstractmethod
+    async def accessibility_quiescence(
+        self,
+        pid: int | None = None,
+        bundle_id: str | None = None,
+        busy_threshold_ms: int | None = None,
+        quiet_window_ms: int | None = None,
+    ) -> AsyncGenerator[QuiescenceEvent, None]:
+        """Stream quiescence events for an application, or the frontmost one when
+        neither pid nor bundle_id is given. A None tunable takes the companion's default."""
+        # pyrefly: ignore [invalid-yield]
+        yield
 
     async def accessibility_wait_result(
         self,

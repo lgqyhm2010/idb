@@ -17,8 +17,32 @@ struct LogMethodHandler: @unchecked Sendable {
   let commandExecutor: IDBCommandExecutor
 
   func handle(request: Idb_LogRequest, responseStream: RPCWriter<Idb_LogResponse>, context: ServerContext) async throws {
-    let writingDone = AsyncPromise<Void>()
     let streamWriter = FIFOStreamWriter(stream: responseStream)
+    try await Self.tail(cancellation: context.cancellation, send: { try streamWriter.send($0) }) { consumer in
+      if request.source == .companion {
+        return try await commandExecutor.tail_companion_logs(consumer)
+      }
+      return try await target.log.tail(arguments: request.arguments, consumer: consumer)
+    }
+  }
+
+  /// Forwards the log `start` begins until the log ends, a write fails, or `cancellation` reports the RPC
+  /// cancelled, as it does when the client goes away. Only a write would otherwise notice the client is gone.
+  static func tail(
+    cancellation: ServerContext.RPCCancellationHandle,
+    send: @escaping @Sendable (Idb_LogResponse) throws -> Void,
+    start: @escaping @Sendable (any DataConsumer) async throws -> any LogOperation
+  ) async throws {
+    try await withRPCCancellation(cancellation) {
+      try await forward(send: send, start: start)
+    }
+  }
+
+  private static func forward(
+    send: @escaping @Sendable (Idb_LogResponse) throws -> Void,
+    start: (any DataConsumer) async throws -> any LogOperation
+  ) async throws {
+    let writingDone = AsyncPromise<Void>()
 
     let consumer = FBBlockDataConsumer.synchronousDataConsumer { data in
       if writingDone.isResolved {
@@ -28,18 +52,13 @@ struct LogMethodHandler: @unchecked Sendable {
         $0.output = data
       }
       do {
-        try streamWriter.send(response)
+        try send(response)
       } catch {
         writingDone.fail(error)
       }
     }
 
-    let operation: any LogOperation
-    if request.source == .companion {
-      operation = try await commandExecutor.tail_companion_logs(consumer)
-    } else {
-      operation = try await target.log.tail(arguments: request.arguments, consumer: consumer)
-    }
+    let operation = try await start(consumer)
 
     let observeWritingDone = Task<Void, Error> {
       try await writingDone.value

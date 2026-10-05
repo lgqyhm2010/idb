@@ -30,6 +30,8 @@ from idb.common.format import json_format_debugger_info
 from idb.common.gzip import drain_gzip_decompress, gunzip
 from idb.common.hid import (
     button_press_to_events,
+    drag_to_events,
+    from_edge,
     iterator_to_async_iterator,
     key_press_to_events,
     multi_tap_to_events,
@@ -51,6 +53,7 @@ from idb.common.types import (
     AccessibilityInfoOptions,
     AccessibilityMarker,
     AccessibilityPoint,
+    AccessibilityReadTarget,
     AccessibilityScrollDirection,
     AccessibilitySearchableKey,
     AccessibilitySearchDiagnostics,
@@ -76,6 +79,7 @@ from idb.common.types import (
     FileEntryInfo,
     FileListing,
     HIDButtonType,
+    HIDEdgeType,
     HIDEvent,
     HIDHinge,
     HIDOrientationType,
@@ -88,6 +92,12 @@ from idb.common.types import (
     LoggingMetadata,
     OnlyFilter,
     Permission,
+    QuiescenceEvent,
+    QuiescenceState,
+    QuiescenceStateChanged,
+    QuiescenceTargetChanged,
+    QuiescenceTargetExited,
+    QuiescenceTouchesCompleted,
     Screenshot,
     ScreenshotOptions,
     TargetDescription,
@@ -108,9 +118,12 @@ from idb.grpc.idb_grpc import CompanionServiceStub
 from idb.grpc.idb_pb2 import (
     AccessibilityActionRequest,
     AccessibilityActionResponse,
+    AccessibilityQuiescenceRequest,
+    AccessibilityQuiescenceResponse,
     AddMediaRequest,
     ANY as AnySetting,
     ApproveRequest,
+    ClearDeliveredNotificationsRequest,
     ClearKeychainRequest,
     ConnectRequest,
     ContactsClearRequest,
@@ -166,6 +179,7 @@ from idb.grpc.install import (
     generate_binary_chunks,
     generate_io_chunks,
     generate_requests,
+    select_stream_compression,
 )
 from idb.grpc.instruments import (
     instruments_drain_until_running,
@@ -224,6 +238,42 @@ COMPRESSION_MAP: dict[Compression, "Payload.Compression"] = {
     Compression.GZIP: Payload.GZIP,
     Compression.ZSTD: Payload.ZSTD,
 }
+
+
+_QUIESCENCE_STATES: dict[int, QuiescenceState] = {
+    AccessibilityQuiescenceResponse.BUSY: QuiescenceState.BUSY,
+    AccessibilityQuiescenceResponse.SETTLING: QuiescenceState.SETTLING,
+    AccessibilityQuiescenceResponse.QUIET: QuiescenceState.QUIET,
+}
+
+_QUIESCENCE_SIGNALS: dict[int, str] = {
+    AccessibilityQuiescenceResponse.RUN_LOOP_IDLE: "run_loop_idle",
+    AccessibilityQuiescenceResponse.ANIMATIONS_INACTIVE: "animations_inactive",
+}
+
+
+def _quiescence_event_from_grpc(
+    response: AccessibilityQuiescenceResponse,
+) -> QuiescenceEvent:
+    pid = response.pid
+    event = response.WhichOneof("event")
+    if event == "touches_completed":
+        return QuiescenceTouchesCompleted(pid=pid)
+    if event == "target_changed":
+        return QuiescenceTargetChanged(pid=pid)
+    if event == "target_exited":
+        return QuiescenceTargetExited(pid=pid)
+    if event != "state" or response.state.state not in _QUIESCENCE_STATES:
+        raise IdbException(f"The companion sent an unknown quiescence event {event}")
+    return QuiescenceStateChanged(
+        pid=pid,
+        state=_QUIESCENCE_STATES[response.state.state],
+        # A signal newer than this client is still reported, by its number.
+        busy_signals=tuple(
+            _QUIESCENCE_SIGNALS.get(signal, str(signal))
+            for signal in response.state.busy_signals
+        ),
+    )
 
 
 def log_and_handle_exceptions(grpc_method_name: str):  # pyre-ignore
@@ -436,18 +486,40 @@ class Client(ClientBase):
                         self.logger.debug(
                             f"Companion is remote, generating binary chunks for {file_path}"
                         )
+                        compression = select_stream_compression(
+                            requested=compression,
+                            supported=self.companion.supported_compressions,
+                        )
+                        self.logger.debug(
+                            f"Streaming {file_path} with {(compression or Compression.GZIP).name} compression"
+                        )
                         # chunk file from file_path
                         generator = generate_binary_chunks(
                             path=file_path,
                             destination=destination,
                             compression=compression,
                             logger=self.logger,
+                            zstd_zip_stream=self._streams_zips_as_zstd(
+                                destination, compression
+                            ),
                         )
 
             else:
                 # chunk file from memory
                 self.logger.debug("Sending file data from input stream")
-                generator = generate_io_chunks(io=bundle, logger=self.logger)
+                # `compression` is deliberately not reassigned: these bytes go out
+                # as their producer compressed them, so only a zip may be wrapped.
+                generator = generate_io_chunks(
+                    io=bundle,
+                    logger=self.logger,
+                    zstd_zip_stream=self._streams_zips_as_zstd(
+                        destination,
+                        select_stream_compression(
+                            requested=compression,
+                            supported=self.companion.supported_compressions,
+                        ),
+                    ),
+                )
                 # stream to companion
             await stream.send_message(InstallRequest(destination=destination))
             if make_debuggable is not None:
@@ -494,6 +566,16 @@ class Client(ClientBase):
                     name=response.name, uuid=response.uuid, progress=response.progress
                 )
 
+    def _streams_zips_as_zstd(
+        self, destination: Destination, compression: Compression
+    ) -> bool:
+        # A companion without `zstd_zip_streams` would extract the stream as a tar.
+        return (
+            destination == InstallRequest.APP
+            and compression == Compression.ZSTD
+            and self.companion.zstd_zip_streams
+        )
+
     @property
     def _is_verbose(self) -> bool:
         return self.logger.isEnabledFor(logging.DEBUG)
@@ -524,7 +606,7 @@ class Client(ClientBase):
     @log_and_handle_exceptions("accessibility_info")
     async def accessibility_info(
         self,
-        target: AccessibilityTarget | None,
+        target: AccessibilityReadTarget | None,
         options: AccessibilityInfoOptions,
     ) -> AccessibilityInfo:
         response = await self.stub.accessibility_info(
@@ -563,6 +645,25 @@ class Client(ClientBase):
             poll_interval=poll_interval,
             backend=backend,
         )
+
+    @log_and_handle_exceptions("accessibility_quiescence")
+    async def accessibility_quiescence(
+        self,
+        pid: int | None = None,
+        bundle_id: str | None = None,
+        busy_threshold_ms: int | None = None,
+        quiet_window_ms: int | None = None,
+    ) -> AsyncGenerator[QuiescenceEvent, None]:
+        request = AccessibilityQuiescenceRequest(
+            pid=pid,
+            bundle_id=bundle_id,
+            busy_threshold_ms=busy_threshold_ms,
+            quiet_window_ms=quiet_window_ms,
+        )
+        async with self.stub.accessibility_quiescence.open() as stream:
+            await stream.send_message(request, end=True)
+            async for response in stream:
+                yield _quiescence_event_from_grpc(response)
 
     async def _accessibility_wait_result(
         self,
@@ -836,6 +937,12 @@ class Client(ClientBase):
             for notification in response.notifications
         ]
 
+    @log_and_handle_exceptions("clear_delivered_notifications")
+    async def clear_delivered_notifications(self, bundle_id: str) -> None:
+        await self.stub.clear_delivered_notifications(
+            ClearDeliveredNotificationsRequest(bundle_id=bundle_id)
+        )
+
     @log_and_handle_exceptions("terminate")
     async def terminate(self, bundle_id: str) -> None:
         await self.stub.terminate(TerminateRequest(bundle_id=bundle_id))
@@ -854,6 +961,7 @@ class Client(ClientBase):
                 udid=target.udid,
                 is_local=self.is_local,
                 pid=None,
+                supported_compressions=self.companion.supported_compressions,
             ),
             # Extract the companion metadata from the response.
             metadata=response.companion.metadata,
@@ -1036,7 +1144,12 @@ class Client(ClientBase):
                 await stream.end()
                 await stream.recv_message()
             else:
+                compression = select_stream_compression(
+                    requested=compression,
+                    supported=self.companion.supported_compressions,
+                )
                 if compression is not None:
+                    self.logger.debug(f"Pushing with {compression.name} compression")
                     await stream.send_message(
                         PushRequest(
                             payload=Payload(compression=COMPRESSION_MAP[compression])
@@ -1216,9 +1329,26 @@ class Client(ClientBase):
         duration: float | None = None,
         delta: int | None = None,
         display: str | None = None,
+        edge: HIDEdgeType | None = None,
     ) -> None:
         await self.send_events(
-            on_display(display, swipe_to_events(p_start, p_end, duration, delta))
+            on_display(
+                display,
+                from_edge(edge, swipe_to_events(p_start, p_end, duration, delta)),
+            )
+        )
+
+    @log_and_handle_exceptions("hid")
+    async def drag(
+        self,
+        points: list[tuple[float, float]],
+        duration: float = 1.0,
+        delta: float | None = None,
+        display: str | None = None,
+        edge: HIDEdgeType | None = None,
+    ) -> None:
+        await self.send_events(
+            on_display(display, from_edge(edge, drag_to_events(points, duration, delta)))
         )
 
     @log_and_handle_exceptions("hid")

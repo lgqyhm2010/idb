@@ -693,6 +693,61 @@ output="$(in_package "$dir" '
 assert_equal "a repeat REPL build regenerates sources before project globs" 'regenerated-proto
 regenerated-project' "$output"
 
+# The focused companion XCTest bundle is a real build target with explicit files,
+# not an unreferenced addition to the historical CompanionTests directory.
+companion_target="$(awk '/^  CompanionRoutingTests:$/ { active=1; next } active && /^  [A-Za-z_-]+:$/ { exit } active { print }' "$SRC/Companion/project.yml")"
+assert_contains "companion routing is a unit-test bundle" "$companion_target" 'type: bundle.unit-test'
+assert_contains "companion routing scheme runs its bundle" "$companion_target" '- CompanionRoutingTests'
+assert_equal "only four companion regression files are selected" 4 "$(printf '%s\n' "$companion_target" | grep -c 'path: ../CompanionTests/.*Tests.swift')"
+for suite in AccessibilityInfoMethodHandlerTests HidRequestTranslationTests AccessibilityInfoRequestTranslationTests DisplayErrorTranslationTests; do
+    assert_contains "companion target includes $suite" "$companion_target" "$suite.swift"
+done
+production_closure="$(awk '/^  idb_companion:$/ { active=1; next } active && /^  [A-Za-z_-]+:$/ { exit } active && /- framework:/ { print $3 }' "$SRC/Companion/project-deps.yml" | sort)"
+test_closure="$(printf '%s\n' "$companion_target" | awk '/- framework:/ { print $3 }' | sort)"
+assert_equal "companion test link closure follows production" "$production_closure" "$test_closure"
+
+output="$(in_package "$dir" '
+    check_protobuf() { :; }
+    build_idb_deps() { echo prepared-dependencies; }
+    generate_proto() { echo regenerated-proto; }
+    generate_companion_project() { echo regenerated-project; }
+    build_companion_archives() { echo built-release-archives; }
+    invoke_xcodebuild() { echo "xcodebuild $*"; }
+    run_tests CompanionRoutingTests
+')"
+assert_equal "companion test command is supported" 0 "$?"
+assert_contains "companion codegen precedes source glob expansion" "$output" 'prepared-dependencies
+regenerated-proto
+regenerated-project
+built-release-archives'
+assert_contains "companion tests use companion project" "$output" '-project Companion/idb_companion.xcodeproj -scheme CompanionRoutingTests'
+assert_contains "companion tests build Release with testability" "$output" 'ENABLE_TESTABILITY=YES'
+assert_contains "companion tests use Release products" "$output" '-configuration Release'
+assert_contains "companion tests execute tests" "$output" '-maximum-test-execution-time-allowance 600 test'
+output="$(in_package "$dir" '
+    check_protobuf() { :; }
+    build_idb_deps() { :; }
+    generate_proto() { return 9; }
+    generate_companion_project() { echo should-not-generate; }
+    build_companion_archives() { echo should-not-build; }
+    invoke_xcodebuild() { echo should-not-test; }
+    run_tests CompanionRoutingTests
+')"
+assert_equal "companion codegen failure stops testing" 9 "$?"
+assert_equal "companion tests never run stale generated sources" '' "$output"
+
+output="$(in_package "$dir" '
+    check_protobuf() { :; }
+    build_idb_deps() { :; }
+    generate_proto() { :; }
+    generate_companion_project() { return 8; }
+    build_companion_archives() { echo should-not-build; }
+    invoke_xcodebuild() { echo should-not-test; }
+    run_tests CompanionRoutingTests
+')"
+assert_equal "companion project failure stops testing" 8 "$?"
+assert_equal "companion tests never run a failed generated project" '' "$output"
+
 if [ "$FAILURES" -ne 0 ]; then
     echo "$FAILURES assertion(s) failed"
     exit 1

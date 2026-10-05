@@ -8,19 +8,32 @@
 import Foundation
 import XPC
 
-/// The `displayinfo` feature: what the provider reports about each display, and what a current
-/// report has to say before a display can be selected from it.
+/// What one `displayinfo` read says about the simulator's displays, before anything is selected from it.
+enum SimulatorDisplayReport: Equatable, Sendable {
+  /// Every display, identified, with its activity.
+  case displays([SimulatorDisplay])
+  /// A runtime that reports no display activity. The geometry of each integrated display, which may not be
+  /// identified.
+  case legacy(integrated: [SimulatorDisplayGeometry])
+  /// Layout has moved to a display whose backlight has not caught up, as after a hinge change.
+  case transitioning
+  case failed(SimulatorCoreDeviceError)
+}
+
+/// The `displayinfo` feature: what the provider reports about each display.
 enum SimulatorDisplayProtocol {
   static let service = "com.apple.coredevice.feature.getdisplayinfo"
   static let action = "com.apple.coredevice.action.displayinfo"
 
   /// The output as the provider sends it. Activity and stable identity are optional only because
-  /// older providers omit both from every display; see `snapshot`.
+  /// older providers omit activity from every display or report every backlight as `unknown`, and
+  /// some of those omit identity too; see `report`.
   struct Report: Decodable {
     struct Record: Decodable {
       let uniqueId: String?
       let name: String
       let active: Bool?
+      let backlightState: String?
       let primary: Bool
       let bounds: [[Double]]
       let pointScale: Int64
@@ -32,32 +45,46 @@ enum SimulatorDisplayProtocol {
     let displays: [Record]
   }
 
-  /// Whether a report can select a display, or comes from a provider that cannot say which is active.
-  enum Snapshot: Equatable {
-    case displays([SimulatorDisplay])
-    case legacyProvider
-  }
-
   private static let maximumDisplays = 32
   private static let maximumStringLength = 1024
 
-  /// A report with identity and activity yields displays; one that omits both from every display
-  /// is a legacy provider. A report that has them on some displays but not others is malformed.
-  static func snapshot(_ reply: xpc_object_t) throws -> Snapshot {
-    let report = try validated(CoreDeviceReply.decode(Report.self, from: reply))
-    let legacy = report.displays.allSatisfy { $0.active == nil && $0.uniqueId == nil }
-    guard legacy, !report.displays.isEmpty else {
-      return .displays(try displays(in: report))
-    }
-    for record in report.displays {
-      _ = try validated(record)
-    }
-    return .legacyProvider
+  /// A report with activity yields displays; one that carries no activity evidence on any display is
+  /// legacy, whether or not it sends identity (Xcode 27.0 sends identity without activity). An `unknown`
+  /// backlight is not evidence: Xcode 27.1 driving an iOS 26 runtime reports it on every display and sends
+  /// no identity. A report with activity on some displays but not others is malformed.
+  static func report(_ reply: xpc_object_t) -> SimulatorDisplayReport {
+    reading { try CoreDeviceReply.decode(Report.self, from: reply) }
   }
 
-  /// A current report with explicit per-display activity and identity.
-  static func displays(_ reply: xpc_object_t) throws -> [SimulatorDisplay] {
-    try displays(in: validated(CoreDeviceReply.decode(Report.self, from: reply)))
+  /// A report pushed by `displayinfoupdates`, which arrives already decoded.
+  static func report(of report: Report) -> SimulatorDisplayReport {
+    reading { report }
+  }
+
+  private static func reading(_ decode: () throws -> Report) -> SimulatorDisplayReport {
+    do {
+      return try interpreted(validated(decode()))
+    } catch let error as SimulatorCoreDeviceError {
+      return .failed(error)
+    } catch {
+      return .failed(.malformed("\(error)"))
+    }
+  }
+
+  private static func interpreted(_ report: Report) throws -> SimulatorDisplayReport {
+    let legacy = report.displays.allSatisfy { $0.active == nil && [nil, "unknown"].contains($0.backlightState) }
+    guard legacy, !report.displays.isEmpty else {
+      return try displays(in: report)
+    }
+    var integrated: [SimulatorDisplayGeometry] = []
+    for record in report.displays {
+      let validated = try validated(record)
+      guard validated.integrated else { continue }
+      guard !validated.bounds.isEmpty else { throw SimulatorCoreDeviceError.malformed("Invalid integrated display geometry") }
+      integrated.append(
+        SimulatorDisplayGeometry(bounds: validated.bounds, scale: Double(record.pointScale), rotation: record.currentOrientation))
+    }
+    return .legacy(integrated: integrated)
   }
 
   private static func validated(_ report: Report) throws -> Report {
@@ -66,7 +93,8 @@ enum SimulatorDisplayProtocol {
     return report
   }
 
-  private static func displays(in report: Report) throws -> [SimulatorDisplay] {
+  private static func displays(in report: Report) throws -> SimulatorDisplayReport {
+    let hasLayoutActivity = report.displays.contains { $0.active != nil }
     var identifiers: Set<String> = []
     var displays: [SimulatorDisplay] = []
     for record in report.displays {
@@ -74,14 +102,33 @@ enum SimulatorDisplayProtocol {
       guard let id = record.uniqueId, !id.isEmpty, id.utf8.count <= maximumStringLength, identifiers.insert(id).inserted else {
         throw SimulatorCoreDeviceError.malformed("Duplicate or empty display identity")
       }
-      guard let active = record.active else { throw SimulatorCoreDeviceError.malformed("Display has no activity") }
-      guard !active || !validated.bounds.isEmpty else { throw SimulatorCoreDeviceError.malformed("Active display has empty bounds") }
+      guard let activity = try activity(of: record, hasLayoutActivity: hasLayoutActivity) else { return .transitioning }
+      guard activity != .active || !validated.bounds.isEmpty else { throw SimulatorCoreDeviceError.malformed("Active display has empty bounds") }
       displays.append(
         SimulatorDisplay(
-          uniqueID: id, name: record.name, isActive: active, isPrimary: record.primary, isIntegrated: validated.integrated,
+          uniqueID: id, name: record.name, activity: activity, isPrimary: record.primary, isIntegrated: validated.integrated,
           bounds: validated.bounds, scale: Double(record.pointScale), rotation: record.currentOrientation))
     }
-    return displays.sorted { $0.uniqueID < $1.uniqueID }
+    return .displays(displays.sorted { $0.uniqueID < $1.uniqueID })
+  }
+
+  /// Layout activity is authoritative when the report carries it; otherwise backlight state identifies
+  /// the illuminated display. Nil when an inactive layout is still lit, as mid-transition.
+  private static func activity(of record: Report.Record, hasLayoutActivity: Bool) throws -> SimulatorDisplayActivity? {
+    if hasLayoutActivity {
+      guard let active = record.active else { throw SimulatorCoreDeviceError.malformed("Display has no activity") }
+      if !active, let state = record.backlightState, ["activeOn", "activeDimmed"].contains(state) {
+        return nil
+      }
+      return active ? .active : .inactive
+    }
+    switch record.backlightState {
+    case "activeOn", "activeDimmed": return .active
+    case "off", "inactiveOn": return .inactive
+    case "unknown": return .unknown
+    case nil: throw SimulatorCoreDeviceError.malformed("Display has no activity")
+    default: throw SimulatorCoreDeviceError.malformed("Unknown backlight state")
+    }
   }
 
   /// The fields every record has to satisfy, legacy or not.

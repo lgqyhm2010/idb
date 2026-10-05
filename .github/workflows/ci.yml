@@ -28,6 +28,11 @@ jobs:
           - macos-26
     steps:
       - uses: actions/checkout@v5
+      # The runner image leaves Spotlight on. Nothing here searches with it,
+      # and its indexer competes for CPU with everything the job writes.
+      - name: Turn off Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off || true
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -68,6 +73,8 @@ jobs:
             -v
       - name: Check the documentation's links into the repository
         run: python -m CI.check_documentation_links
+      - name: Test homebrew.py
+        run: python -m unittest homebrew_tests -v
 
   mac-frameworks:
     name: Build frameworks (macOS)
@@ -75,6 +82,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      # The runner image leaves Spotlight on. Nothing here searches with it,
+      # and its indexer competes for CPU with everything the job writes.
+      - name: Turn off Spotlight indexing
+        run: sudo mdutil -a -i off || true
       - name: Install tools
         run: brew install xcodegen xcbeautify
       - name: Build frameworks
@@ -113,6 +124,10 @@ jobs:
           - FBDeviceControl
     steps:
       - uses: actions/checkout@v5
+      # The runner image leaves Spotlight on. Nothing here searches with it,
+      # and its indexer competes for CPU with everything the job writes.
+      - name: Turn off Spotlight indexing
+        run: sudo mdutil -a -i off || true
       - name: Install tools
         run: brew install xcodegen xcbeautify
       # The smoke suite takes a booted simulator from its environment and does
@@ -147,12 +162,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # A larger runner, because the build is compile-bound and the end-to-end
+  # shards and formulae wait on it.
   mac-companion:
     name: Build companion + distribution (macOS)
-    runs-on: macos-26
+    # Larger runners are configured by upstream; forks use standard hosted
+    # macOS runners without requiring paid runner access.
+    runs-on: ${{ github.repository == 'facebook/idb' && 'macos-26-xlarge' || 'macos-26' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+      # The runner image leaves Spotlight on. Nothing here searches with it,
+      # and its indexer competes for CPU with everything the job writes.
+      - name: Turn off Spotlight indexing
+        run: sudo mdutil -a -i off || true
       - name: Install tools
         run: brew install xcodegen protobuf xcbeautify
       # build.sh compiles both protoc plugins from source on first run;
@@ -166,6 +189,8 @@ jobs:
           key: protoc-plugins-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ runner.os }}
       - name: Build everything and assemble the distribution
         run: ./build.sh build all
+      - name: Test companion display routing and request translation
+        run: ./build.sh test CompanionRoutingTests
       # The raw xcodebuild output build.sh keeps for every invocation; the
       # formatted job log shows only what the formatter recognised.
       - name: Upload xcodebuild logs on failure
@@ -204,8 +229,10 @@ jobs:
   # local files. A template that no longer matches the tarball layout, a
   # dependency pin that stopped resolving, or an install block that breaks
   # fails here, on the diff that caused it, instead of on release day. The
-  # rendered files are uploaded for review; their URLs point at this runner,
-  # so they are a build output, not something to install from.
+  # rendered files and the wheel are uploaded alongside the idb-companion
+  # artifact. The formulae's URLs point at this runner, so installing them
+  # elsewhere means downloading all three and repointing the URLs at them,
+  # which is what homebrew.py at the repository root does.
   mac-formulae:
     name: Render and install the formulae (macOS)
     runs-on: macos-26
@@ -213,6 +240,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      # The runner image leaves Spotlight on. Nothing here searches with it,
+      # and its indexer competes for CPU with everything the job writes.
+      - name: Turn off Spotlight indexing
+        run: sudo mdutil -a -i off || true
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -241,6 +272,12 @@ jobs:
         with:
           name: formulae
           path: tap/
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v5
+        with:
+          name: fb-idb-dist
+          path: assets/fb_idb-*-py3-none-any.whl
+          if-no-files-found: error
       - name: Mount the render as the facebook/fb tap
         run: |
           taps="$(brew --repository)/Library/Taps/facebook"
@@ -261,11 +298,20 @@ jobs:
       - name: Test the installed formulae
         run: brew test facebook/fb/idb-companion facebook/fb/idb-cli facebook/fb/idb
 
+  # Each shard gets its own runner and simulator, apart from `install`, whose
+  # companion targets the Mac; `CI.end_to_end_shard` says which modules it runs. A larger runner, because on the standard 3-core, 7 GB
+  # VM the simulator stalls for tens of seconds at a time and outlasts test waits.
   mac-end-to-end:
-    name: End-to-end (idb through idb_companion, macOS)
-    runs-on: macos-26
+    name: End-to-end ${{ matrix.shard }} (idb through idb_companion, macOS)
+    # Larger runners are configured by upstream; forks use standard hosted
+    # macOS runners without requiring paid runner access.
+    runs-on: ${{ github.repository == 'facebook/idb' && 'macos-26-xlarge' || 'macos-26' }}
     needs: mac-companion
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [demos, ui, system, apps, install]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -288,9 +334,19 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
           tar -C "$RUNNER_TEMP/artifacts" -xzf idb-companion-distribution.tgz
+      # The runner image leaves Spotlight on, and its indexer takes more than a
+      # core while the freshly booted simulator and the tests are running.
+      # Nothing here searches with Spotlight. The `.noindex` suffix below keeps
+      # the device set out of the index even if this step fails.
+      - name: Turn off Spotlight indexing
+        run: sudo mdutil -a -i off || true
       # Export DEVICE_UDID and DEVICE_SET_PATH for a dedicated simulator.
+      # On disposable hosted CI only, inventory both sets and shut down exact
+      # extra booted default-set devices. Evidence reports verified isolation
+      # or an explicit no-op; no waits or assertions in the tests are changed.
       - name: Provision a simulator
-        run: python3 -m CI.provision_simulator --name end-to-end-provided --device-set "$RUNNER_TEMP/end-to-end-device-set" >> "$GITHUB_ENV"
+        if: matrix.shard != 'install'
+        run: python3 -m CI.provision_simulator --name end-to-end-provided --device-set "$RUNNER_TEMP/end-to-end-device-set.noindex" --isolate-hosted-ci --diagnostics-dir "$RUNNER_TEMP/end-to-end-diagnostics/isolation" >> "$GITHUB_ENV"
       # Fail if a required simulator host service is unavailable. Record H.264
       # rather than the default HEVC: this run's video is what the website
       # publishes, and it is the encoding every browser decodes.
@@ -299,29 +355,53 @@ jobs:
           IDB_BIN="$(command -v idb)" \
           IDB_E2E_COMPANION_PATH="$RUNNER_TEMP/artifacts/Distribution/idb_companion" \
           IDB_E2E_RECORDER_PATH="$RUNNER_TEMP/artifacts/Distribution/sim-video" \
+          IDB_E2E_REPL_PATH="$RUNNER_TEMP/artifacts/Distribution/idb-repl" \
           IDB_E2E_ARTIFACTS_DIR="$RUNNER_TEMP/end-to-end-diagnostics" \
           IDB_E2E_RECORDER_ENCODING=h264 \
           IDB_E2E_STRICT=1 \
-          python -m unittest discover -s EndToEndTests -t . -v
+          IDB_E2E_PROCESS_SNAPSHOTS=1 \
+          python -m unittest -v --durations 0 $(python3 -m CI.end_to_end_shard ${{ matrix.shard }})
       # Only a run in which every documented demo passed produces this, so the
       # artifact's existence is what lets the site publish them. The recorder
       # that captured the run is also what cuts each demo's clip out of it.
+      # Every demo is in the `demos` shard, and nothing else is.
       - name: Document the demos this run performed
+        if: matrix.shard == 'demos'
         run: python3 -m CI.generate_documentation --artifacts-dir "$RUNNER_TEMP/end-to-end-diagnostics" --output "$RUNNER_TEMP/documentation" --recorder "$RUNNER_TEMP/artifacts/Distribution/sim-video"
       - name: Upload the demo documentation
+        if: matrix.shard == 'demos'
         uses: actions/upload-artifact@v5
         with:
           name: documentation
           path: ${{ runner.temp }}/documentation
       - name: Collect diagnostics
         if: always()
-        run: python3 -m CI.collect_diagnostics --artifacts-dir "$RUNNER_TEMP/end-to-end-diagnostics" --output "$RUNNER_TEMP/end-to-end-diagnostics"
+        env:
+          IDB_E2E_SHARD: ${{ matrix.shard }}
+        run: |
+          extra=()
+          if [[ "$IDB_E2E_SHARD" != install ]]; then
+            extra=(--hosted-ci-snapshot --device-set "$RUNNER_TEMP/end-to-end-device-set.noindex")
+          fi
+          python3 -m CI.collect_diagnostics "${extra[@]}" --artifacts-dir "$RUNNER_TEMP/end-to-end-diagnostics" --output "$RUNNER_TEMP/end-to-end-diagnostics"
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: end-to-end-diagnostics
-          path: ${{ runner.temp }}/end-to-end-diagnostics
+          name: end-to-end-diagnostics-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/end-to-end-diagnostics
+            !${{ runner.temp }}/end-to-end-diagnostics/*-idb-output.log
+          if-no-files-found: ignore
+          retention-days: 14
+      # Everything each idb exec printed, apart from the video so it can be
+      # fetched and grepped on its own.
+      - name: Upload idb output
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: idb-output-${{ matrix.shard }}
+          path: ${{ runner.temp }}/end-to-end-diagnostics/*-idb-output.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -347,10 +427,14 @@ jobs:
 
   # The same site built from the demos the end-to-end run documented, so a
   # manifest the website cannot render fails here rather than on deployment.
+  # This job's conclusion is what deployment checks. It runs even when another
+  # shard failed: the `documentation` artifact only exists when every demo
+  # passed, so downloading it is the gate on the demos.
   website-demos:
     name: Build the website from the end-to-end run
     runs-on: ubuntu-latest
     needs: mac-end-to-end
+    if: ${{ !cancelled() && needs.mac-end-to-end.result != 'skipped' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5

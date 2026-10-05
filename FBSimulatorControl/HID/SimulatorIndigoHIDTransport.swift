@@ -11,7 +11,8 @@ import CoreGraphics
 import Foundation
 
 /**
- The default HID transport (IndigoHIDRegistrationPort).
+ The legacy HID transport (IndigoHIDRegistrationPort), the default on toolchains that predate `dtuhidd`.
+ On later toolchains only the tvOS trackpad still works over it.
 
  Builds `IndigoMessage` payloads with `SimulatorIndigoHID` and delivers them through the runtime-only
  `SimDeviceLegacyHIDClient` (owned by `SimulatorIndigoHIDClient`). Guest-side:
@@ -30,10 +31,10 @@ actor SimulatorIndigoHIDTransport {
   private let mainScreenSize: CGSize
   /// The scale of the main screen.
   private let mainScreenScale: Float
-  /// Whether the guest has handed its legacy keyboard HID over to `dtuhidd`, captured from
-  /// `Simulator.isLegacyKeyboardSuppressed` when the transport is built. `sendKeyboard` fails loudly on
-  /// it rather than typing into the void; the DTUHID transport is the workaround.
-  private let legacyKeyboardSuppressed: Bool
+  /// Whether the guest drops legacy input, captured from `Simulator.isLegacyInputSuppressed` when the
+  /// transport is built. Touch, button and keyboard sends fail loudly on it rather than reporting
+  /// success for input that has no effect; the DTUHID transport is the workaround.
+  private let legacyInputSuppressed: Bool
   /// The product family of the target, captured at construction. Touchscreen touches are a no-op on
   /// tvOS (it has no digitizer), so the touch primitives reject `AppleTV` rather than failing silently.
   private let productFamily: ProductFamily
@@ -47,7 +48,7 @@ actor SimulatorIndigoHIDTransport {
       indigo: try SimulatorIndigoHID(),
       mainScreenSize: simulator.device.deviceType.mainScreenSize,
       mainScreenScale: simulator.device.deviceType.mainScreenScale,
-      legacyKeyboardSuppressed: simulator.isLegacyKeyboardSuppressed,
+      legacyInputSuppressed: simulator.isLegacyInputSuppressed,
       productFamily: simulator.productFamily)
   }
 
@@ -56,14 +57,14 @@ actor SimulatorIndigoHIDTransport {
     indigo: SimulatorIndigoHID,
     mainScreenSize: CGSize,
     mainScreenScale: Float,
-    legacyKeyboardSuppressed: Bool,
+    legacyInputSuppressed: Bool,
     productFamily: ProductFamily
   ) {
     self.indigoClient = indigoClient
     self.indigo = indigo
     self.mainScreenSize = mainScreenSize
     self.mainScreenScale = mainScreenScale
-    self.legacyKeyboardSuppressed = legacyKeyboardSuppressed
+    self.legacyInputSuppressed = legacyInputSuppressed
     self.productFamily = productFamily
   }
 
@@ -74,35 +75,58 @@ actor SimulatorIndigoHIDTransport {
   }
 
   func sendTouch(
-    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge
+    direction: SimulatorHIDDirection, x: Double, y: Double, edge: SimulatorHIDEdge, display: SimulatorHIDDisplay? = nil
   ) async throws {
     guard productFamily.hasTouchscreen else {
       throw SimulatorHIDError.touchUnsupportedOnAppleTV
     }
+    try requireLegacyInput("Touch")
+    try requireUnnamedDisplay(display)
+    let point = try display?.geometry.unrotatedPoint(from: CGPoint(x: x, y: y)) ?? CGPoint(x: x, y: y)
     try await indigoClient.send(
       indigo.touchScreenSize(
-        mainScreenSize, screenScale: mainScreenScale, direction: direction, x: x, y: y, edge: edge))
+        display?.geometry.bounds.size ?? mainScreenSize,
+        screenScale: display.map { Float($0.geometry.scale) } ?? mainScreenScale,
+        direction: direction, x: point.x, y: point.y, edge: display?.unrotatedEdge(edge) ?? edge))
   }
 
-  func sendTwoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint) async throws {
+  func sendTwoFingerTouch(direction: SimulatorHIDDirection, finger1: CGPoint, finger2: CGPoint, display: SimulatorHIDDisplay? = nil) async throws {
     guard productFamily.hasTouchscreen else {
       throw SimulatorHIDError.touchUnsupportedOnAppleTV
     }
+    try requireLegacyInput("Touch")
+    try requireUnnamedDisplay(display)
+    let first = try display?.geometry.unrotatedPoint(from: finger1) ?? finger1
+    let second = try display?.geometry.unrotatedPoint(from: finger2) ?? finger2
     try await indigoClient.send(
       indigo.twoFingerTouchScreenSize(
-        mainScreenSize, screenScale: mainScreenScale, direction: direction, finger1: finger1, finger2: finger2))
+        display?.geometry.bounds.size ?? mainScreenSize,
+        screenScale: display.map { Float($0.geometry.scale) } ?? mainScreenScale,
+        direction: direction, finger1: first, finger2: second))
+  }
+
+  /// On Xcode 27 (CoreSimulator-1155.4)+ button and keyboard events deliver byte-correctly but have no
+  /// effect, and touch is dropped unpredictably. Nothing observable from here tells a delivered send from
+  /// a dropped one, so none is reported as a success.
+  private func requireLegacyInput(_ operation: String) throws {
+    if legacyInputSuppressed {
+      throw SimulatorHIDError.legacyInputSuppressed(operation: operation)
+    }
+  }
+
+  private func requireUnnamedDisplay(_ display: SimulatorHIDDisplay?) throws {
+    if case .selected = display {
+      throw SimulatorDisplayInteractionError.unsupportedCapability("explicit display routing over Indigo")
+    }
   }
 
   func sendButton(direction: SimulatorHIDDirection, button: SimulatorHIDButton) async throws {
+    try requireLegacyInput("Button")
     try await indigoClient.send(indigo.button(with: direction, button: button))
   }
 
   func sendKeyboard(direction: SimulatorHIDDirection, keyCode: UInt32) async throws {
-    // On Xcode 27 (CoreSimulator-1155.4)+ the guest disconnects the legacy `ExternalKeyboardService`
-    // in favour of dtuhidd, so legacy keyboard events deliver byte-correctly but produce no text.
-    if legacyKeyboardSuppressed {
-      throw SimulatorHIDError.keyboardSuppressedByDTUHIDD
-    }
+    try requireLegacyInput("Keyboard")
     try await indigoClient.send(indigo.keyboard(with: direction, keyCode: keyCode))
   }
 
@@ -112,7 +136,8 @@ actor SimulatorIndigoHIDTransport {
     try await sendKeyboard(direction: direction, keyCode: button.keyboardUsage)
   }
 
-  // No tvOS guard — the trackpad is exactly what Apple TV targets need (unlike the touchscreen).
+  // No tvOS guard — the trackpad is exactly what Apple TV targets need (unlike the touchscreen). No
+  // suppression guard either: the tvOS guest still honours Indigo trackpad events on Xcode 27.
   func sendTrackpad(point: SimulatorTrackpadPoint, phase: SimulatorTrackpadPhase) async throws {
     try await indigoClient.send(indigo.trackpad(point: CGPoint(x: point.x, y: point.y), phase: phase))
   }
