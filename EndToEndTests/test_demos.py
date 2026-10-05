@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import struct
@@ -34,7 +35,9 @@ from .harness import (
     _screen,
     AppState,
     Completed,
+    Deadline,
     FIXTURE_APP_BUNDLE_ID,
+    HarnessError,
     IdbEndToEndTestCase,
     LocalPages,
     NotReady,
@@ -43,6 +46,7 @@ from .harness import (
     UI_UPDATE_TIMEOUT_SECONDS,
     wait_until,
 )
+from .notification_banner import BANNER_LOG_PREDICATE, NotificationBanner
 from .test_accessibility import (
     _row_movement,
     _row_positions,
@@ -332,10 +336,10 @@ CRASH_REPORT_TIMEOUT_SECONDS = 60.0
 # A banner is not in the accessibility tree, so it is tapped where SpringBoard
 # puts it: centred, just below the Dynamic Island.
 BANNER_Y = 90
-# Nothing a client can read reports a banner landing; it slides in for well
-# under a second and stays for several.
-BANNER_ARRIVAL_SECONDS = 1.0
-BANNER_OPEN_TIMEOUT_SECONDS = 15.0
+# Preserve the original one-second arrival plus fifteen-second launch budget.
+# Presentation, the single coordinate tap, and launch now share that deadline.
+BANNER_OPEN_TIMEOUT_SECONDS = 16.0
+BANNER_OBSERVER_SETUP_TIMEOUT_SECONDS = 15.0
 # On a fast host the steps around the spin finish in well under a second, too
 # quickly to see it in the recording.
 SPIN_HOLD_SECONDS = 10.0
@@ -704,6 +708,55 @@ class WebContentDemos(SafariTestCase):
 
 
 class NotificationDemos(IdbEndToEndTestCase):
+    async def open_notification_banner(self, x: int, y: int) -> None:
+        # Python's log CLI otherwise buffers its prints when stdout is a pipe.
+        # The context owns shutdown/reaping even when the deadline cancels a tap
+        # or launch poll; cleanup is deliberately outside the assertion budget.
+        async with self.idb_process(
+            "log",
+            "--",
+            "--style",
+            "compact",
+            "--predicate",
+            BANNER_LOG_PREDICATE,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        ) as log:
+            banner = NotificationBanner(log, NEWS_BUNDLE_ID)
+            await banner.wait_for_stream(BANNER_OBSERVER_SETUP_TIMEOUT_SECONDS)
+            banner.begin_send()
+            await self.idb(
+                "send-notification",
+                NEWS_BUNDLE_ID,
+                NOTIFICATION_PAYLOAD,
+                step="Deliver a notification while the app is not running",
+                retry_transient_answers=False,
+            )
+            deadline = Deadline(BANNER_OPEN_TIMEOUT_SECONDS)
+
+            async def open_banner() -> None:
+                await banner.wait_for_presentation(deadline)
+                banner.require_current_presentation()
+                if deadline.passed:
+                    raise HarnessError("Notification deadline expired before the tap")
+                await self.idb(
+                    "ui",
+                    "tap",
+                    str(x),
+                    str(y),
+                    step="Tap the banner",
+                    timeout=deadline.remaining,
+                    retry_transient_answers=False,
+                )
+                if deadline.passed:
+                    raise HarnessError("Notification deadline expired during the tap")
+                await self.wait_for_app(
+                    NEWS_BUNDLE_ID, AppState.RUNNING, timeout=deadline.remaining
+                )
+
+            # wait_for_app bounds individual simctl polls, but its retry helper
+            # checks time only between polls. Bound the whole operation as well.
+            await asyncio.wait_for(open_banner(), timeout=deadline.remaining)
+
     @documented_demo(
         slug="open-an-app-from-a-notification-banner",
         title="Deliver a push notification and open the app from its banner",
@@ -775,17 +828,7 @@ class NotificationDemos(IdbEndToEndTestCase):
             str(x),
         )
 
-        await self.idb(
-            "send-notification",
-            NEWS_BUNDLE_ID,
-            NOTIFICATION_PAYLOAD,
-            step="Deliver a notification while the app is not running",
-        )
-        await asyncio.sleep(BANNER_ARRIVAL_SECONDS)
-        await self.idb("ui", "tap", str(x), str(y), step="Tap the banner")
-        await self.wait_for_app(
-            NEWS_BUNDLE_ID, AppState.RUNNING, timeout=BANNER_OPEN_TIMEOUT_SECONDS
-        )
+        await self.open_notification_banner(x, y)
         self.note(
             f"{NEWS_BUNDLE_ID} is running: the tap landed on the notification's "
             "banner, which opened the app."

@@ -1876,6 +1876,7 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
         stdin: bytes | None = None,
         step: str | None = None,
+        retry_transient_answers: bool = True,
     ) -> Completed:
         """Run idb; with check=True, report nonzero exits as failures or skips.
 
@@ -1886,6 +1887,7 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
         A transient accessibility answer is repeated where `worth_repeating`
         allows, until TRANSIENT_ANSWER_TIMEOUT_SECONDS pass. Only the attempt
         that ends the command is published as the step.
+        Set retry_transient_answers=False when the test requires one attempt.
         """
         deadline = Deadline(TRANSIENT_ANSWER_TIMEOUT_SECONDS)
         while True:
@@ -1893,7 +1895,11 @@ class IdbEndToEndTestCase(unittest.IsolatedAsyncioTestCase):
 
             def published(completed: Completed) -> str | None:
                 nonlocal repeat
-                repeat = worth_repeating(args, completed) and not deadline.passed
+                repeat = (
+                    retry_transient_answers
+                    and worth_repeating(args, completed)
+                    and not deadline.passed
+                )
                 return None if repeat else step
 
             completed = await self._run_once(

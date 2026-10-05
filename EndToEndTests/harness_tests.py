@@ -25,12 +25,13 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NoReturn, Sequence
 from unittest import mock
 
-from . import harness, recording as recording_module
+from . import harness, notification_banner, recording as recording_module, test_demos
 from .documentation import Transcript
 from .harness import (
     _optional_binary_from_environment,
@@ -1535,6 +1536,23 @@ class TransientAccessibilityAnswerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome, SUCCEEDED)
         self.assertEqual(run.await_count, 2)
+
+    async def test_one_attempt_disables_even_nothing_written_retries(self) -> None:
+        for args in (
+            ("ui", "tap", "200", "90"),
+            ("send-notification", "com.apple.news", "{}"),
+        ):
+            with self.subTest(args=args):
+                outcome, run, recording = await self.attempt(
+                    args,
+                    [ELEMENT_MOVED, SUCCEEDED],
+                    retry_transient_answers=False,
+                    step="One attempt",
+                )
+                self.assertIsInstance(outcome, Failed)
+                self.assertIn("nothing was written", str(outcome))
+                run.assert_awaited_once()
+                self.assertEqual(recording.command.call_count, 1)
 
     async def test_a_tap_the_application_did_not_answer_is_not_repeated(
         self,
@@ -3081,6 +3099,329 @@ class StopPushServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(logs.records), 1)
         self.assertIn("launchctl hung", logs.output[0])
+
+
+class NotificationBannerTests(unittest.IsolatedAsyncioTestCase):
+    base = datetime(2026, 10, 5, 17, 9, 30)
+    digest = "B1B5-AEDC"
+    request_id = "0AE59510-20A1-45A9-A68B-B99078934C69"
+
+    def setUp(self) -> None:
+        self.elapsed = 0.0
+        self.chunks: list[tuple[float, bytes]] = []
+        self.read_bytes = 0
+        self.log = SimpleNamespace(
+            returncode=None,
+            stdout_capture=SimpleNamespace(total_bytes=0),
+            read_some=self.read_some,
+        )
+        self.banner = notification_banner.NotificationBanner(
+            self.log, "com.apple.news", now=self.now
+        )
+
+    def now(self) -> datetime:
+        return self.base + timedelta(seconds=self.elapsed)
+
+    def line(self, at: float, message: str) -> bytes:
+        date = self.base + timedelta(seconds=at)
+        return (
+            f"{date:%Y-%m-%d %H:%M:%S}.{date.microsecond // 1000:03d} "
+            f"Df SpringBoard[1871:12a43] {message}\n"
+        ).encode()
+
+    def adding(
+        self, at: float, digest: str = "B1B5-AEDC", bundle: str = "com.apple.news"
+    ) -> bytes:
+        return self.line(
+            at, f"[{bundle}] Adding notification request {digest} to destinations: Default"
+        )
+
+    def request(self, at: float, request_id: str | None = None) -> bytes:
+        return self.line(
+            at, f"attributedBody is empty for request {self.digest} "
+            "<UNNotificationRequest: 0x11726f2d0; "
+            f"identifier: {request_id or self.request_id}, content: <UNNotificationContent:>"
+        )
+
+    def appearance(
+        self, at: float, phase: str = "did appear", digest: str = "B1B5-AEDC",
+        request_id: str | None = None,
+    ) -> bytes:
+        return self.line(
+            at, f"Presentable {phase} as banner: "
+            "<SBNotificationPresentableViewController: 0x11aa48000; "
+            "requesterIdentifier: com.apple.UserNotificationsKit; "
+            f"requestIdentifier: {request_id or self.request_id}; "
+            f"viewController: self; bannerAppearState: appearing; logDigest: {digest}>"
+        )
+
+    async def read_some(self, timeout: float) -> bytes:
+        if not self.chunks:
+            raise HarnessError("log produced no further evidence")
+        at, data = self.chunks.pop(0)
+        self.elapsed = at
+        self.read_bytes += len(data)
+        self.log.stdout_capture.total_bytes = max(
+            self.log.stdout_capture.total_bytes, self.read_bytes
+        )
+        return data
+
+    def deadline(self, at: float = 16.0) -> object:
+        owner = self
+
+        class FakeDeadline:
+            @property
+            def remaining(self) -> float:
+                return at - owner.elapsed
+
+            @property
+            def passed(self) -> bool:
+                return self.remaining <= 0
+
+        return FakeDeadline()
+
+    async def test_delayed_presentation_and_split_chunks_share_deadline(self) -> None:
+        self.chunks = [
+            (0.1, self.line(0.1, "[com.apple.runningboard:monitor] Received state update"))
+        ]
+        await self.banner.wait_for_stream(15)
+        self.banner.begin_send()
+        adding = self.adding(0.2)
+        self.chunks = [
+            (0.2, adding[:40]), (0.2, adding[40:]),
+            (0.3, self.request(0.3)), (9.6, self.appearance(9.6)),
+        ]
+        deadline = self.deadline(16.1)
+        await self.banner.wait_for_presentation(deadline)
+        self.assertEqual(self.banner.request_id, self.request_id)
+        self.assertAlmostEqual(deadline.remaining, 6.5)
+
+    async def test_headers_and_stale_events_do_not_prove_stream_readiness(self) -> None:
+        self.chunks = [(0.1,
+            b"Filtering the log data using predicate\nTimestamp Ty Process[PID:TID]\n"
+            + self.line(-1, "old event")
+        )]
+        with self.assertRaisesRegex(HarnessError, "no further evidence"):
+            await self.banner.wait_for_stream(15)
+        self.assertFalse(self.banner.streaming)
+
+    async def test_stale_unrelated_and_will_appear_do_not_satisfy_readiness(self) -> None:
+        self.banner._feed(self.adding(0, "1111-2222"))
+        self.elapsed = 1
+        self.banner.begin_send()
+        self.chunks = [(2,
+            self.adding(0.5) + self.appearance(0.6)
+            + self.adding(1.1, bundle="com.other.app")
+            + self.appearance(1.2, digest="1111-2222")
+            + self.adding(1.5) + self.request(1.6)
+            + self.appearance(1.7, phase="will appear")
+        )]
+        with self.assertRaisesRegex(HarnessError, "no further evidence"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.assertIsNone(self.banner.appeared_at)
+
+    async def test_ambiguous_news_requests_fail_closed(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(1, self.adding(0.1) + self.adding(0.2, "1111-2222"))]
+        with self.assertRaisesRegex(HarnessError, "More than one"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_matching_digest_requires_matching_full_request_id(self) -> None:
+        for request in (b"", self.request(0.2, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")):
+            with self.subTest(request=request):
+                self.setUp()
+                self.banner.begin_send()
+                self.chunks = [(1, self.adding(0.1) + request + self.appearance(1))]
+                with self.assertRaisesRegex(HarnessError, "matching full request ID"):
+                    await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_buffered_dismissal_in_next_chunk_fails_before_returning(self) -> None:
+        self.banner.begin_send()
+        first = self.adding(0.1) + self.request(0.2) + self.appearance(1)
+        second = self.appearance(1.1, phase="will disappear")
+        self.chunks = [(1.2, first), (1.2, second)]
+        self.log.stdout_capture.total_bytes = len(first) + len(second)
+        with self.assertRaisesRegex(HarnessError, "dismissed"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_lost_events_and_terminated_stream_fail_closed(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(1, b"=== Messages dropped during live streaming ===\n")]
+        with self.assertRaisesRegex(HarnessError, "lost events"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.log.returncode = 1
+        self.chunks = [(1, self.adding(0.1) + self.request(0.2) + self.appearance(1))]
+        with self.assertRaisesRegex(HarnessError, "stopped streaming"):
+            await self.banner.wait_for_presentation(self.deadline())
+
+    async def test_backlogged_appearance_and_scheduler_delay_are_rejected(self) -> None:
+        self.banner.begin_send()
+        self.chunks = [(3, self.adding(0.1) + self.request(0.2) + self.appearance(1))]
+        with self.assertRaisesRegex(HarnessError, "stale"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.elapsed = 1.5
+        self.banner.require_current_presentation()
+        self.elapsed = 2.001
+        with self.assertRaisesRegex(HarnessError, "stale"):
+            self.banner.require_current_presentation()
+
+    async def test_expired_deadline_never_reads_more_events(self) -> None:
+        self.banner.begin_send()
+        self.elapsed = 16
+        self.chunks = [(16, self.adding(1))]
+        with self.assertRaisesRegex(HarnessError, "Timed out"):
+            await self.banner.wait_for_presentation(self.deadline())
+        self.assertEqual(len(self.chunks), 1)
+
+
+class NotificationDemoFlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.log_context = mock.MagicMock()
+        self.log_context.__aenter__ = mock.AsyncMock(return_value=object())
+        self.log_context.__aexit__ = mock.AsyncMock(return_value=False)
+        self.case = SimpleNamespace(
+            idb_process=mock.Mock(return_value=self.log_context),
+            idb=mock.AsyncMock(),
+            wait_for_app=mock.AsyncMock(),
+        )
+        self.banner = mock.Mock()
+        self.banner.wait_for_stream = mock.AsyncMock()
+        self.banner.wait_for_presentation = mock.AsyncMock()
+
+    async def run_demo(self) -> None:
+        with mock.patch.object(test_demos, "NotificationBanner", return_value=self.banner):
+            await test_demos.NotificationDemos.open_notification_banner(self.case, 200, 90)
+
+    async def test_single_coordinate_tap_and_exact_running_assertion(self) -> None:
+        await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.assertEqual(
+            self.case.idb.await_args_list[0].args[:2],
+            ("send-notification", "com.apple.news"),
+        )
+        tap = self.case.idb.await_args_list[1]
+        self.assertEqual(tap.args, ("ui", "tap", "200", "90"))
+        self.assertFalse(tap.kwargs["retry_transient_answers"])
+        self.assertFalse(
+            self.case.idb.await_args_list[0].kwargs["retry_transient_answers"]
+        )
+        self.assertGreater(tap.kwargs["timeout"], 0)
+        self.assertLessEqual(tap.kwargs["timeout"], 16)
+        self.case.wait_for_app.assert_awaited_once()
+        self.assertEqual(
+            self.case.wait_for_app.await_args.args, ("com.apple.news", AppState.RUNNING)
+        )
+        self.assertLessEqual(
+            self.case.wait_for_app.await_args.kwargs["timeout"], tap.kwargs["timeout"]
+        )
+        self.assertEqual(self.case.idb_process.call_args.kwargs["env"]["PYTHONUNBUFFERED"], "1")
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_missing_stream_evidence_does_not_send_or_tap(self) -> None:
+        self.banner.wait_for_stream.side_effect = HarnessError("no subscription evidence")
+        with self.assertRaisesRegex(HarnessError, "subscription"):
+            await self.run_demo()
+        self.case.idb.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_missing_presentation_fails_without_tap_and_closes_observer(self) -> None:
+        self.banner.wait_for_presentation.side_effect = HarnessError("never appeared")
+        with self.assertRaisesRegex(HarnessError, "never appeared"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 1)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_presentation_and_tap_consume_the_same_launch_budget(self) -> None:
+        elapsed = 0.0
+
+        class FakeDeadline:
+            def __init__(self, seconds: float) -> None:
+                self.at = elapsed + seconds
+
+            @property
+            def remaining(self) -> float:
+                return self.at - elapsed
+
+            @property
+            def passed(self) -> bool:
+                return self.remaining <= 0
+
+        async def present(deadline: Deadline) -> None:
+            nonlocal elapsed
+            elapsed = 9.6
+
+        async def command(*args: str, **kwargs: object) -> None:
+            nonlocal elapsed
+            if args[:2] == ("ui", "tap"):
+                elapsed += 1.0
+
+        self.banner.wait_for_presentation.side_effect = present
+        self.case.idb.side_effect = command
+        with mock.patch.object(test_demos, "Deadline", new=FakeDeadline):
+            await self.run_demo()
+        self.assertAlmostEqual(self.case.idb.await_args.kwargs["timeout"], 6.4)
+        self.assertAlmostEqual(
+            self.case.wait_for_app.await_args.kwargs["timeout"], 5.4
+        )
+
+    async def test_expired_budget_does_not_start_the_tap(self) -> None:
+        deadline = SimpleNamespace(remaining=16.0, passed=False)
+
+        async def present(*args: object) -> None:
+            deadline.remaining = -0.001
+            deadline.passed = True
+
+        self.banner.wait_for_presentation.side_effect = present
+        with mock.patch.object(test_demos, "Deadline", return_value=deadline):
+            with self.assertRaisesRegex(HarnessError, "expired before the tap"):
+                await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 1)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_tap_failure_is_not_retried_and_still_closes_observer(self) -> None:
+        self.case.idb.side_effect = [None, HarnessError("tap failed")]
+        with self.assertRaisesRegex(HarnessError, "tap failed"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.case.wait_for_app.assert_not_awaited()
+        self.log_context.__aexit__.assert_awaited_once()
+
+    async def test_cleanup_failure_is_reported(self) -> None:
+        self.log_context.__aexit__.side_effect = HarnessError("cleanup failed")
+        with self.assertRaisesRegex(HarnessError, "cleanup failed"):
+            await self.run_demo()
+        self.assertEqual(self.case.idb.await_count, 2)
+
+    async def test_outer_deadline_cancels_an_overlong_launch_poll(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stuck(*args: object, **kwargs: object) -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        async def expire(operation: Awaitable[None], *, timeout: float) -> None:
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 16)
+            task = asyncio.create_task(operation)
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            raise asyncio.TimeoutError
+
+        self.case.wait_for_app.side_effect = stuck
+        with mock.patch.object(test_demos.asyncio, "wait_for", new=expire):
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.run_demo()
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.case.idb.await_count, 2)
+        self.log_context.__aexit__.assert_awaited_once()
 
 
 if __name__ == "__main__":
